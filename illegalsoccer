@@ -9,7 +9,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR prototype 0.9"
+local BUILD = "Auto GK 3.2.6 | STR prototype 0.12"
 local ENV = type(getgenv) == "function" and getgenv() or _G
 
 -- Keep the current instance running until all dependencies have loaded.
@@ -4535,14 +4535,16 @@ connect(RunService.Heartbeat, function(dt)
     end
 end)
 
--- STR prototype: native aim input, bounded search, conservative keeper reach.
+-- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
-    local A = { Enabled = false, AutoCurve = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
+    local A = { Enabled = false, AutoCurve = false, SmartRelease = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
     local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
-        SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65,
-        MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30 }
+        SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
+        MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
+        ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5 }
     local stats = { shots = 0, assisted = 0, redirected = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
-        errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0 }
+        errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
+        releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
     local recentShots = {}
     -- Native modules are populated by name during lazy installation.
     local N: { [string]: any } = {}
@@ -4671,17 +4673,50 @@ local function createStriker(d)
         local offset = math.clamp((origin - mouth.plane):Dot(mouth.lateral), -mouth.halfWidth, mouth.halfWidth)
         return flat(origin - (mouth.plane + mouth.lateral * offset)).Magnitude
     end
+    local function defenderSnapshot(character, root, hum, cf, velocity)
+        local state = d.M.Controllers.GetHumanoidState(character, hum)
+        local airborne = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+        local floor = d.M.Grounding.GetStandingY(hum, root)
+        local gravity = math.max(workspace.Gravity, 1)
+        local jump = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * gravity * hum.JumpHeight)
+        local landAt = airborne and math.max(0, (velocity.Y + math.sqrt(velocity.Y ^ 2
+            + 2 * gravity * math.max(0, cf.Position.Y - floor))) / gravity) or 0
+        local runSpeed = N.ActionMovement.GetRunWalkSpeed(N.ActionMovement.GetBaseWalkSpeed(), false)
+        local receive = N.Receiving.GetReceiveHitbox(character, false)
+        local airReceive = N.Receiving.GetReceiveHitbox(character, true)
+        local slide = N.Tackle.Constants
+        local untilTime = N.Tackle.GetSlidingUntil(character)
+        -- SlidingUntil uses the workspace server clock, not the smoothed ball clock.
+        local slideAge = untilTime and math.max(0, workspace:GetServerTimeNow() - (untilTime - slide.TotalMotionSeconds)) or nil
+        local direction = flat(velocity)
+        if direction.Magnitude <= 0.5 then direction = flat(cf.LookVector) end
+        direction = direction.Magnitude > 1e-5 and direction.Unit or Vector3.new(0, 0, -1)
+        local function padded(box)
+            return { Size = box.Size + Vector3.new(1, 1, 1) * (d.M.Physics.BallRadius * 2),
+                CFrameOffset = box.CFrameOffset, Shape = box.Shape }
+        end
+        return { character = character, position = cf.Position, cf = cf, root = { CFrame = cf },
+            tilted = cf.UpVector.Y < 0.98,
+            velocity = velocity, speed = math.max(runSpeed, hum.WalkSpeed, slideAge and 0 or flat(velocity).Magnitude),
+            jump = math.max(0, jump), floor = floor, gravity = gravity, landAt = landAt,
+            receive = padded(receive), airReceive = padded(airReceive), tackle = padded(d.M.Hitboxes.SlideTackle),
+            slideAge = slideAge, slideDirection = direction, slideConstants = table.clone(slide) }
+    end
     local function keepersFor(ch, team, goal, practiceGoals)
-        local found, seen = {}, {}
+        local found, defenders, seen = {}, {}, {}
         local context = d.M.Motion.GetContext(ch)
+        local opposing = not practiceGoals and d.M.Match.Constants.TeamDisplayNames[team]
+            and type(d.M.Match.GetOpposingTeamName) == "function"
+            and d.M.Match.GetOpposingTeamName(team) or nil
         local function add(character, actor)
             if not character or character == ch or seen[character] then return end
             seen[character] = true
-            if not d.M.Match.IsGoalkeeperCharacter(character)
-                or d.M.Motion.GetContext(character) ~= context then return end
+            if d.M.Motion.GetContext(character) ~= context then return end
+            local keeper = d.M.Match.IsGoalkeeperCharacter(character)
+            local otherTeam = d.M.Teams.GetActorTeamName(actor or character)
+            if not keeper and (not opposing or otherTeam ~= opposing) then return end
             -- Practice actors share a neutral Practice label. Match teams are adversarial.
             if not practiceGoals then
-                local otherTeam = d.M.Teams.GetActorTeamName(actor or character)
                 if team and otherTeam == team then return end
             end
             local root = character:FindFirstChild("HumanoidRootPart")
@@ -4703,6 +4738,10 @@ local function createStriker(d)
             end
             local velocity = d.M.Motion.GetVelocity(character) or root.AssemblyLinearVelocity
             if not vec(velocity) then velocity = V0 end
+            if not keeper then
+                table.insert(defenders, defenderSnapshot(character, root, hum, cf, velocity))
+                return
+            end
             local jump = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * workspace.Gravity * hum.JumpHeight)
             table.insert(found, { position = cf.Position, velocity = velocity,
                 speed = math.max(24, hum.WalkSpeed, flat(velocity).Magnitude),
@@ -4721,10 +4760,11 @@ local function createStriker(d)
         end
         addChildren(folder)
         addChildren(folder and folder:FindFirstChild("NPCs"))
-        return found
+        return found, defenders
     end
-    local function frame(sample)
-        if not session or session.locked then return nil end
+    local function frame(sample, releaseDelay)
+        local timing = releaseDelay ~= nil
+        if not session or (session.locked and not timing) then return nil end
         local allowed, reason = eligible()
         if not allowed then return skipFrame(reason) end
         local ch = d.Player.Character
@@ -4750,6 +4790,12 @@ local function createStriker(d)
         local constants = session.constants or N.Power.GetChargeConstants(ch, N.Shoot.Constants.Kick)
         session.constants = constants
         local elapsed = math.max(0, os.clock() - session.started)
+        if timing then
+            -- Use the native charge epoch and its clock, not the wrapper's entry time.
+            if not num(session.chargeStartedAt) then return nil end
+            elapsed = d.M.Clock.GetSmoothedServerTime() - session.chargeStartedAt
+            if not num(elapsed) or elapsed < 0 then return nil end
+        end
         local minimum = N.Core.GetMinimumReleaseSeconds(constants)
         local maximum = constants.MaximumChargeSeconds
         local charge = math.clamp(math.max(minimum, elapsed), minimum, maximum)
@@ -4775,11 +4821,17 @@ local function createStriker(d)
             charge = math.clamp(math.max(minimum, elapsed + remaining), minimum, maximum)
         end
         -- Non-owner volleys keep updating aim while waiting; they do not use the owned-ball lock.
-        local approachingLock = not volley and not session.releasing and elapsed >= lockCharge - 0.08
+        local approachingLock = not timing and not volley and not session.releasing and elapsed >= lockCharge - 0.08
         local charges = approachingLock and { lockCharge, (lockCharge + maximum) / 2, maximum } or { charge }
         local velocity = flat(root.AssemblyLinearVelocity)
         local lead = volley and math.max(remaining, minimum - elapsed, 0)
             or (approachingLock and math.max(0, maximum - elapsed) or math.max(0, minimum - elapsed))
+        if timing then
+            if volley then return nil end
+            charge = math.clamp(elapsed + releaseDelay, minimum, maximum)
+            charges = { charge }
+            lead = math.max(releaseDelay, minimum - elapsed, 0)
+        end
         local nowOrigin = origin
         local delta = velocity * lead
         if sample.IsAirborne and lead > 0 then
@@ -4799,15 +4851,17 @@ local function createStriker(d)
             return nil
         end
         local curve = N.Curves.IsEnabled() and (session.curve or 0) or 0
+        local keepers, defenders = keepersFor(ch, team, goal, practiceGoals)
         return { character = ch, root = root, origin = origin, velocity = velocity,
             sample = sample, goal = goal, goalCF = goal.CFrame, world = world, mouth = mouth,
             charge = approachingLock and maximum or charge, charges = charges,
             minimumCharge = minimum, maximumCharge = maximum,
+            elapsed = elapsed,
             lead = lead, aimOffset = delta, volley = volley, canApply = imminent,
             distance = session.distance, arrivalRemaining = remaining,
             curve = curve, autoCurve = session.autoCurve == true and N.Curves.IsEnabled() and N.Curves.GetPower() > 0,
             boost = N.Power.GetMultiplier(ch), curvePower = N.Curves.GetPower(),
-            keepers = keepersFor(ch, team, goal, practiceGoals), at = d.M.Clock.GetSmoothedServerTime(),
+            keepers = keepers, defenders = defenders, at = d.M.Clock.GetSmoothedServerTime(),
             radius = d.M.Physics.BallRadius, clock = os.clock(), team = team,
             context = d.M.Motion.GetContext(ch), ballId = ballId() }
     end
@@ -5021,6 +5075,157 @@ local function createStriker(d)
         end
         return minimum
     end
+    local function defenderOffset(defender, seconds)
+        local horizontal = flat(defender.velocity) * seconds
+        if defender.slideAge then
+            local c = defender.slideConstants
+            local travel = N.Tackle.GetMaximumTravelBetween(defender.slideAge,
+                defender.slideAge + seconds, c.StartupDashDistance, c.Distance)
+            horizontal = defender.slideDirection * travel
+        end
+        local y = defender.floor
+        if seconds < defender.landAt then
+            y = math.max(y, defender.position.Y + defender.velocity.Y * seconds - defender.gravity * seconds * seconds / 2)
+        end
+        return horizontal + UP * (y - defender.position.Y)
+    end
+    local function defenderProfile(f, defender, t0, t1)
+        local cache = f.defenderProfiles
+        if not cache then cache = {}; f.defenderProfiles = cache end
+        local atTime = cache[t1]
+        if not atTime then atTime = {}; cache[t1] = atTime end
+        local cached = atTime[defender]
+        if cached and cached.t0 == t0 then return cached end
+        local a, b = f.lead + t0, f.lead + t1
+        local offset0, offset1 = defenderOffset(defender, a), defenderOffset(defender, b)
+        local airborne0, airborne1 = a < defender.landAt, b < defender.landAt
+        local box0 = airborne0 and defender.airReceive or defender.receive
+        local box1 = airborne1 and defender.airReceive or defender.receive
+        local available = math.max(0, b + C.NetworkMargin)
+        local jumpTime = math.min(math.max(0, available - defender.landAt), defender.jump / defender.gravity)
+        local jumpRise = math.max(0, defender.jump * jumpTime - defender.gravity * jumpTime * jumpTime / 2)
+        local receiveTop = defender.receive.CFrameOffset.Y + defender.receive.Size.Y / 2
+        local airTop = defender.airReceive.CFrameOffset.Y + defender.airReceive.Size.Y / 2
+        local groundBottom = defender.receive.CFrameOffset.Y - defender.receive.Size.Y / 2
+        local airBottom = defender.airReceive.CFrameOffset.Y - defender.airReceive.Size.Y / 2
+        local low = math.min(defender.position.Y + offset0.Y + (airborne0 and airBottom or groundBottom),
+            defender.position.Y + offset1.Y + (airborne1 and airBottom or groundBottom))
+        local high = math.max(defender.position.Y + offset0.Y + (airborne0 and airTop or receiveTop),
+            defender.position.Y + offset1.Y + (airborne1 and airTop or receiveTop))
+        if available > defender.landAt then high = math.max(high, defender.floor + airTop + jumpRise) end
+        local halfWidth = math.max(defender.receive.Size.X, defender.receive.Size.Z,
+            defender.airReceive.Size.X, defender.airReceive.Size.Z) / 2
+        local horizontal = defender.speed * available
+        local slideReach, slideWindow0, slideWindow1
+        local c = defender.slideConstants
+        if defender.slideAge then
+            -- Existing slide: use its replicated phase and bounded native travel.
+            -- Do not credit a second full dash in the same available interval.
+            horizontal = math.max(horizontal, flat(offset1).Magnitude)
+            slideWindow0 = math.max(a, c.HitboxDelaySeconds - defender.slideAge)
+            slideWindow1 = math.min(b, c.HitboxDelaySeconds + c.HitboxSeconds - defender.slideAge)
+            if slideWindow0 <= slideWindow1 then
+                slideReach = N.Tackle.GetMaximumTravelBetween(defender.slideAge,
+                    defender.slideAge + slideWindow1, c.StartupDashDistance, c.Distance)
+            end
+        else
+            -- Possible new tackle: run BEFORE starting it, then travel during its
+            -- actual hitbox window. Unknown future input/stamina remains an estimate.
+            local maxAge = math.min(c.HitboxDelaySeconds + c.HitboxSeconds, available - defender.landAt)
+            if maxAge >= c.HitboxDelaySeconds then
+                for i = 0, 4 do
+                    local age = c.HitboxDelaySeconds + (maxAge - c.HitboxDelaySeconds) * i / 4
+                    local travel = N.Tackle.GetMaximumTravelBetween(0, age, c.StartupDashDistance, c.Distance)
+                    slideReach = math.max(slideReach or 0, defender.speed * (available - age) + travel)
+                end
+            end
+        end
+        if slideReach then
+            local box = defender.tackle
+            slideReach += flat(box.CFrameOffset.Position).Magnitude + math.sqrt(box.Size.X ^ 2 + box.Size.Z ^ 2) / 2
+        end
+        cached = { t0 = t0, a = a, b = b, offset0 = offset0, offset1 = offset1,
+            box0 = box0, box1 = box1, radius = horizontal + halfWidth, low = low, high = high,
+            slideReach = slideReach, slideLow = defender.floor + defender.tackle.CFrameOffset.Y - defender.tackle.Size.Y / 2,
+            slideHigh = defender.floor + defender.tackle.CFrameOffset.Y + defender.tackle.Size.Y / 2,
+            slideWindow0 = slideWindow0, slideWindow1 = slideWindow1 }
+        atTime[defender] = cached
+        return cached
+    end
+    local function defenderDemand(f, first, second, t0, t1)
+        if not f.defenders or #f.defenders == 0 then return math.huge, 0 end
+        local dx, dz = second.X - first.X, second.Z - first.Z
+        local lengthSquared = dx * dx + dz * dz
+        local lowY, highY = math.min(first.Y, second.Y), math.max(first.Y, second.Y)
+        local minimum, risk = math.huge, 0
+        for _, defender in ipairs(f.defenders) do
+            local p = defenderProfile(f, defender, t0, t1)
+            local x, z = first.X - defender.position.X, first.Z - defender.position.Z
+            local alpha = lengthSquared > 1e-8
+                and math.clamp(-(x * dx + z * dz) / lengthSquared, 0, 1) or 0
+            x, z = x + dx * alpha, z + dz * alpha
+            local distance = math.sqrt(x * x + z * z)
+            local vertical = math.max(lowY - p.high, p.low - highY, 0)
+            local value = math.max(distance / math.max(p.radius, 0.01), vertical > 0 and 1 + vertical / 4 or 0)
+            if p.slideReach then
+                vertical = math.max(lowY - p.slideHigh, p.slideLow - highY, 0)
+                value = math.min(value, math.max(distance / math.max(p.slideReach, 0.01), vertical > 0 and 1 + vertical / 4 or 0))
+            end
+            minimum = math.min(minimum, value)
+            if value <= 1 then risk = math.max(risk, 1) end
+            -- Relative swept segments catch a moving defender crossing the ball
+            -- between samples. Use native oval/box tests, not endpoint proximity.
+            local direct = false
+            if risk < 2 and (value <= 1 or defender.tilted) then
+                local from, to = first - p.offset0, second - p.offset1
+                if p.box1 ~= p.box0 then
+                    -- Split at landing: the taller airborne box must not extend
+                    -- into the grounded part of this sample interval.
+                    local alphaAtLanding = math.clamp((defender.landAt - p.a) / math.max(p.b - p.a, 1e-8), 0, 1)
+                    local landing = first:Lerp(second, alphaAtLanding) - defenderOffset(defender, defender.landAt)
+                    direct = d.M.Hitboxes.GetSegmentEnterAlpha(defender.root, p.box0, from, landing) ~= nil
+                        or d.M.Hitboxes.GetSegmentEnterAlpha(defender.root, p.box1, landing, to) ~= nil
+                else
+                    direct = d.M.Hitboxes.GetSegmentEnterAlpha(defender.root, p.box0, from, to) ~= nil
+                end
+                if not direct and p.slideWindow0 and p.slideWindow0 <= p.slideWindow1 then
+                    local duration = math.max(p.b - p.a, 1e-8)
+                    local slideFrom = first:Lerp(second, (p.slideWindow0 - p.a) / duration) - defenderOffset(defender, p.slideWindow0)
+                    local slideTo = first:Lerp(second, (p.slideWindow1 - p.a) / duration) - defenderOffset(defender, p.slideWindow1)
+                    direct = d.M.Hitboxes.GetSegmentEnterAlpha(defender.root, defender.tackle, slideFrom, slideTo) ~= nil
+                end
+            end
+            if direct then risk = 2 end
+        end
+        return minimum, risk
+    end
+    local function betterRating(a, b)
+        if not a then return false end
+        if not b then return true end
+        local ar, br = a.defenderRisk or 0, b.defenderRisk or 0
+        if ar ~= br then return ar < br end
+        return a.score > b.score
+    end
+    local function hasObstruction(f, hits)
+        if not hits then return false end
+        -- Goal-volume entry can happen AFTER a post/wall rebound. Only contacts
+        -- on the native ground surfaces are allowed before the shot reaches goal.
+        local ground = f.groundParts
+        if not ground then
+            ground = {}
+            for _, solid in ipairs(f.world.GroundSolids or {}) do
+                if solid.Part then ground[solid.Part] = true end
+            end
+            f.groundParts = ground
+        end
+        local constants = d.M.Physics.Constants
+        local minimumY = constants and constants.Solver and constants.Solver.MinimumGroundNormalY or 0.55
+        for _, hit in ipairs(hits) do
+            local normal = hit.FaceNormal or hit.Normal
+            if not ground[hit.Part] or not vec(normal) or normal.Y < minimumY then return true end
+        end
+        return false
+    end
     local function validate(f, aim, charge, yielding)
         local velocity, spin = launch(f, aim, charge)
         if yielding then coroutine.yield() end
@@ -5034,8 +5239,12 @@ local function createStriker(d)
         if eta <= 0 or eta > C.Horizon then return nil end
         local mouth = f.mouth
         local edge = math.min(mouth.halfWidth - math.abs((position - mouth.center):Dot(mouth.lateral)), mouth.top - position.Y)
-        if edge < C.EdgeMargin or position.Y < mouth.bottom then return nil end
+        -- Keep the whole ball inside the opening, not just its centre. The same
+        -- check is used for current aim, searched candidates and smart release.
+        if position.Y < mouth.bottom then return nil end
+        if edge - f.radius < C.EdgeMargin then return nil, position end
         local minGap, minDemand, previous = math.huge, math.huge, f.origin
+        local defenderReach, defenderRisk, previousT = math.huge, 0, 0
         local cursor = state
         local count = math.ceil(eta / C.Step)
         for i = 1, count do
@@ -5044,26 +5253,40 @@ local function createStriker(d)
             local t = math.min(C.Step * i, eta)
             cursor = d.M.Physics.GetStateAtTime(cursor, launchAt + t, f.world, {})
             if not cursor or not vec(cursor.Position) then return nil end
+            if hasObstruction(f, cursor.BoundaryHits) then return nil end
             minGap = math.min(minGap, keeperGap(f, previous, cursor.Position, t))
             minDemand = math.min(minDemand, reachDemand(f, previous, cursor.Position, t))
+            local demand, risk = defenderDemand(f, previous, cursor.Position, previousT, t)
+            defenderReach, defenderRisk = math.min(defenderReach, demand), math.max(defenderRisk, risk)
+            previousT = t
             previous = cursor.Position
             if yielding and i % 8 == 0 then coroutine.yield() end
         end
+        -- The native entry observer interpolates between physics positions. Also
+        -- check the actual sampled position at its reported crossing time.
+        edge = math.min(edge, mouth.halfWidth - math.abs((cursor.Position - mouth.center):Dot(mouth.lateral)),
+            mouth.top - cursor.Position.Y)
+        if edge - f.radius < C.EdgeMargin then return nil, cursor.Position end
         if #f.keepers == 0 then minGap, minDemand = nil, nil end
         return { gap = minGap, reachDemand = minDemand, predictionCharge = charge,
             score = (minDemand and (minDemand - 1) * d.M.Dive.Constants.Distance or 0)
-                - eta * 0.35 + math.min(edge, 2) * 0.08,
-            eta = eta, position = position, keepers = #f.keepers }
+                - eta * 0.35 + math.min(edge, 2) * 0.08
+                - math.clamp(1 - defenderReach, 0, 1) * d.M.Dive.Constants.Distance,
+            defenderDemand = defenderReach < math.huge and defenderReach or nil, defenderRisk = defenderRisk,
+            eta = eta, position = position, keepers = #f.keepers, edgeClearance = edge - f.radius }
     end
     local function rate(f, aim, yielding)
-        local worst, conservativeGap
+        local worst, conservativeGap, clearance, defenderReach
         for _, charge in ipairs(f.charges) do
-            local result = validate(f, aim, charge, yielding)
-            if not result then return nil end
+            local result, edgePosition = validate(f, aim, charge, yielding)
+            if not result then return nil, edgePosition end
             if result.gap ~= nil then conservativeGap = math.min(conservativeGap or math.huge, result.gap) end
-            if not worst or result.score < worst.score then worst = result end
+            clearance = math.min(clearance or math.huge, result.edgeClearance)
+            if result.defenderDemand then defenderReach = math.min(defenderReach or math.huge, result.defenderDemand) end
+            if not worst or betterRating(worst, result) then worst = result end
         end
-        if worst then worst.gap = conservativeGap end
+        if worst then worst.gap, worst.edgeClearance = conservativeGap, clearance end
+        if worst then worst.defenderDemand = defenderReach end
         return worst
     end
     local function compatible(a, b)
@@ -5091,6 +5314,27 @@ local function createStriker(d)
         local yaw, pitch = angles(direction)
         return aimAt(f, yaw, pitch)
     end
+    local function insetAim(f, aim, position)
+        -- A transported corner proposal can drift towards a post. Use its fresh
+        -- crossing as a correction hint, then validate again within the existing
+        -- two-proposal limit. This approximation never authorizes an aim by itself.
+        local mouth = f.mouth
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = mouth.halfWidth - inset
+        if half <= 0 or mouth.top - inset <= mouth.bottom + f.radius then return nil end
+        local x = (position - mouth.center):Dot(mouth.lateral)
+        local shift = mouth.lateral * (math.clamp(x, -half, half) - x)
+            + UP * math.min(0, mouth.top - inset - position.Y)
+        local origin = f.sample.Origin + (f.aimOffset or V0)
+        local distance = (origin - mouth.plane):Dot(mouth.forward)
+        local ballDistance = (f.origin - mouth.plane):Dot(mouth.forward)
+        local toward = -aim.Direction:Dot(mouth.forward)
+        if distance <= 0 or ballDistance <= 0 or toward <= 1e-5 or shift.Magnitude < 1e-5 then return nil end
+        local direction = aim.Direction * (distance / toward) + shift * (distance / ballDistance)
+        if not vec(direction) or direction.Magnitude < 1e-5 then return nil end
+        local yaw, pitch = angles(direction.Unit)
+        return aimAt(f, yaw, pitch)
+    end
     local function targetPoint(mouth, target)
         local point = mouth.center + mouth.lateral * target.X
         return Vector3.new(point.X, target.Y, point.Z)
@@ -5105,9 +5349,11 @@ local function createStriker(d)
     end
     local function searchTargets(f)
         local mouth = f.mouth
-        local half = mouth.halfWidth - f.radius - C.EdgeMargin
+        -- Leave room for the iterative solver's 0.30-stud target tolerance.
+        local inset = f.radius + C.EdgeMargin + C.TargetSlack
+        local half = mouth.halfWidth - inset
         local low = mouth.bottom + f.radius + 0.4
-        local high = mouth.top - f.radius - C.EdgeMargin
+        local high = mouth.top - inset
         if half <= 0 or high <= low then return {} end
         local middle = (low + high) / 2
         local targets = {}
@@ -5120,10 +5366,12 @@ local function createStriker(d)
                 local point = targetPoint(mouth, target)
                 local eta = (point - f.origin).Magnitude / math.max(speed, 1)
                 local priority = (reachDemand(f, point, point, eta) - 1) * d.M.Dive.Constants.Distance - eta * 0.35
-                targets[#targets + 1] = { target = target, priority = priority, order = #targets + 1, level = level }
+                local _, risk = defenderDemand(f, f.origin, point, 0, eta)
+                targets[#targets + 1] = { target = target, priority = priority, order = #targets + 1, level = level, defenderRisk = risk }
             end
         end
         table.sort(targets, function(a, b)
+            if a.defenderRisk ~= b.defenderRisk then return a.defenderRisk < b.defenderRisk end
             if a.priority == b.priority then return a.order < b.order end
             return a.priority > b.priority
         end)
@@ -5163,7 +5411,7 @@ local function createStriker(d)
                         end
                         table.insert(owner.candidates, candidate)
                         retained = true
-                        table.sort(owner.candidates, function(a, b) return a.rating.score > b.rating.score end)
+                        table.sort(owner.candidates, function(a, b) return betterRating(a.rating, b.rating) end)
                         while #owner.candidates > 15 do table.remove(owner.candidates) end
                     end
                 end
@@ -5198,8 +5446,9 @@ local function createStriker(d)
                 local bestSeed = owner.candidates[1]
                 if bestSeed then
                     local side = (bestSeed.rating.position - f.mouth.center):Dot(f.mouth.lateral) < 0 and -1 or 1
-                    local target = Vector2.new(side * (f.mouth.halfWidth - f.radius - C.EdgeMargin),
-                        math.clamp(bestSeed.rating.position.Y, f.mouth.bottom + f.radius + 0.4, f.mouth.top - f.radius - C.EdgeMargin))
+                    local inset = f.radius + C.EdgeMargin + C.TargetSlack
+                    local target = Vector2.new(side * (f.mouth.halfWidth - inset),
+                        math.clamp(bestSeed.rating.position.Y, f.mouth.bottom + f.radius + 0.4, f.mouth.top - inset))
                     local checkedCurves = {}
                     for _, curve in ipairs({ f.curve, -1, 1, 0 }) do
                         if not checkedCurves[curve] then
@@ -5262,8 +5511,10 @@ local function createStriker(d)
             local suffix = owner.autoCurve and (owner.frame.autoCurve
                 and string.format(" | Curve %+.1f", owner.selectedCurve or owner.frame.curve)
                 or " | Curve unavailable") or ""
-            return string.format("%s | %s\n%d GK tracked | Estimated gap %.1f\n%d alternatives evaluated%s", distance,
-                shotZone(owner.frame.mouth, rating.position), count, rating.gap, owner.candidateEvaluations or 0, suffix)
+            local defenders = owner.frame.defenders and #owner.frame.defenders or 0
+            local coverage = defenders > 0 and string.format("%d GK / %d DEF", count, defenders) or string.format("%d GK tracked", count)
+            return string.format("%s | %s\n%s | Estimated gap %.1f\n%d alternatives evaluated%s", distance,
+                shotZone(owner.frame.mouth, rating.position), coverage, rating.gap, owner.candidateEvaluations or 0, suffix)
         end
         return string.format("%s | %d GK tracked | Searching", distance, count)
     end
@@ -5344,7 +5595,7 @@ local function createStriker(d)
             local ad = math.abs((a.power or f.charge) - f.charge)
             local bd = math.abs((b.power or f.charge) - f.charge)
             if math.abs(ad - bd) > 1e-5 then return ad < bd end
-            return a.rating.score > b.rating.score
+            return betterRating(a.rating, b.rating)
         end)
         for _, entry in ipairs(shortlist) do
             if (requiredCurve == nil or entry.curve == requiredCurve)
@@ -5357,8 +5608,20 @@ local function createStriker(d)
                 if f.autoCurve and entry.curve ~= nil then
                     candidateFrame = table.clone(f); candidateFrame.curve = entry.curve
                 end
-                local rating = rate(candidateFrame, aim, false)
-                if rating and (not best or rating.score > best.score) then
+                local rating, edgePosition = rate(candidateFrame, aim, false)
+                if not rating and edgePosition and checked < 2 then
+                    local corrected = insetAim(candidateFrame, aim, edgePosition)
+                    if corrected then
+                        checked += 1
+                        rating = rate(candidateFrame, corrected, false)
+                        if rating then
+                            aim = corrected
+                            entry.direction, entry.frame, entry.at = aim.Direction, f, clock
+                            entry.rating, entry.power = rating, f.charge
+                        end
+                    end
+                end
+                if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
                 if checked >= 2 then break end
@@ -5367,7 +5630,7 @@ local function createStriker(d)
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
         local confirmed = normal and (requiredCurve == nil or f.curve == requiredCurve)
-            and (not best or normal.score >= best.score)
+            and not betterRating(best, normal)
         if confirmed then chosen, best, selectedCandidate, selectedCurve = table.clone(sample), normal, nil, f.curve end
         if choice and not chosen then
             -- A commitment is not a cached collision verdict. If no checked route
@@ -5395,10 +5658,13 @@ local function createStriker(d)
                 manualCurve = f.curve, character = f.character, context = f.context, ballId = f.ballId }
         end
         owner.applied, owner.rating, owner.direction = true, best, chosen.Direction
+        owner.appliedAim = table.clone(chosen)
         owner.redirected = (chosen.Direction - sample.Direction).Magnitude > 1e-5 or math.abs(selectedCurve - f.curve) > 1e-5
         owner.reason = owner.redirected and "assisted" or "confirmed_aim"
         stats.lastCharge, stats.lastCurve = f.charge, selectedCurve
-        setStatus(not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT"),
+        setStatus(best.defenderRisk == 2 and "DEFENDER IN SHOT PATH"
+            or (best.defenderRisk == 1 and "DEFENDERS COVER SHOT")
+            or (not owner.redirected and "AIM CONFIRMED" or (best.gap >= C.ClearGapThreshold and "OUTSIDE MODELED REACH" or "BEST AVAILABLE SHOT")),
             decisionDetail(owner))
         local scope = scopes[thread()]
         if scope then scope.applied = true end
@@ -5407,6 +5673,12 @@ local function createStriker(d)
     local function observe(command, locked)
         if session and command and command.PassType == d.M.Actions.PassTypes.Shot then
             session.curve = command.Curve or 0
+            if A.SmartRelease and session.smartRelease and typeof(command.AimDirection) == "table" then
+                session.nativeAimRevision = (session.nativeAimRevision or 0) + 1
+                session.nativeAim = table.clone(command.AimDirection)
+                local root = d.Player.Character and d.Player.Character:FindFirstChild("HumanoidRootPart")
+                session.nativeAimRoot = root and root.Position or nil
+            end
             if locked then
                 session.locked = true
                 session.job = nil
@@ -5425,6 +5697,83 @@ local function createStriker(d)
             or pair.ballId ~= ballId() or pair.context ~= d.M.Motion.GetContext(pair.character)
             or not N.Curves.IsEnabled() then return nil end
         return pair.curve, pair
+    end
+    local function releaseDecision(owner)
+        if not owner.applied or not owner.frame or owner.input == nil or not num(owner.chargeStartedAt)
+            or N.Client.IsVolleyCharging() or not ownsBall() then return nil end
+        local sample = owner.nativeAim
+        if typeof(sample) ~= "table" or not owner.appliedAim
+            or sample.Direction ~= owner.appliedAim.Direction then return nil end
+        sample = table.clone(sample)
+        if owner.locked then
+            local root = d.Player.Character and d.Player.Character:FindFirstChild("HumanoidRootPart")
+            if not root or not vec(owner.nativeAimRoot) then return nil end
+            local delta = root.Position - owner.nativeAimRoot
+            sample.Origin += delta
+            sample.CameraCFrame += delta
+        end
+        local f = frame(sample, 0)
+        if not f or #f.keepers == 0 or not compatible(owner.frame, f)
+            or f.elapsed < f.minimumCharge + 0.005 or f.elapsed >= f.maximumCharge - 0.015 then return nil end
+        -- Let auto curve make its per-shot choice before choosing its release time.
+        if f.autoCurve and not owner.curveChoice then return nil end
+        local curve = f.curve
+        if f.autoCurve then curve = pairedCurve(sample) end
+        if curve == nil then return nil end
+        local function evaluate(delay)
+            local at = delay == 0 and f or frame(sample, delay)
+            if not at or not compatible(f, at) then return nil, false end
+            at = table.clone(at)
+            at.curve = curve
+            return rate(at, sample, false), true
+        end
+        -- Compare the already selected trajectory now, halfway to full charge,
+        -- and at full charge. Forecasts include the keeper's extra waiting time.
+        -- This never changes a native locked direction or invents a charge value.
+        local began = os.clock()
+        local function inBudget()
+            if (os.clock() - began) * 1000 <= C.ReleaseBudgetMs then return true end
+            stats.releaseBudgetSkips += 1
+            owner.releaseTiming = { decision = "budget" }
+            return false
+        end
+        stats.releaseChecks += 1
+        local now = evaluate(0)
+        if not inBudget() or not now then return nil end
+        local remaining = f.maximumCharge - f.elapsed
+        local laterBest
+        for _, delay in ipairs({ remaining / 2, remaining }) do
+            local later, valid = evaluate(delay)
+            if not inBudget() or not valid then return nil end
+            if betterRating(later, laterBest) then laterBest = later end
+        end
+        local release = not laterBest
+            or ((now.defenderRisk or 0) ~= (laterBest.defenderRisk or 0) and betterRating(now, laterBest))
+            or ((now.defenderRisk or 0) == (laterBest.defenderRisk or 0) and now.score >= laterBest.score + C.ReleaseMargin)
+        owner.releaseTiming = { decision = release and "release" or "wait", charge = f.charge,
+            nowScore = now.score, laterScore = laterBest and laterBest.score or nil,
+            nowDefenderRisk = now.defenderRisk, laterDefenderRisk = laterBest and laterBest.defenderRisk or nil }
+        if release then return now end
+        return nil
+    end
+    local function smartReleaseStep()
+        local owner = session
+        if not (alive and A.Enabled and A.SmartRelease and owner and owner.smartRelease)
+            or owner.releasing or owner.smartDispatched or not N.Client.IsCharging() then return end
+        local clock = os.clock()
+        if clock < (owner.nextReleaseCheck or 0) then return end
+        owner.nextReleaseCheck = clock + C.ReleaseInterval
+        local began = os.clock()
+        local rating = releaseDecision(owner)
+        stats.maxReleaseMs = math.max(stats.maxReleaseMs, (os.clock() - began) * 1000)
+        if not rating or session ~= owner or not (A.Enabled and A.SmartRelease and eligible())
+            or not N.Client.IsCharging() or N.Client.IsVolleyCharging() or not ownsBall() then return end
+        -- End the actual user-started press only once, after native UpdateAim has
+        -- stored its ray. Its own release path still enforces minimums and locks.
+        owner.smartDispatched = true
+        owner.rating = rating
+        stats.releaseRequests += 1
+        N.Client.HandleInputEnded(owner.input)
     end
     local function curveCommand(command)
         if not command or command.PassType ~= d.M.Actions.PassTypes.Shot then return command end
@@ -5471,7 +5820,8 @@ local function createStriker(d)
             Shoot = "Modules.Actions.Shoot", Core = "Modules.Actions.KickCore", Power = "Modules.Actions.KickPowerups",
             Carry = "Modules.Ball.Carry", Curves = "Modules.CurvedKicks", Tutorial = "Client.Gameplay.TutorialSession",
             ShotAssist = "Modules.Actions.ShotAimAssist", Follow = "Client.Gameplay.Visual.TrajectoryPreviewFollow",
-            Controls = "Modules.Gameplay.Controls", Volley = "Client.Gameplay.Actions.VolleyOpportunity" }
+            Controls = "Modules.Gameplay.Controls", Volley = "Client.Gameplay.Actions.VolleyOpportunity",
+            Receiving = "Modules.Ball.Receiving", Tackle = "Modules.Actions.SlideTackle", ActionMovement = "Modules.Actions.ActionMovement" }
         for name, path in pairs(paths) do
             assert(alive and d.alive(), "STR was unloaded while dependencies were loading")
             N[name] = d.load(path)
@@ -5521,6 +5871,7 @@ local function createStriker(d)
             if not alive or not A.Enabled then return original(input, processed, transfer) end
             if not processed and N.Controls.IsInput("Kick", input) and not N.Client.IsCharging() then
                 session = { started = os.clock(), curve = 0, candidates = {}, locked = false, autoCurve = A.AutoCurve,
+                    input = input, smartRelease = A.SmartRelease,
                     volleyArrival = transfer and transfer.VolleyArrivalTime or nil }
             end
             local result = table.pack(scopeCall(original, input, processed, transfer))
@@ -5551,12 +5902,25 @@ local function createStriker(d)
             end end)
         end
         for _, key in ipairs({ "UpdateAim", "UpdateChargePath" }) do
-            hook(N.Client, key, function(original) return function(...) return scopeCall(original, ...) end end)
+            hook(N.Client, key, function(original) return function(...)
+                if key ~= "UpdateAim" or not (A.SmartRelease and session and session.smartRelease)
+                    or session.releasing or session.smartDispatched then return scopeCall(original, ...) end
+                local owner = session
+                local revision = owner and owner.nativeAimRevision
+                local result = table.pack(scopeCall(original, ...))
+                -- Native aim updates are throttled. Only consider release after this
+                -- call reports its current ray/curve, not a previous update's sample.
+                if key == "UpdateAim" and owner and session == owner and owner.nativeAimRevision ~= revision
+                    and not scopes[thread()] and alive and A.Enabled and A.SmartRelease then
+                    guarded(smartReleaseStep)
+                end
+                return table.unpack(result, 1, result.n)
+            end end)
         end
         hook(N.Client, "HandleInputEnded", function(original) return function(input)
             if alive and A.Enabled and session and N.Controls.IsInput("Kick", input) then
                 session.releasing = true
-                if not session.locked then scopeCall(N.Client.UpdateAim) end
+                if not session.locked and not session.smartDispatched then scopeCall(N.Client.UpdateAim) end
             end
             return scopeCall(original, input)
         end end)
@@ -5604,7 +5968,12 @@ local function createStriker(d)
             return original(...)
         end end)
         hook(d.M.Protocol, "Start", function(original) return function(command)
-            if alive and A.Enabled then guarded(observe, command, false) end
+            if alive and A.Enabled then
+                guarded(observe, command, false)
+                if session and command and command.PassType == d.M.Actions.PassTypes.Shot then
+                    session.chargeStartedAt = command.ShotTime
+                end
+            end
             return forwardCommand(original, command, curveCommand(command))
         end end)
         hook(d.M.Protocol, "Update", function(original) return function(command)
@@ -5620,6 +5989,7 @@ local function createStriker(d)
             command = curveCommand(command)
             if alive and A.Enabled and session and command.PassType == d.M.Actions.PassTypes.Shot then
                 stats.shots += 1
+                if session.smartDispatched then stats.autoReleases += 1 end
                 if session.applied then stats.assisted += 1 end
                 if session.applied and session.redirected then stats.redirected += 1 end
                 if session.applied and not session.redirected then stats.confirmed += 1 end
@@ -5632,6 +6002,8 @@ local function createStriker(d)
                     checkedAlternatives = session.checkedAlternatives or 0,
                     evaluatedAlternatives = session.candidateEvaluations or 0,
                     autoCurve = session.autoCurve == true,
+                    smartReleased = session.smartDispatched == true,
+                    releaseTiming = session.releaseTiming,
                     curveChanged = session.pair ~= nil and math.abs(session.pair.curve - session.pair.manualCurve) > 1e-5,
                     distance = session.distance, shotKind = session.volley and "volley" or "owned",
                     team = session.frame and session.frame.team or nil,
@@ -5642,11 +6014,17 @@ local function createStriker(d)
                     reachDemand = session.rating and session.rating.reachDemand or nil,
                     predictionCharge = session.rating and session.rating.predictionCharge or nil,
                     estimatedFlightSeconds = session.rating and session.rating.eta or nil,
+                    estimatedEdgeClearance = session.rating and session.rating.edgeClearance or nil,
+                    trackedDefenders = session.frame and session.frame.defenders and #session.frame.defenders or 0,
+                    defenderDemand = session.rating and session.rating.defenderDemand or nil,
+                    defenderRisk = session.rating and session.rating.defenderRisk or nil,
                     targetZone = session.rating and session.frame and shotZone(session.frame.mouth, session.rating.position) or nil,
-                    outsideModeledReach = session.rating ~= nil and session.rating.gap ~= nil and session.rating.gap >= C.ClearGapThreshold,
+                    outsideModeledReach = session.rating ~= nil and session.rating.gap ~= nil
+                        and session.rating.gap >= C.ClearGapThreshold and (session.rating.defenderRisk or 0) == 0,
                     trackedKeepers = session.frame and #session.frame.keepers or 0 })
                 if #recentShots > 12 then table.remove(recentShots, 1) end
-                local outcome = session.applied and (session.redirected and "assisted | " or "aim confirmed | ") or "normal | "
+                local outcome = session.smartDispatched and "smart release | "
+                    or (session.applied and (session.redirected and "assisted | " or "aim confirmed | ") or "normal | ")
                 setStatus("READY", "Last shot: " .. outcome .. decisionDetail(session))
                 session.job = nil
                 session = nil
@@ -5718,6 +6096,14 @@ local function createStriker(d)
         end
         return true
     end
+    function A.SetSmartRelease(value)
+        if not alive or installing then return false end
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.SmartRelease = value == true
+        -- Enabling applies to the next user press. Disabling stops an active check.
+        if session and not A.SmartRelease then session.smartRelease = false end
+        return true
+    end
     function A.Cleanup()
         if not cancelPairedCharge() then return false end
         alive, A.Enabled = false, false
@@ -5727,15 +6113,18 @@ local function createStriker(d)
         return restore()
     end
     function A.Debug()
-        return { enabled = A.Enabled, autoCurve = A.AutoCurve, ready = A.Ready, status = A.Status, detail = A.Detail,
+        return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.9",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.12",
+            defenderAwareness = true,
+            releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
     end
     if d.test then A.Test = { mouthFor = mouthFor, mouthDistance = mouthDistance, keeperGap = keeperGap,
-        reachDemand = reachDemand, validate = validate,
+        reachDemand = reachDemand, validate = validate, defenderDemand = defenderDemand, defenderProfile = defenderProfile,
+        betterRating = betterRating,
         solve = solve, frame = frame, scopeCall = scopeCall, choose = choose, native = N,
-        compatible = compatible, launch = launch, rate = rate, stats = stats, keepersFor = keepersFor,
+        compatible = compatible, launch = launch, rate = rate, stats = stats, keepersFor = keepersFor, candidateAim = candidateAim,
         horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone,
         setSession = function(value) session = value end, getSession = function() return session end } end
     return A
@@ -6324,7 +6713,7 @@ do
     )
 
     local gkRefresherCount = #refreshers
-    activeBody = frame(strikerContent, "Options", 0, 0, 292, 70)
+    activeBody = frame(strikerContent, "Options", 0, 0, 292, 105)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -6332,22 +6721,23 @@ do
     order = 0
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
+    toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 84),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 119),
         Size = UDim2.fromOffset(276, 36), TextWrapped = true,
         Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
     })
     local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 126),
+        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 161),
         Size = UDim2.fromOffset(276, 54), TextWrapped = true,
         TextColor3 = C.muted,
     })
-    text(strikerContent, "Within 55 studs of the goal opening.\nAuto curve compares both bends and straight shots.\nTap, charge, or volley normally.", 11, {
-        Position = UDim2.fromOffset(8, 194), Size = UDim2.fromOffset(276, 64),
+    text(strikerContent, "Within 55 studs of the goal opening.\nSmart release: hold shoot to let STR pick timing.\nManual release and volley timing take priority.", 11, {
+        Position = UDim2.fromOffset(8, 229), Size = UDim2.fromOffset(276, 64),
         TextWrapped = true, TextColor3 = C.muted,
     })
     text(strikerContent, "Keeper reach is an estimate. A goal is not guaranteed.", 10, {
-        Position = UDim2.fromOffset(8, 280), Size = UDim2.fromOffset(276, 60),
+        Position = UDim2.fromOffset(8, 315), Size = UDim2.fromOffset(276, 48),
         TextWrapped = true, TextColor3 = C.accentDim,
     })
 
