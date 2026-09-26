@@ -9,7 +9,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR prototype 0.12"
+local BUILD = "Auto GK 3.2.6 | STR prototype 0.13"
 local ENV = type(getgenv) == "function" and getgenv() or _G
 
 -- Keep the current instance running until all dependencies have loaded.
@@ -5276,18 +5276,24 @@ local function createStriker(d)
             eta = eta, position = position, keepers = #f.keepers, edgeClearance = edge - f.radius }
     end
     local function rate(f, aim, yielding)
-        local worst, conservativeGap, clearance, defenderReach
+        local ranked, conservativeGap, clearance, defenderReach, defenderRisk
         for _, charge in ipairs(f.charges) do
             local result, edgePosition = validate(f, aim, charge, yielding)
             if not result then return nil, edgePosition end
             if result.gap ~= nil then conservativeGap = math.min(conservativeGap or math.huge, result.gap) end
             clearance = math.min(clearance or math.huge, result.edgeClearance)
             if result.defenderDemand then defenderReach = math.min(defenderReach or math.huge, result.defenderDemand) end
-            if not worst or betterRating(worst, result) then worst = result end
+            defenderRisk = math.max(defenderRisk or 0, result.defenderRisk or 0)
+            -- Every possible locked release must still enter the goal safely.
+            -- Rank difficulty at the intended charge, rather than letting a slower
+            -- early-release forecast dominate a held, full-power shot.
+            if not ranked or math.abs(charge - f.charge) < math.abs(ranked.predictionCharge - f.charge) then ranked = result end
         end
-        if worst then worst.gap, worst.edgeClearance = conservativeGap, clearance end
-        if worst then worst.defenderDemand = defenderReach end
-        return worst
+        if ranked then
+            ranked.gap, ranked.edgeClearance = conservativeGap, clearance
+            ranked.defenderDemand, ranked.defenderRisk = defenderReach, defenderRisk
+        end
+        return ranked
     end
     local function compatible(a, b)
         return a and b and a.character == b.character and a.goal == b.goal and a.goalCF == b.goalCF
@@ -6115,7 +6121,7 @@ local function createStriker(d)
     function A.Debug()
         return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.12",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.13",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
