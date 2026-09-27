@@ -1,3 +1,124 @@
+local function createDmcStartup(d)
+    local B = {
+        stage = "Waiting for the game", finished = false,
+        cleanup = nil :: (() -> (boolean?, string?))?,
+        error = nil :: string?,
+    }
+    function B.Status(text)
+        B.stage = text
+        if not B.finished then pcall(d.show, "Dmc | Starting", text) end
+    end
+    function B.Load(path)
+        B.Status("Loading " .. path)
+        local object = d.resolve(path)
+        local result, closed
+        d.spawn(function()
+            local values = table.pack(pcall(d.require, object))
+            if not closed then result = values end
+        end)
+        local deadline = d.now() + 30
+        while not result and d.now() < deadline do d.wait() end
+        closed = true
+        assert(result, "Timed out loading " .. path .. ". The game module did not return within 30 seconds.")
+        assert(result[1], "Cannot load " .. path .. ": " .. tostring(result[2]))
+        assert(type(result[2]) == "table", "Unexpected module result: " .. path)
+        return result[2]
+    end
+    function B.Run(main)
+        B.Status(B.stage)
+        local ok, err = pcall(function() d.ready(); main(B) end)
+        B.finished = true
+        if ok then
+            pcall(d.hide)
+        else
+            local message = tostring(err)
+            local cleanup = B.cleanup
+            if cleanup then
+                local cleaned, released = pcall(cleanup)
+                if not cleaned or released == false then message = message .. "\nCleanup incomplete; rejoin before retrying." end
+            end
+            B.error = message
+            d.warn("[Dmc startup] " .. message)
+            pcall(d.show, "Dmc | Startup failed", message .. "\n\nSend this error and your executor name when reporting the problem.")
+        end
+        return ok, err
+    end
+    return B
+end
+
+local function createDmcStartupDisplay()
+    local gui, label, heading, closeConnection
+    local function hide()
+        if closeConnection then closeConnection:Disconnect(); closeConnection = nil end
+        if gui then gui:Destroy(); gui = nil end
+    end
+    local function show(title, message)
+        if not gui then
+            local player = game:GetService("Players").LocalPlayer
+            local parent = player and player:FindFirstChildOfClass("PlayerGui")
+            if not parent then return end
+            gui = Instance.new("ScreenGui")
+            gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcStartup", false, 1000
+            local panel = Instance.new("Frame")
+            panel.AnchorPoint = Vector2.new(0.5, 0.5)
+            panel.Position, panel.Size = UDim2.new(0.5, 0, 0.4, 0), UDim2.new(0.9, 0, 0, 200)
+            panel.BackgroundColor3, panel.BorderSizePixel = Color3.fromRGB(16, 16, 15), 0
+            panel.Parent = gui
+            local size = Instance.new("UISizeConstraint")
+            size.MaxSize = Vector2.new(460, 200); size.Parent = panel
+            heading = Instance.new("TextLabel")
+            heading.Position, heading.Size = UDim2.new(0, 14, 0, 8), UDim2.new(1, -58, 0, 28)
+            heading.BackgroundTransparency, heading.TextSize = 1, 16
+            heading.TextXAlignment, heading.Font = Enum.TextXAlignment.Left, Enum.Font.GothamMedium
+            heading.TextColor3 = Color3.fromRGB(222, 193, 115); heading.Parent = panel
+            label = Instance.new("TextBox")
+            label.Position, label.Size = UDim2.new(0, 14, 0, 44), UDim2.new(1, -28, 1, -54)
+            label.BackgroundTransparency, label.TextSize, label.TextWrapped = 1, 13, true
+            label.ClearTextOnFocus, label.TextEditable, label.MultiLine = false, false, true
+            label.TextXAlignment, label.TextYAlignment = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
+            label.Font, label.TextColor3 = Enum.Font.Code, Color3.fromRGB(233, 231, 220)
+            label.Parent = panel
+            local close = Instance.new("TextButton")
+            close.Text, close.TextSize = "X", 14
+            close.Position, close.Size = UDim2.new(1, -38, 0, 8), UDim2.new(0, 28, 0, 28)
+            close.BackgroundColor3, close.TextColor3 = Color3.fromRGB(39, 37, 30), heading.TextColor3
+            close.Parent = panel
+            closeConnection = close.Activated:Connect(hide)
+            gui.Parent = parent
+        end
+        heading.Text, label.Text = title, message
+    end
+    return show, hide
+end
+
+local startupShow, startupHide = createDmcStartupDisplay()
+local BOOT = createDmcStartup({
+    now = os.clock, wait = function() task.wait(0.05) end, spawn = task.spawn,
+    require = require, warn = warn, show = startupShow, hide = startupHide,
+    ready = function()
+        local players = game:GetService("Players")
+        local deadline = os.clock() + 30
+        while (not game:IsLoaded() or not players.LocalPlayer) and os.clock() < deadline do
+            startupShow("Dmc | Starting", "Waiting for the game to finish loading...")
+            task.wait(0.1)
+        end
+        assert(game:IsLoaded() and players.LocalPlayer, "Game client was not ready after 30 seconds. Join the game before running Dmc.")
+        assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
+        startupShow("Dmc | Starting", "Loading game modules...")
+    end,
+    resolve = function(path)
+        local object = game:GetService("ReplicatedStorage")
+        local deadline = os.clock() + 30
+        for name in string.gmatch(path, "[^.]+") do
+            object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
+            assert(object, "Missing dependency: " .. path .. ". Run Dmc in the supported game after it loads.")
+        end
+        return object
+    end,
+})
+
+BOOT.Run(function()
+-- DMC MAIN BEGIN
 --==============================================================
 -- SERVICES
 --==============================================================
@@ -9,8 +130,12 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.15 | Misc 0.6 | Evaluation 0.2"
-local ENV = type(getgenv) == "function" and getgenv() or _G
+local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.6 | Evaluation 0.2"
+local ENV = _G
+if type(getgenv) == "function" then
+    local ok, environment = pcall(getgenv)
+    if ok and type(environment) == "table" then ENV = environment end
+end
 
 -- Keep the current instance running until all dependencies have loaded.
 
@@ -28,9 +153,7 @@ local function resolve(path)
 end
 
 local function module(path)
-    local ok, result = pcall(require, resolve(path))
-    assert(ok, "Cannot load " .. path .. ": " .. tostring(result))
-    return result
+    return BOOT.Load(path)
 end
 
 local M = {
@@ -305,6 +428,7 @@ end
 
 ENV.__AUTO_GK_CLEANUP = cleanup
 ENV.StopAutoGK = cleanup
+BOOT.cleanup = cleanup
 
 local function connect(signal, fn)
     local c = signal:Connect(fn)
@@ -4935,7 +5059,7 @@ local function createStriker(d)
         local seeded = false
         -- Reuse a local aim-to-goal derivative from this job to start nearby targets.
         -- This is only a starting guess; native flight and goal-entry checks still decide validity.
-        if seed and seed.hit then
+        if seed and seed.hit and (target - seed.hit).Magnitude <= 8 then
             local error2 = target - seed.hit
             local determinant = seed.dx.X * seed.dy.Y - seed.dy.X * seed.dx.Y
             if math.abs(determinant) > 1e-5 then
@@ -5059,10 +5183,11 @@ local function createStriker(d)
         local segment = flat(second - first)
         local lengthSquared = segment:Dot(segment)
         local lowY = math.min(first.Y, second.Y)
-        local minimum = math.huge
+        local minimum, difficulty = math.huge, math.huge
         for _, keeper in ipairs(f.keepers) do
             if keeper.upright == false then
-                return math.max(0, 1 + keeperGap(f, first, second, t) / d.M.Dive.Constants.Distance)
+                local fallback = math.max(0, 1 + keeperGap(f, first, second, t) / d.M.Dive.Constants.Distance)
+                return fallback, fallback
             end
             local alpha = lengthSquared > 1e-8
                 and math.clamp(flat(keeper.position - first):Dot(segment) / lengthSquared, 0, 1) or 0
@@ -5075,12 +5200,18 @@ local function createStriker(d)
                 -- Fraction of horizontal/vertical reach required together. A signed
                 -- box penetration would saturate on low-ball height and could prefer
                 -- an easy central shot over a further corner.
-                best = math.min(best, math.max(separation / math.max(profile[i], 0.01),
-                    height / math.max(profile[i + 1], 0.01)))
+                local horizontal = separation / math.max(profile[i], 0.01)
+                local vertical = height / math.max(profile[i + 1], 0.01)
+                best = math.min(best, math.max(horizontal, vertical))
+                -- Ranking only: simultaneous sideways and upward effort is harder than
+                -- either alone. Keep this separate from the conservative reach verdict.
+                -- The old max-only score treated height below the horizontal demand as free.
+                difficulty = math.min(difficulty, math.max(horizontal, vertical)
+                    + 0.20 * math.min(horizontal, vertical))
             end
             minimum = math.min(minimum, best)
         end
-        return minimum
+        return minimum, difficulty
     end
     local function defenderOffset(defender, seconds)
         local horizontal = flat(defender.velocity) * seconds
@@ -5233,6 +5364,13 @@ local function createStriker(d)
         end
         return false
     end
+    local function cornerPreference(mouth, position)
+        -- Small tie preference for safe upper corners, subordinate to modeled
+        -- interception difficulty and the separate defender-risk ordering.
+        local height = math.clamp((position.Y - mouth.bottom) / math.max(mouth.top - mouth.bottom, 0.01), 0, 1)
+        local width = math.clamp(math.abs((position - mouth.center):Dot(mouth.lateral)) / math.max(mouth.halfWidth, 0.01), 0, 1)
+        return 0.20 * height * width
+    end
     local function validate(f, aim, charge, yielding)
         local velocity, spin = launch(f, aim, charge)
         if yielding then coroutine.yield() end
@@ -5250,7 +5388,7 @@ local function createStriker(d)
         -- check is used for current aim, searched candidates and smart release.
         if position.Y < mouth.bottom then return nil end
         if edge - f.radius < C.EdgeMargin then return nil, position end
-        local minGap, minDemand, previous = math.huge, math.huge, f.origin
+        local minGap, minDemand, minDifficulty, previous = math.huge, math.huge, math.huge, f.origin
         local defenderReach, defenderRisk, previousT = math.huge, 0, 0
         local cursor = state
         local count = math.ceil(eta / C.Step)
@@ -5262,9 +5400,10 @@ local function createStriker(d)
             if not cursor or not vec(cursor.Position) then return nil end
             if hasObstruction(f, cursor.BoundaryHits) then return nil end
             minGap = math.min(minGap, keeperGap(f, previous, cursor.Position, t))
-            minDemand = math.min(minDemand, reachDemand(f, previous, cursor.Position, t))
-            local demand, risk = defenderDemand(f, previous, cursor.Position, previousT, t)
-            defenderReach, defenderRisk = math.min(defenderReach, demand), math.max(defenderRisk, risk)
+            local demand, difficulty = reachDemand(f, previous, cursor.Position, t)
+            minDemand, minDifficulty = math.min(minDemand, demand), math.min(minDifficulty, difficulty)
+            local defenderRequired, risk = defenderDemand(f, previous, cursor.Position, previousT, t)
+            defenderReach, defenderRisk = math.min(defenderReach, defenderRequired), math.max(defenderRisk, risk)
             previousT = t
             previous = cursor.Position
             if yielding and i % 8 == 0 then coroutine.yield() end
@@ -5274,10 +5413,11 @@ local function createStriker(d)
         edge = math.min(edge, mouth.halfWidth - math.abs((cursor.Position - mouth.center):Dot(mouth.lateral)),
             mouth.top - cursor.Position.Y)
         if edge - f.radius < C.EdgeMargin then return nil, cursor.Position end
-        if #f.keepers == 0 then minGap, minDemand = nil, nil end
-        return { gap = minGap, reachDemand = minDemand, predictionCharge = charge,
-            score = (minDemand and (minDemand - 1) * d.M.Dive.Constants.Distance or 0)
+        if #f.keepers == 0 then minGap, minDemand, minDifficulty = nil, nil, nil end
+        return { gap = minGap, reachDemand = minDemand, difficulty = minDifficulty, predictionCharge = charge,
+            score = (minDifficulty and (minDifficulty - 1) * d.M.Dive.Constants.Distance or 0)
                 - eta * 0.35 + math.min(edge, 2) * 0.08
+                + cornerPreference(mouth, position)
                 - math.clamp(1 - defenderReach, 0, 1) * d.M.Dive.Constants.Distance,
             defenderDemand = defenderReach < math.huge and defenderReach or nil, defenderRisk = defenderRisk,
             eta = eta, position = position, keepers = #f.keepers, edgeClearance = edge - f.radius }
@@ -5400,7 +5540,8 @@ local function createStriker(d)
                 local target = Vector2.new(x, height)
                 local point = targetPoint(mouth, target)
                 local eta = (point - f.origin).Magnitude / math.max(speed, 1)
-                local priority = (reachDemand(f, point, point, eta) - 1) * d.M.Dive.Constants.Distance - eta * 0.35
+                local _, difficulty = reachDemand(f, point, point, eta)
+                local priority = (difficulty - 1) * d.M.Dive.Constants.Distance - eta * 0.35 + cornerPreference(mouth, point)
                 local _, risk = defenderDemand(f, f.origin, point, 0, eta)
                 targets[#targets + 1] = { target = target, priority = priority, order = #targets + 1, level = level, defenderRisk = risk }
             end
@@ -5410,9 +5551,16 @@ local function createStriker(d)
             if a.priority == b.priority then return a.order < b.order end
             return a.priority > b.priority
         end)
-        -- Check the strongest option at each height before revisiting the same height.
-        -- This changes work order, never the score or the physical validity of a shot.
+        -- Solve both upper corners early, then cover mid/low lanes. A short charge
+        -- must not spend its whole search budget on bends around an easy low seed.
+        -- Priority affects search order only; every proposal still needs native validation.
         local ordered, seen = {}, {}
+        for _, entry in ipairs(targets) do
+            if entry.level == 2 and math.abs(entry.target.X) == half then
+                ordered[#ordered + 1] = entry
+                seen[entry.level] = true
+            end
+        end
         for _, entry in ipairs(targets) do
             if not seen[entry.level] then seen[entry.level] = true; ordered[#ordered + 1] = entry end
         end
@@ -5475,43 +5623,68 @@ local function createStriker(d)
                         and f.charge <= f.minimumCharge + 0.025 then owner.tapPrepared = true end
                 end
             end
-            -- Solve both bends toward the strongest completed corner at full power.
-            -- Reusing a straight aim without compensating for spin would miss the target.
-            if f.autoCurve then
-                local bestSeed = owner.candidates[1]
-                if bestSeed then
-                    local side = (bestSeed.rating.position - f.mouth.center):Dot(f.mouth.lateral) < 0 and -1 or 1
-                    local inset = f.radius + C.EdgeMargin + C.TargetSlack
-                    local target = Vector2.new(side * (f.mouth.halfWidth - inset),
-                        math.clamp(bestSeed.rating.position.Y, f.mouth.bottom + f.radius + 0.4, f.mouth.top - inset))
-                    local checkedCurves = {}
-                    for _, curve in ipairs({ f.curve, -1, 1, 0 }) do
-                        if not checkedCurves[curve] then
-                            checkedCurves[curve] = true
-                            local curved = table.clone(solveFrame); curved.curve = curve
-                            retain(curved, -3, solve(curved, target, {}))
-                        end
-                    end
-                end
-            end
             local function prepare(atPower, entry, seed)
                 retain(atPower, entry.order, solve(atPower, entry.target, seed))
             end
             local seeds = {}
-            for index, entry in ipairs(targets) do
-                if index == 1 and not owner.tapPrepared and f.charge <= f.minimumCharge + 0.025 then
-                    local tapFrame = table.clone(f)
-                    tapFrame.charge, tapFrame.charges = f.minimumCharge, { f.minimumCharge }
-                    prepare(tapFrame, entry, {})
-                    owner.tapPrepared = true
+            if not owner.tapPrepared and f.charge <= f.minimumCharge + 0.025 then
+                local tapFrame = table.clone(f)
+                tapFrame.charge, tapFrame.charges = f.minimumCharge, { f.minimumCharge }
+                for _, entry in ipairs(targets) do
+                    if entry.level == 3 then prepare(tapFrame, entry, {}); break end
                 end
+                owner.tapPrepared = true
+            end
+            -- Compare straight and both bends at each upper corner before spending
+            -- time on more low variants. Each bend gets its own ballistic solve.
+            for index = 1, math.min(2, #targets) do
+                local entry = targets[index]
+                local at = table.clone(solveFrame); at.curve = f.curve
+                seeds[at.curve] = seeds[at.curve] or {}
+                prepare(at, entry, seeds[at.curve])
+            end
+            if f.autoCurve then
+                local curves, seenCurves = {}, { [f.curve] = true }
+                for _, curve in ipairs({ -1, 1, 0 }) do
+                    if not seenCurves[curve] then curves[#curves + 1] = curve; seenCurves[curve] = true end
+                end
+                for _, curve in ipairs(curves) do
+                    for index = 1, math.min(2, #targets) do
+                        local at = table.clone(solveFrame); at.curve = curve
+                        seeds[curve] = seeds[curve] or {}
+                        prepare(at, targets[index], seeds[curve])
+                    end
+                end
+            end
+            -- A lower bend can be harder when the keeper is well off-center. Give
+            -- the strongest middle lane the same three-curve comparison as the
+            -- upper corners, rather than assigning its bend by list position.
+            local middlePrepared
+            if f.autoCurve then
+                for _, entry in ipairs(targets) do
+                    if entry.level == 1 then
+                        local seen = {}
+                        for _, curve in ipairs({ f.curve, -1, 1, 0 }) do
+                            if not seen[curve] then
+                                seen[curve] = true
+                                local at = table.clone(solveFrame); at.curve = curve
+                                seeds[curve] = seeds[curve] or {}
+                                prepare(at, entry, seeds[curve])
+                            end
+                        end
+                        middlePrepared = entry
+                        break
+                    end
+                end
+            end
+            for index, entry in ipairs(targets) do
                 -- Rotate curve variants through later height solves within the same
                 -- coroutine budget. With auto curve off, this is the original search.
                 local curves = f.autoCurve and { f.curve, -1, 1, 0 } or { f.curve }
                 local curve = curves[(index - 1) % #curves + 1]
                 local candidateFrame = table.clone(solveFrame); candidateFrame.curve = curve
                 seeds[curve] = seeds[curve] or {}
-                prepare(candidateFrame, entry, seeds[curve])
+                if index > 2 and entry ~= middlePrepared then prepare(candidateFrame, entry, seeds[curve]) end
             end
         end)
     end
@@ -5521,9 +5694,9 @@ local function createStriker(d)
         local began, calls = os.clock(), 0
         if not owner.job or coroutine.status(owner.job) == "dead" or not compatible(owner.jobFrame, f)
             or os.clock() - owner.jobFrame.clock > C.CandidateAge then startJob(f, owner) end
-        -- Extra curve dimensions may use otherwise idle slice capacity, with the
-        -- same 2.5 ms deadline and no additional loop or update connection.
-        local callLimit = f.autoCurve and C.CallsPerSlice * 3 or C.CallsPerSlice
+        -- Use otherwise idle slice capacity to cover both corners. The wall-time
+        -- deadline remains 2.5 ms, with no additional loop or update connection.
+        local callLimit = C.CallsPerSlice * 6
         while owner.job and coroutine.status(owner.job) ~= "dead" and calls < callLimit do
             local ok, err = coroutine.resume(owner.job)
             if not ok then busy = false; error(err) end
@@ -5601,12 +5774,14 @@ local function createStriker(d)
             owner.curveChoice, choice = nil, nil
         end
         -- Keep the early preview at the player's curve while the alternatives solve.
-        -- Choose once in the existing pre-lock window, or immediately for a release/
-        -- imminent volley. This adds no delay to the native shot or aim lock.
+        -- Compare curves in the pre-lock window, or immediately for a release/
+        -- imminent volley. The native lock is the commitment boundary; a curve
+        -- chosen early must not exclude a stronger solution completed before it.
         local decideCurve = f.autoCurve and (#f.charges > 1 or owner.releasing or f.volley)
         local requiredCurve = choice and choice.curve
+        if decideCurve then requiredCurve = nil end
         if f.autoCurve and not decideCurve and not choice then requiredCurve = f.curve end
-        if f.autoCurve then
+        do
             local stage = f.volley and (f.canApply and "strike" or "prepare")
                 or (#f.charges > 1 and "lock" or (owner.releasing and "release" or "early"))
             if owner.validationStage ~= stage then
@@ -5623,13 +5798,25 @@ local function createStriker(d)
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
-        if choice then table.insert(shortlist, 1, choice.candidate) end
+        local incumbent = choice and choice.candidate or owner.selectedCandidate
+        if incumbent then table.insert(shortlist, 1, incumbent) end
+        owner.validationPass = (owner.validationPass or 0) + 1
+        local prioritizeBest = owner.validationPass % 2 == 0
         table.sort(shortlist, function(a, b)
             -- Revalidate the previous winner, then fairly visit alternatives. Two stale
             -- top-ranked proposals must not hide every other lane until aim lock.
             local incumbent = choice and choice.candidate or owner.selectedCandidate
             if a == incumbent then return b ~= incumbent end
             if b == incumbent then return false end
+            -- Alternate strength and age: refresh a strong finished corner promptly,
+            -- while stale or invalid leaders cannot permanently hide other lanes.
+            if prioritizeBest then
+                local ar, br = a.rating, b.rating
+                if a.checkedStage == owner.validationStage then ar = a.checkedRating end
+                if b.checkedStage == owner.validationStage then br = b.checkedRating end
+                if betterRating(ar, br) then return true end
+                if betterRating(br, ar) then return false end
+            end
             local ac, bc = a.checkedAt or 0, b.checkedAt or 0
             if ac ~= bc then return ac < bc end
             local ad = math.abs((a.power or f.charge) - f.charge)
@@ -5650,7 +5837,9 @@ local function createStriker(d)
                 -- second physics check available for a different proposal.
                 local duplicate
                 for _, seen in ipairs(seenAims) do
-                    if seen.direction == aim.Direction and seen.curve == candidateFrame.curve then
+                    -- Rebuilding yaw/pitch can change the last float bits of the
+                    -- same ray. Do not spend both slots checking that ray twice.
+                    if (seen.direction - aim.Direction).Magnitude <= 1e-6 and seen.curve == candidateFrame.curve then
                         duplicate = seen
                         break
                     end
@@ -5684,6 +5873,10 @@ local function createStriker(d)
                     score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
                     gap = rating and rating.gap, flightSeconds = rating and rating.eta,
                     ageSeconds = math.max(0, os.clock() - entry.at), correctedEdge = correctedEdge }
+                -- A full-power search score must not keep a proposal that failed
+                -- the real charge window ahead of every untested alternative.
+                -- These values order work only; selection always uses rate() above.
+                entry.checkedStage, entry.checkedRating = owner.validationStage, rating
                 if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
@@ -6082,6 +6275,7 @@ local function createStriker(d)
                     volleyRemaining = session.frame and session.frame.arrivalRemaining or nil,
                     estimatedGap = session.rating and session.rating.gap or nil,
                     reachDemand = session.rating and session.rating.reachDemand or nil,
+                    estimatedKeeperDifficulty = session.rating and session.rating.difficulty or nil,
                     predictionCharge = session.rating and session.rating.predictionCharge or nil,
                     estimatedFlightSeconds = session.rating and session.rating.eta or nil,
                     estimatedEdgeClearance = session.rating and session.rating.edgeClearance or nil,
@@ -6193,7 +6387,7 @@ local function createStriker(d)
     function A.Debug()
         return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.15",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
@@ -7324,7 +7518,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.22 stamina recovery",
+    build = "Dmc 0.23 startup and shot selection",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
@@ -8367,3 +8561,6 @@ ENV.AutoGKDebug = function()
 end
 
 print("[Auto GK] Loaded | RightShift: show / hide")
+
+-- DMC MAIN END
+end)
