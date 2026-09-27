@@ -9,7 +9,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR prototype 0.13"
+local BUILD = "Auto GK 3.2.6 | STR 0.15 | Misc 0.5 | Evaluation 0.2"
 local ENV = type(getgenv) == "function" and getgenv() or _G
 
 -- Keep the current instance running until all dependencies have loaded.
@@ -157,6 +157,8 @@ local S = {
     cancelUITweens = nil,
     releaseOwnedState = nil,
     releaseStriker = nil,
+    releaseMisc = nil,
+    releaseEvaluation = nil,
     connections = {},
     status = "STARTING",
     detail = "",
@@ -256,7 +258,9 @@ local function cleanup()
     if S.closeDropdown then attempt("UI close", S.closeDropdown) end
     if S.cancelUITweens then attempt("UI tweens", S.cancelUITweens) end
 
+    if S.releaseMisc then attempt("Miscellaneous", S.releaseMisc) end
     if S.releaseStriker then attempt("Striker hooks", S.releaseStriker) end
+    if S.releaseEvaluation then attempt("Evaluation observers", S.releaseEvaluation) end
 
     if S.releaseOwnedState then
         attempt("Owned state", S.releaseOwnedState, true)
@@ -4834,9 +4838,11 @@ local function createStriker(d)
         end
         local nowOrigin = origin
         local delta = velocity * lead
+        local airborneProjection
         if sample.IsAirborne and lead > 0 then
             local hum = ch:FindFirstChildOfClass("Humanoid")
             local floor = d.M.Grounding.GetStandingY(hum, root)
+            airborneProjection = { y = root.Position.Y, velocityY = root.AssemblyLinearVelocity.Y, floor = floor }
             local y = math.max(floor, root.Position.Y + root.AssemblyLinearVelocity.Y * lead - workspace.Gravity * lead * lead / 2)
             delta += Vector3.new(0, y - root.Position.Y, 0)
         end
@@ -4858,6 +4864,7 @@ local function createStriker(d)
             minimumCharge = minimum, maximumCharge = maximum,
             elapsed = elapsed,
             lead = lead, aimOffset = delta, volley = volley, canApply = imminent,
+            releaseProjection = approachingLock and { origin = nowOrigin, airborne = airborneProjection, reachProfiles = {} } or nil,
             distance = session.distance, arrivalRemaining = remaining,
             curve = curve, autoCurve = session.autoCurve == true and N.Curves.IsEnabled() and N.Curves.GetPower() > 0,
             boost = N.Power.GetMultiplier(ch), curvePower = N.Curves.GetPower(),
@@ -5275,10 +5282,32 @@ local function createStriker(d)
             defenderDemand = defenderReach < math.huge and defenderReach or nil, defenderRisk = defenderRisk,
             eta = eta, position = position, keepers = #f.keepers, edgeClearance = edge - f.radius }
     end
+    local function releaseFrame(f, charge)
+        local projection = f.releaseProjection
+        if not projection then return f end
+        local lead = math.max(0, charge - f.elapsed)
+        if math.abs(lead - f.lead) < 1e-8 then return f end
+        local at = table.clone(f)
+        local delta = f.velocity * lead
+        local air = projection.airborne
+        if air then
+            local y = math.max(air.floor, air.y + air.velocityY * lead - workspace.Gravity * lead * lead / 2)
+            delta += Vector3.new(0, y - air.y, 0)
+        end
+        at.origin = d.M.Physics.GetContainedGroundPosition(projection.origin + delta, f.radius, f.world)
+        at.aimOffset, at.lead = at.origin - projection.origin, lead
+        -- Reach envelopes include waiting time; another release time needs its own cache.
+        local profiles = projection.reachProfiles[lead]
+        if not profiles then profiles = {}; projection.reachProfiles[lead] = profiles end
+        at.reachProfiles = profiles
+        return at
+    end
     local function rate(f, aim, yielding)
         local ranked, conservativeGap, clearance, defenderReach, defenderRisk
         for _, charge in ipairs(f.charges) do
-            local result, edgePosition = validate(f, aim, charge, yielding)
+            -- Earlier releases move the carrier/camera less and give the keeper less
+            -- preparation time than the full-charge release in this same aim window.
+            local result, edgePosition = validate(releaseFrame(f, charge), aim, charge, yielding)
             if not result then return nil, edgePosition end
             if result.gap ~= nil then conservativeGap = math.min(conservativeGap or math.huge, result.gap) end
             clearance = math.min(clearance or math.huge, result.edgeClearance)
@@ -5531,6 +5560,7 @@ local function createStriker(d)
         owner.reason = nil
         owner.bestGap = nil
         owner.redirected = false
+        owner.decisionAudit = nil
         owner.completedAlternatives, owner.checkedAlternatives = 0, 0
         local f = frame(sample)
         if not f then
@@ -5551,6 +5581,10 @@ local function createStriker(d)
         end
         local normal = rate(f, sample, false)
         owner.rawRating = normal
+        local audit = { scope = "current aim and freshly checked proposals", checked = {}, duplicatesSkipped = 0,
+            rawScore = normal and normal.score, rawDefenderRisk = normal and normal.defenderRisk,
+            rawCurve = f.curve, frameAt = f.clock, predictionCharge = f.charge }
+        owner.decisionAudit = audit
         local clock = os.clock()
         if clock >= (owner.nextWork or 0) then
             owner.nextWork = clock + 1 / C.SampleHz
@@ -5585,7 +5619,7 @@ local function createStriker(d)
         end
         -- Recheck a completed candidate using current power, launch position and keeper state.
         -- Invalid/stale work never supplies a direction to native shooting.
-        local checked = 0
+        local checked, seenAims = 0, {}
         local shortlist = table.clone(owner.candidates)
         -- Preserve the chosen route even if the bounded search pool evicts its seed.
         -- It is a proposal only: revalidate it below with current power/world/keeper data.
@@ -5606,27 +5640,50 @@ local function createStriker(d)
         for _, entry in ipairs(shortlist) do
             if (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
-                checked += 1
-                owner.validationSequence = (owner.validationSequence or 0) + 1
-                entry.checkedAt = owner.validationSequence
                 local aim = candidateAim(entry, f)
                 local candidateFrame = f
                 if f.autoCurve and entry.curve ~= nil then
                     candidateFrame = table.clone(f); candidateFrame.curve = entry.curve
                 end
+                -- A committed winner may also remain in the search pool. Identical
+                -- current rays with the same curve share a validation; keep the
+                -- second physics check available for a different proposal.
+                local duplicate
+                for _, seen in ipairs(seenAims) do
+                    if seen.direction == aim.Direction and seen.curve == candidateFrame.curve then
+                        duplicate = seen
+                        break
+                    end
+                end
+                if duplicate then
+                    entry.checkedAt = duplicate.checkedAt
+                    audit.duplicatesSkipped += 1
+                    continue
+                end
+                checked += 1
+                owner.validationSequence = (owner.validationSequence or 0) + 1
+                entry.checkedAt = owner.validationSequence
+                seenAims[#seenAims + 1] = { direction = aim.Direction, curve = candidateFrame.curve,
+                    checkedAt = entry.checkedAt }
                 local rating, edgePosition = rate(candidateFrame, aim, false)
+                local correctedEdge = false
                 if not rating and edgePosition and checked < 2 then
                     local corrected = insetAim(candidateFrame, aim, edgePosition)
                     if corrected then
                         checked += 1
                         rating = rate(candidateFrame, corrected, false)
                         if rating then
+                            correctedEdge = true
                             aim = corrected
                             entry.direction, entry.frame, entry.at = aim.Direction, f, clock
                             entry.rating, entry.power = rating, f.charge
                         end
                     end
                 end
+                audit.checked[#audit.checked + 1] = { valid = rating ~= nil, curve = candidateFrame.curve,
+                    score = rating and rating.score, defenderRisk = rating and rating.defenderRisk,
+                    gap = rating and rating.gap, flightSeconds = rating and rating.eta,
+                    ageSeconds = math.max(0, os.clock() - entry.at), correctedEdge = correctedEdge }
                 if betterRating(rating, best) then
                     chosen, best, selectedCandidate, selectedCurve = aim, rating, entry, candidateFrame.curve
                 end
@@ -5647,6 +5704,12 @@ local function createStriker(d)
         owner.selectedCandidate = selectedCandidate
         owner.completedAlternatives = #owner.candidates
         owner.checkedAlternatives = checked
+        audit.proposalPool = #owner.candidates
+        audit.requiredCurve = requiredCurve
+        audit.selectedScore = best and best.score
+        audit.selectedDefenderRisk = best and best.defenderRisk
+        audit.selectedCurve = selectedCurve
+        audit.confirmedOriginalAim = confirmed == true
         if not chosen then
             owner.applied, owner.rating, owner.reason = false, nil, "searching"
             setStatus(#f.keepers == 0 and "SEARCHING / NO GK DATA" or "SEARCHING", decisionDetail(owner))
@@ -5992,6 +6055,7 @@ local function createStriker(d)
         end end)
         hook(d.M.Protocol, "Release", function(original) return function(command)
             local source = command
+            local evaluationRecord, evaluationFrame, evaluationPosition
             command = curveCommand(command)
             if alive and A.Enabled and session and command.PassType == d.M.Actions.PassTypes.Shot then
                 stats.shots += 1
@@ -6028,6 +6092,10 @@ local function createStriker(d)
                     outsideModeledReach = session.rating ~= nil and session.rating.gap ~= nil
                         and session.rating.gap >= C.ClearGapThreshold and (session.rating.defenderRisk or 0) == 0,
                     trackedKeepers = session.frame and #session.frame.keepers or 0 })
+                evaluationRecord, evaluationFrame = recentShots[#recentShots], session.frame
+                evaluationRecord.selectionAudit = session.decisionAudit
+                evaluationRecord.predictionAgeSeconds = session.frame and math.max(0, os.clock() - session.frame.clock) or nil
+                evaluationPosition = session.rating and session.rating.position
                 if #recentShots > 12 then table.remove(recentShots, 1) end
                 local outcome = session.smartDispatched and "smart release | "
                     or (session.applied and (session.redirected and "assisted | " or "aim confirmed | ") or "normal | ")
@@ -6036,7 +6104,11 @@ local function createStriker(d)
                 session = nil
                 table.clear(nativeLaunches)
             end
-            return forwardCommand(original, source, command)
+            local result = table.pack(forwardCommand(original, source, command))
+            if d.evaluation and evaluationRecord then
+                d.evaluation.Call("ShotSent", evaluationRecord, evaluationFrame, command, evaluationPosition)
+            end
+            return table.unpack(result, 1, result.n)
         end end)
         for _, key in ipairs({ "HandleStartRejected", "HandleReleaseRejected" }) do
             if type(N.Client[key]) == "function" then
@@ -6121,7 +6193,7 @@ local function createStriker(d)
     function A.Debug()
         return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.13",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.15",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
@@ -6136,16 +6208,1103 @@ local function createStriker(d)
     return A
 end
 
+-- Optional STR extras. Native input/cooldowns and stamina source ownership stay intact.
+local function createStrikerMisc(d)
+    local A = { AutoDribble = false, InfiniteStamina = false, DribbleStatus = "OFF", StaminaStatus = "OFF" }
+    local N: { [string]: any } = {}
+    local alive, loadingDribble, loadingStamina = true, false, false
+    local generation, staminaGeneration = 0, 0
+    local heartbeat, inputConnection = nil, nil
+    local ownershipHook, nativeOwner = nil, nil
+    local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
+    local nextStaminaRetry = 0
+    local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
+    local candidates, cachedCharacter = {}, nil
+    local staminaSource = "DmcStamina_" .. d.id
+    local staminaOwned = false
+    local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
+        attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
+        staminaAutoOff = 0, observerErrors = 0, errors = 0, maxTickMs = 0 }
+    local recent = {}
+    local lastCorrection = nil
+    local C = { Interval = 1 / 30, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
+        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15 }
+    local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+    local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+    local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
+    local function problem(err)
+        A.LastError = tostring(err)
+        stats.errors += 1
+        warn("[Dmc Misc] " .. A.LastError)
+    end
+    local function stopWatch()
+        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
+        if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+        if ownershipHook then
+            ownershipHook.active = false
+            if d.M.Dodge.SetOwnerUserId == ownershipHook.wrapper then
+                d.M.Dodge.SetOwnerUserId = ownershipHook.original
+            end
+            ownershipHook = nil
+        end
+        nativeOwner = nil
+        candidates, cachedCharacter = {}, nil
+        nextDiscovery = 0
+    end
+    local function stopStaminaWatch()
+        if staminaHeartbeat then staminaHeartbeat:Disconnect(); staminaHeartbeat = nil end
+        if guardHook then
+            guardHook.active = false
+            -- A later wrapper belongs to its installer; leave our inner observer passive.
+            if N.Guard.Validate == guardHook.observer then N.Guard.Validate = guardHook.original end
+            guardHook = nil
+        end
+        correctionPending = nil
+    end
+    local function startStaminaWatch()
+        assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
+        if guardHook then
+            assert(guardHook.active, "Previous movement observer cleanup is incomplete")
+            return
+        end
+        local hook = { original = N.Guard.Validate, active = true }
+        local function noteRejected(root, claimedPosition, claimedVelocity)
+            stats.localCorrections += 1
+            local correction = { clock = os.clock(), context = d.M.Motion.GetContext(d.Player.Character),
+                positionChange = (root.Position - claimedPosition).Magnitude,
+                velocityChange = (root.AssemblyLinearVelocity - claimedVelocity).Magnitude,
+                source = "LocalMovementGuard.Validate", staminaWasOn = true }
+            lastCorrection = correction
+            if not correctionPending then correctionPending = correction end
+            A.StaminaStatus = "CORRECTION DETECTED"
+        end
+        hook.observer = function(root, ...)
+            local character = d.Player.Character
+            local watching = hook.active and alive and d.alive() and A.InfiniteStamina
+                and root ~= nil and character and root == character:FindFirstChild("HumanoidRootPart")
+            local claimedPosition = watching and root.Position or nil
+            local claimedVelocity = watching and root.AssemblyLinearVelocity or nil
+            -- Run validation exactly once. Its corrections, result and errors stay native.
+            local result = hook.original(root, ...)
+            if watching and result == false then
+                local ok = pcall(noteRejected, root, claimedPosition, claimedVelocity)
+                if not ok then
+                    stats.observerErrors += 1
+                    correctionPending = correctionPending or { source = "LocalMovementGuard.Validate", detail = "diagnostic unavailable" }
+                end
+            end
+            return result
+        end
+        guardHook = hook
+        N.Guard.Validate = hook.observer
+        staminaHeartbeat = d.Run.Heartbeat:Connect(function()
+            if not (alive and d.alive() and correctionPending) or os.clock() < nextStaminaRetry then return end
+            nextStaminaRetry = os.clock() + 1
+            -- Apply the native switch outside Validate, after its physics correction.
+            local correction = correctionPending
+            if A.SetInfiniteStamina(false) then
+                stats.staminaAutoOff += 1
+                lastCorrection = correction
+                A.StaminaStatus = "OFF: LOCAL CORRECTION"
+            else
+                -- Keep the pending shutdown and observer until native release succeeds.
+                correctionPending = correction
+                A.StaminaStatus = "CLEANUP REQUIRED"
+            end
+        end)
+    end
+    local function stopDribbleWatch(err)
+        A.AutoDribble = false
+        generation += 1
+        stopWatch()
+        A.DribbleStatus = "ERROR"
+        problem(err)
+    end
+    local function loadDribble()
+        local paths = { Controls = "Modules.Gameplay.Controls", Input = "Libraries.Input",
+            Tackle = "Modules.Actions.SlideTackle", Sprint = "Client.Gameplay.Player.Sprint",
+            Shoot = "Client.Gameplay.Actions.Shoot", ChargeState = "Modules.Actions.ActionChargeState",
+            Effects = "Client.Gameplay.Actions.TackleEffects", KickCore = "Modules.Actions.KickCore",
+            Power = "Modules.Actions.KickPowerups" }
+        for name, path in pairs(paths) do
+            if not N[name] then N[name] = d.load(path) end
+        end
+        for _, item in ipairs({ { N.Controls, "CreateInput" }, { N.Controls, "IsInput" },
+            { N.Controls, "IsAvailable" }, { N.Controls, "IsOnCooldown" }, { N.Controls, "IsActive" },
+            { N.Input, "ShouldIgnoreKeybind" }, { N.Tackle, "GetSlidingUntil" },
+            { N.Tackle, "GetMaximumTravelBetween" }, { N.Sprint, "CanSpendStamina" },
+            { N.Shoot, "IsCharging" }, { N.ChargeState, "IsCharging" }, { N.Effects, "GetObservedChargeFill" },
+            { N.KickCore, "GetMinimumReleaseDelaySeconds" }, { N.Power, "GetChargeConstants" },
+            { d.M.Dodge, "HandleInputBegan" }, { d.M.Dodge, "IsDribbling" } }) do
+            assert(type(item[1][item[2]]) == "function", "Missing native dribble API: " .. item[2])
+        end
+        N.Dodge = N.Dodge or d.load("Modules.Actions.Dodge")
+        assert(finite(N.Dodge.Constants.StaminaCost), "Missing dribble stamina cost")
+        local box = d.M.Hitboxes.Kick
+        assert(box and vector(box.Size) and typeof(box.CFrameOffset) == "CFrame", "Missing native kick hitbox")
+    end
+    local function currentBallId()
+        return type(d.M.Renderer.GetMatchBallId) == "function" and d.M.Renderer.GetMatchBallId() or nil
+    end
+    local function watchNativeOwner()
+        local hook = { original = d.M.Dodge.SetOwnerUserId, active = true }
+        assert(type(hook.original) == "function", "Native dribble ownership unavailable")
+        hook.wrapper = function(userId, ...)
+            if hook.active then nativeOwner = nil end
+            local result = table.pack(hook.original(userId, ...))
+            if hook.active and alive and A.AutoDribble and d.alive() then
+                local ok = pcall(function()
+                    local ch = d.Player.Character
+                    nativeOwner = ch and { character = ch, ballId = currentBallId(),
+                        context = d.M.Motion.GetContext(ch), userId = userId } or nil
+                end)
+                if not ok then nativeOwner = nil; stats.observerErrors += 1 end
+            end
+            return table.unpack(result, 1, result.n)
+        end
+        ownershipHook = hook
+        d.M.Dodge.SetOwnerUserId = hook.wrapper
+    end
+    local function ownsBall(ch)
+        -- Follow the same handoff as native Dodge; the renderer may lag on receipt.
+        if nativeOwner and nativeOwner.character == ch and nativeOwner.ballId == currentBallId()
+            and nativeOwner.context == d.M.Motion.GetContext(ch) then
+            return nativeOwner.userId == d.Player.UserId
+        end
+        return d.M.Renderer.GetOwnedUserId() == d.Player.UserId
+    end
+    local function eligible()
+        if not (alive and A.AutoDribble and d.alive()) then return nil, "OFF" end
+        if d.suspended() or N.Input.ShouldIgnoreKeybind(false) or d.Gui.MenuIsOpen
+            or os.clock() < manualUntil then return nil, "PAUSED" end
+        local ch = d.Player.Character
+        local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+        local root = ch and ch:FindFirstChild("HumanoidRootPart")
+        if not ch or not ch.Parent or not root or not hum or hum.Health <= 0 then return nil, "WAITING" end
+        if d.M.Match.IsGoalkeeperCharacter(ch) then return nil, "GK ROLE" end
+        if d.M.Freeze.IsFrozen() or d.M.Replay.IsActive() or d.M.Controllers.IsSuspended(ch) then return nil, "PAUSED" end
+        if not ownsBall(ch) then return nil, "NO BALL" end
+        if N.Shoot.IsCharging() then return nil, "SHOOTING" end
+        for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick" }) do
+            if N.Controls.IsActive(name) then return nil, "STRIKING" end
+        end
+        if d.M.Dodge.IsDribbling() then return nil, "DRIBBLING" end
+        if d.M.Slide.IsSlideTackling() or not d.M.Controllers.IsLanded(ch, hum) then return nil, "MOVING" end
+        if not N.Controls.IsAvailable("Dribble") or N.Controls.IsOnCooldown("Dribble") then return nil, "COOLDOWN / BLOCKED" end
+        if not N.Sprint.CanSpendStamina(N.Dodge.Constants.StaminaCost, true) then return nil, "LOW STAMINA" end
+        if os.clock() < retryAt then return nil, "RETRY WAIT" end
+        return ch, root
+    end
+    local function discover(ch)
+        local seen, list = {}, {}
+        local function add(character, actor)
+            if not character or character == ch or seen[character] then return end
+            seen[character] = true
+            list[#list + 1] = { character = character, actor = actor or character }
+        end
+        for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+        local folder = workspace:FindFirstChild("Characters")
+        local function children(container)
+            if not container then return end
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("Model") then add(child) end
+            end
+        end
+        children(folder)
+        children(folder and folder:FindFirstChild("NPCs"))
+        candidates, cachedCharacter = list, ch
+        nextDiscovery = os.clock() + C.DiscoverySeconds
+    end
+    local function segmentBox(a, b, half)
+        local low, high = 0, 1
+        for _, axis in ipairs({ "X", "Y", "Z" }) do
+            local origin: number = a[axis]
+            local delta: number = b[axis] - origin
+            local extent: number = half[axis]
+            if math.abs(delta) < 1e-8 then
+                if math.abs(origin) > extent then return false end
+            else
+                local enter, leave = (-extent - origin) / delta, (extent - origin) / delta
+                if enter > leave then enter, leave = leave, enter end
+                low, high = math.max(low, enter), math.min(high, leave)
+                if low > high then return false end
+            end
+        end
+        return true
+    end
+    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age)
+        local constants = N.Tackle.Constants
+        local first = math.max(0, constants.HitboxDelaySeconds - age)
+        local last = math.min(C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
+        if last < first then return nil end
+        local direction = flat(otherVelocity)
+        if direction.Magnitude < 1 then direction = flat(otherCF.LookVector) end
+        if direction.Magnitude < 1e-5 then return nil end
+        direction = direction.Unit
+        -- The native maximum is conservative through the startup/main-dash handoff.
+        -- Recompute from the observed root every scan; never integrate a stale origin.
+        local box = d.M.Hitboxes.SlideTackle
+        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
+        local facing = CFrame.lookAt(otherCF.Position, otherCF.Position + direction)
+        local function point(t)
+            local travel = N.Tackle.GetMaximumTravelBetween(age, age + t,
+                constants.StartupDashDistance, constants.Distance)
+            local rootCF = facing + direction * travel
+            return (rootCF * box.CFrameOffset):PointToObjectSpace(ownCF.Position + ownVelocity * t)
+        end
+        local previous = point(first)
+        if segmentBox(previous, previous, half) then return first end
+        local steps = math.max(1, math.ceil((last - first) / C.Step))
+        for i = 1, steps do
+            local t = first + (last - first) * i / steps
+            local current = point(t)
+            if segmentBox(previous, current, half) then return t end
+            previous = current
+        end
+        return nil
+    end
+    local function kickWindow(candidate)
+        local other, actor = candidate.character, candidate.actor
+        if actor == other then
+            local userId = other:GetAttribute("UserId")
+            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
+        end
+        if not actor or actor.Character ~= other or not finite(actor.UserId)
+            or d.M.Match.IsGoalkeeperCharacter(other) or not N.ChargeState.IsCharging(actor) then return nil end
+        -- Presentation alone can linger after cancellation. Require live native charge state too.
+        -- This fill is elapsed / maximum, NOT KickCore's power alpha.
+        local fill, compact = N.Effects.GetObservedChargeFill(actor.UserId)
+        if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then return nil end
+        local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
+        local maximum = constants and constants.MaximumChargeSeconds
+        if not finite(maximum) or maximum <= 0 then return nil end
+        local first = N.KickCore.GetMinimumReleaseDelaySeconds(fill * maximum, constants)
+        if not finite(first) or first < 0 or first > C.KickLookahead then return nil end
+        return { first = first, fill = fill }
+    end
+    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first)
+        local box = d.M.Hitboxes.Kick
+        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
+        -- Standing kicks use the facing hitbox, not slide travel or velocity-facing.
+        -- Release can happen any time after minimum charge: this is a threat estimate.
+        local function point(t)
+            local rootCF = otherCF + otherVelocity * t
+            return (rootCF * box.CFrameOffset):PointToObjectSpace(ownCF.Position + ownVelocity * t)
+        end
+        local previous = point(first)
+        if segmentBox(previous, previous, half) then return first end
+        local steps = math.max(1, math.ceil((C.KickLookahead - first) / C.Step))
+        for i = 1, steps do
+            local t = first + (C.KickLookahead - first) * i / steps
+            local current = point(t)
+            if segmentBox(previous, current, half) then return t end
+            previous = current
+        end
+        return nil
+    end
+    local function tick()
+        local ch, rootOrReason = eligible()
+        if not ch then A.DribbleStatus = rootOrReason; return end
+        local root = rootOrReason
+        local team = d.M.Teams.GetActorTeamName(d.Player)
+        -- Neutral practice actors share one team; do not guess which is hostile.
+        local opposing = d.M.Match.Constants.TeamDisplayNames[team] and d.M.Match.GetOpposingTeamName(team)
+        if not opposing then A.DribbleStatus = "WAITING FOR OPPONENT"; return end
+        local context = d.M.Motion.GetContext(ch)
+        local ownCF = d.M.Motion.GetCFrame(ch) or root.CFrame
+        local velocity = d.M.Motion.GetVelocity(ch) or root.AssemblyLinearVelocity
+        if not vector(ownCF.Position) or not vector(velocity) then return end
+        if cachedCharacter ~= ch or os.clock() >= nextDiscovery then discover(ch) end
+        stats.scans += 1
+        A.DribbleStatus = "WATCHING"
+        local now, best = workspace:GetServerTimeNow(), nil
+        for _, candidate in ipairs(candidates) do
+            local other = candidate.character
+            if other.Parent and d.M.Motion.GetContext(other) == context
+                and d.M.Teams.GetActorTeamName(candidate.actor) == opposing then
+                -- Require an observed slide or a live native kick charge, never proximity alone.
+                local untilTime = N.Tackle.GetSlidingUntil(other)
+                local constants = N.Tackle.Constants
+                local age = finite(untilTime) and now - (untilTime - constants.TotalMotionSeconds) or nil
+                local hitboxEndsAt = constants.HitboxDelaySeconds + constants.HitboxSeconds
+                local sliding = age ~= nil and age >= 0 and age <= hitboxEndsAt
+                local kick = kickWindow(candidate)
+                if not sliding and not kick then continue end
+                local hum = other:FindFirstChildOfClass("Humanoid")
+                local otherRoot = other:FindFirstChild("HumanoidRootPart")
+                if hum and hum.Health > 0 and otherRoot then
+                    local otherCF = d.M.Motion.GetCFrame(other) or otherRoot.CFrame
+                    local otherVelocity = d.M.Motion.GetVelocity(other) or otherRoot.AssemblyLinearVelocity
+                    if vector(otherCF.Position) and vector(otherVelocity)
+                        and (otherCF.Position - ownCF.Position).Magnitude <= C.Range then
+                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age) or nil
+                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first) or nil
+                        local reason = "tackle"
+                        if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
+                        local distance = flat(otherCF.Position - ownCF.Position).Magnitude
+                        if eta and (not best or eta < best.eta or eta == best.eta and (distance or math.huge) < (best.distance or math.huge)) then
+                            best = { character = other, eta = eta, distance = distance, reason = reason,
+                                tackleAge = reason == "tackle" and age or nil,
+                                hitboxRemaining = reason == "tackle" and hitboxEndsAt - age or nil,
+                                kickChargeFill = reason == "kick" and kick.fill or nil,
+                                earliestRelease = reason == "kick" and kick.first or nil }
+                        end
+                    end
+                end
+            end
+        end
+        if not best or not eligible() then return end
+        stats.threats += 1
+        local input = N.Controls.CreateInput("Dribble")
+        assert(input and N.Controls.IsInput("Dribble", input), "Native dribble binding unavailable")
+        retryAt = os.clock() + C.RetrySeconds
+        stats.attempts += 1
+        -- This owns cooldown, stamina, local movement and the action request together.
+        -- Do not call Init/Cleanup or synthesize a separate remote request.
+        local attempt = { target = best.character.Name, contactSeconds = best.eta, distance = best.distance, reason = best.reason,
+            tackleAgeSeconds = best.tackleAge, hitboxRemainingSeconds = best.hitboxRemaining,
+            kickChargeFill = best.kickChargeFill, earliestReleaseSeconds = best.earliestRelease,
+            serverConfirmed = false }
+        if d.evaluation then
+            d.evaluation.Dribble(attempt, function() d.M.Dodge.HandleInputBegan(input, false) end, best.character)
+        else
+            d.M.Dodge.HandleInputBegan(input, false)
+        end
+        local started = d.M.Dodge.IsDribbling() == true
+        if started then
+            stats.started += 1
+            if best.reason == "kick" then stats.kickTriggers += 1 else stats.tackleTriggers += 1 end
+        else
+            stats.nativeBlocked += 1
+        end
+        A.DribbleStatus = started and "DRIBBLING" or "NATIVE BLOCKED"
+        attempt.localStarted = started
+        recent[#recent + 1] = attempt
+        if #recent > 8 then table.remove(recent, 1) end
+    end
+    -- Read only; used at 10 Hz exclusively during an explicit comparison run.
+    function A.ObserveDribbleGate()
+        if not (alive and A.AutoDribble and d.alive()) then return nil end
+        local ch, rootOrReason = eligible()
+        -- Readiness alone does not imply a qualifying incoming attack.
+        local gate = ch and "ready" or rootOrReason
+        if not ch then
+            if gate ~= "COOLDOWN / BLOCKED" and gate ~= "DRIBBLING"
+                and gate ~= "LOW STAMINA" and gate ~= "RETRY WAIT" then return nil end
+            ch = d.Player.Character
+        end
+        if gate == "COOLDOWN / BLOCKED" then
+            gate = N.Controls.IsOnCooldown("Dribble") and "cooldown" or "native_blocked"
+        elseif gate == "DRIBBLING" then gate = "active"
+        elseif gate == "LOW STAMINA" then gate = "low_stamina"
+        elseif gate == "RETRY WAIT" then gate = "retry_wait" end
+        return ch, gate
+    end
+    function A.SetAutoDribble(value)
+        value = value == true
+        generation += 1
+        local request = generation
+        if not value then
+            A.AutoDribble = false
+            stopWatch()
+            A.DribbleStatus = "OFF"
+            return true
+        end
+        if not alive or not d.alive() or loadingDribble then return false end
+        if A.AutoDribble then return true end
+        loadingDribble = true
+        local ok, err = pcall(loadDribble)
+        loadingDribble = false
+        if request ~= generation or not alive or not d.alive() then return false end
+        if not ok then stopDribbleWatch(err); return false end
+        A.AutoDribble, A.DribbleStatus, nextTick = true, "WATCHING", 0
+        local connected, connectionError = pcall(function()
+            watchNativeOwner()
+            inputConnection = d.Input.InputBegan:Connect(function(input)
+                if not A.AutoDribble then return end
+                local checked, inputError = pcall(function()
+                    for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick", "Dribble", "Tackle", "Jump" }) do
+                        if N.Controls.IsInput(name, input) then manualUntil = os.clock() + C.ManualGrace; break end
+                    end
+                end)
+                if not checked then stopDribbleWatch(inputError) end
+            end)
+            heartbeat = d.Run.Heartbeat:Connect(function()
+                if not (alive and A.AutoDribble and d.alive()) or os.clock() < nextTick then return end
+                nextTick = os.clock() + C.Interval
+                local start = os.clock()
+                local succeeded, tickError = pcall(tick)
+                stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
+                if not succeeded then stopDribbleWatch(tickError) end
+            end)
+        end)
+        if not connected then stopDribbleWatch(connectionError); return false end
+        return true
+    end
+    function A.SetInfiniteStamina(value)
+        value = value == true
+        staminaGeneration += 1
+        local request = staminaGeneration
+        if value and (not alive or not d.alive() or loadingStamina) then return false end
+        if value and A.InfiniteStamina then return true end
+        if not value and not staminaOwned then
+            local stopped, stopError = pcall(stopStaminaWatch)
+            A.InfiniteStamina = false
+            A.StaminaStatus = stopped and "OFF" or "CLEANUP REQUIRED"
+            if not stopped then problem(stopError) end
+            return stopped
+        end
+        loadingStamina = true
+        local ok, err = pcall(function()
+            if not N.Sprint then N.Sprint = d.load("Client.Gameplay.Player.Sprint") end
+            assert(type(N.Sprint.SetUnlimitedStamina) == "function", "Native stamina switch unavailable")
+            if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
+            if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
+            if value then startStaminaWatch() end
+            -- Mark before calling: if native HUD refresh throws after setting the source,
+            -- rollback and later cleanup must still know that removal is required.
+            if value then staminaOwned = true end
+            N.Sprint.SetUnlimitedStamina(staminaSource, value)
+            staminaOwned = value
+            if not value then stopStaminaWatch() end
+        end)
+        loadingStamina = false
+        if not ok then
+            if value and staminaOwned then
+                local removed = pcall(N.Sprint.SetUnlimitedStamina, staminaSource, false)
+                if removed then staminaOwned = false end
+            end
+            if not staminaOwned then pcall(stopStaminaWatch) end
+            A.InfiniteStamina = staminaOwned
+            A.StaminaStatus = staminaOwned and "CLEANUP REQUIRED" or "ERROR"
+            problem(err)
+            return false
+        end
+        if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
+        A.InfiniteStamina = value
+        if value then correctionPending, nextStaminaRetry = nil, 0 end
+        A.StaminaStatus = value and "LOCAL ON" or "OFF"
+        return true
+    end
+    function A.Cleanup()
+        alive = false
+        A.SetAutoDribble(false)
+        return A.SetInfiniteStamina(false)
+    end
+    function A.Debug()
+        return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
+            dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.5",
+            dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
+            kickLookaheadSeconds = C.KickLookahead,
+            correctionFallback = true, lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
+            stats = table.clone(stats), recent = table.clone(recent) }
+    end
+    if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime } end
+    return A
+end
+
+-- Bounded, passive evidence collection. No aim, physics, stamina or action decisions.
+local function createStrikerEvaluation(d)
+    local A = {}
+    local alive, sequence, heartbeat = true, 0, nil
+    local shots, dribbles, connections = {}, {}, {}
+    local pending, dribbleScopes = {}, setmetatable({}, { __mode = "k" })
+    local mainThread, hooks = {}, {}
+    local trial, trialSequence, probe, settingsProbe = nil, 0, nil, nil
+    local trials, encounters, activeEncounters, roster = {}, {}, {}, {}
+    local nextRoster, encounterSequence = 0, 0
+    local encounterOwner, encounterBall, encounterContext = nil, nil, nil
+    local sampleEncounters
+    local nextTick = 0
+    local stats = { shots = 0, dribbles = 0, exactFlightMatches = 0, shotRejections = 0,
+        dribbleRejections = 0, attributeDribbles = 0, unmatchedMovements = 0,
+        unreadableMovements = 0, errors = 0, maxMaintenanceMs = 0, maxCallbackMs = 0,
+        proximitySamples = 0, encounters = 0, droppedShots = 0, droppedDribbles = 0, droppedEncounters = 0 }
+    local lastError, movementFields = nil, nil
+    local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+    local function scalar(v) return type(v) == "string" or type(v) == "boolean" or finite(v) end
+    local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
+    local function plain(value, depth)
+        if scalar(value) then return value end
+        if type(value) ~= "table" or (depth or 0) >= 5 then return nil end
+        local out = {}
+        for k, v in pairs(value) do
+            if type(k) == "string" or type(k) == "number" then out[k] = plain(v, (depth or 0) + 1) end
+        end
+        return out
+    end
+    local function protect(fn, ...)
+        local began = os.clock()
+        local result = table.pack(pcall(fn, ...))
+        stats.maxCallbackMs = math.max(stats.maxCallbackMs, (os.clock() - began) * 1000)
+        if not result[1] then
+            stats.errors += 1
+            lastError = tostring(result[2])
+            return nil
+        end
+        return table.unpack(result, 2, result.n)
+    end
+    local function close(record, reason)
+        if record.closed then return end
+        record.closed = true
+        record.observationEnd = reason
+        pending[record] = nil
+        if record.attributeConnection then
+            record.attributeConnection:Disconnect()
+            record.attributeConnection = nil
+        end
+        record.character, record.goal, record.mouth = nil, nil, nil
+        record.predictedPosition, record.lastPosition = nil, nil
+    end
+    local function sameContext(record)
+        return record.character == d.Player.Character
+            and record.context == d.M.Motion.GetContext(d.Player.Character)
+            and record.ballId == d.M.Renderer.GetMatchBallId()
+    end
+    local function step()
+        local now = os.clock()
+        for record in pairs(pending) do
+            if not sameContext(record) then
+                close(record, "context_changed")
+            elseif now >= record.deadline then
+                if record.kind == "dribble" then
+                    record.localOwnerAtWindowEnd = d.M.Renderer.GetOwnedUserId() == d.Player.UserId
+                end
+                close(record, "window_ended")
+            end
+        end
+        if trial and sampleEncounters then sampleEncounters(now) end
+        if not trial and not next(pending) and heartbeat then heartbeat:Disconnect(); heartbeat = nil end
+    end
+    local function watch(record)
+        if record then pending[record] = true end
+        if heartbeat then return end
+        nextTick = 0
+        heartbeat = d.Run.Heartbeat:Connect(function()
+            if not alive or not d.alive() then return end
+            local now = os.clock()
+            if now < nextTick then return end
+            nextTick = now + 0.1
+            local began = now
+            protect(step)
+            stats.maxMaintenanceMs = math.max(stats.maxMaintenanceMs, (os.clock() - began) * 1000)
+        end)
+    end
+    local function newRecord(kind, detail)
+        if not alive or not d.alive() then return nil end
+        sequence += 1
+        local r = plain(detail or {})
+        r.id, r.kind, r.observedAt = sequence, kind, os.clock()
+        r.build, r.trialId = d.build or "unlabelled_build", trial and trial.id or nil
+        r.sessionIdTag = d.sessionId
+        r.trialLabel, r.scenario = trial and trial.label or nil, trial and trial.scenario or nil
+        r.settings = trial and settingsProbe and plain(protect(settingsProbe)) or nil
+        r.recordedAtMilliseconds = d.timestamp and d.timestamp() or nil
+        r.context = d.M.Motion.GetContext(d.Player.Character)
+        r.ballId = d.M.Renderer.GetMatchBallId()
+        r.character = d.Player.Character
+        r.deadline = r.observedAt + (kind == "shot" and 8 or 1.5)
+        r.serverStatus = "unconfirmed"
+        if trial then trial[kind == "shot" and "shots" or "dribbles"] += 1 end
+        local list = kind == "shot" and shots or dribbles
+        list[#list + 1] = r
+        if #list > 40 then
+            close(table.remove(list, 1), "record_limit")
+            local key = kind == "shot" and "droppedShots" or "droppedDribbles"
+            stats[key] += 1
+        end
+        if kind == "shot" then stats.shots += 1 else stats.dribbles += 1 end
+        watch(r)
+        return r
+    end
+    local function endEncounters(reason)
+        for character, record in pairs(activeEncounters) do
+            record.observationEnd = reason
+            activeEncounters[character] = nil
+        end
+    end
+    local function encounter(character, gate, distance, now)
+        if not trial or not character then return nil end
+        local r = activeEncounters[character]
+        local context, ball = d.M.Motion.GetContext(d.Player.Character), d.M.Renderer.GetMatchBallId()
+        if encounterOwner ~= d.Player.Character or encounterBall ~= ball or encounterContext ~= context then
+            endEncounters("context_changed")
+            encounterOwner, encounterBall, encounterContext = d.Player.Character, ball, context
+            r = nil
+        end
+        if r and (now - r.lastObservedAt > 0.35 or r.context ~= context or r.ballId ~= ball) then
+            r.observationEnd = "separated_or_context_changed"
+            activeEncounters[character], r = nil, nil
+        end
+        if not r then
+            encounterSequence += 1
+            r = { id = encounterSequence, build = d.build or "unlabelled_build", trialId = trial.id,
+                sessionIdTag = d.sessionId,
+                trialLabel = trial.label, scenario = trial.scenario, target = character.Name,
+                context = context, ballId = ball, observedAt = now, firstGate = gate,
+                gates = {}, attemptIds = {} }
+            activeEncounters[character] = r
+            encounters[#encounters + 1] = r
+            stats.encounters += 1
+            if #encounters > 60 then
+                local old = table.remove(encounters, 1)
+                for key, value in pairs(activeEncounters) do if value == old then activeEncounters[key] = nil end end
+                stats.droppedEncounters += 1
+            end
+        end
+        r.lastObservedAt = now
+        r.gates[gate] = true
+        if gate == "eligible" then r.firstEligibleAt = r.firstEligibleAt or now end
+        if finite(distance) then r.minimumDistance = math.min(r.minimumDistance or math.huge, distance) end
+        return r
+    end
+    sampleEncounters = function(now)
+        if not probe or not d.Players then return end
+        -- Report() can be called freely without increasing sampling frequency.
+        if trial.nextSample and now < trial.nextSample then return end
+        trial.nextSample = now + 0.1
+        local ch, gate = probe()
+        if not ch then endEncounters("not_observing"); return end
+        local team = d.M.Teams.GetActorTeamName(d.Player)
+        local opposing = d.M.Match.Constants.TeamDisplayNames[team] and d.M.Match.GetOpposingTeamName(team)
+        local ownCF = d.M.Motion.GetCFrame(ch)
+        if not opposing or not ownCF or not vector(ownCF.Position) then endEncounters("unavailable_context"); return end
+        if now >= nextRoster then
+            local seen = {}
+            roster = {}
+            local function add(character, actor)
+                if not character or character == ch or seen[character] then return end
+                seen[character] = true
+                if #roster >= 128 then trial.rosterTruncated = true; return end
+                roster[#roster + 1] = { character = character, actor = actor or character }
+            end
+            for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+            local folder = workspace:FindFirstChild("Characters")
+            for _, container in ipairs({ folder, folder and folder:FindFirstChild("NPCs") }) do
+                for _, child in ipairs(container:GetChildren()) do if child:IsA("Model") then add(child) end end
+            end
+            nextRoster = now + 0.5
+        end
+        stats.proximitySamples += 1
+        for _, entry in ipairs(roster) do
+            local other = entry.character
+            local hum = other.Parent and other:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and d.M.Motion.GetContext(other) == d.M.Motion.GetContext(ch)
+                and d.M.Teams.GetActorTeamName(entry.actor) == opposing then
+                local otherCF = d.M.Motion.GetCFrame(other)
+                if otherCF and vector(otherCF.Position) then
+                    local delta = otherCF.Position - ownCF.Position
+                    local distance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+                    local radius = activeEncounters[other] and 10.5 or 9
+                    if math.abs(delta.Y) <= 5 and distance <= radius then encounter(other, gate, distance, now) end
+                end
+            end
+        end
+        for character, r in pairs(activeEncounters) do
+            if now - r.lastObservedAt > 0.35 then
+                r.observationEnd = "left_proximity"
+                activeEncounters[character] = nil
+            end
+        end
+    end
+    function A.ConfigureComparison(readGate, readSettings)
+        probe, settingsProbe = readGate, readSettings
+    end
+    function A.BeginTrial(label, scenario)
+        if not alive or not d.alive() then return false, "Script is unloaded" end
+        if trial then return false, "End and export the current run first" end
+        if type(label) ~= "string" or not label:find("%S") or #label > 64
+            or type(scenario) ~= "string" or not scenario:find("%S") or #scenario > 64 then
+            return false, "Use a run label and scenario, each 1-64 characters"
+        end
+        local settings = settingsProbe and protect(settingsProbe) or nil
+        if settingsProbe and type(settings) ~= "table" then return false, "Settings snapshot unavailable" end
+        trialSequence += 1
+        trial = { id = trialSequence, label = label, scenario = scenario, build = d.build or "unlabelled_build",
+            startedAt = os.clock(), settings = plain(settings), firstAttemptId = sequence + 1, shots = 0, dribbles = 0 }
+        trials[#trials + 1] = trial
+        if #trials > 12 then table.remove(trials, 1) end
+        nextRoster = 0
+        watch(nil)
+        return true, trial.id
+    end
+    function A.EndTrial()
+        if not trial then return false, "No active comparison run" end
+        local id = trial.id
+        trial.endedAt, trial.lastAttemptId = os.clock(), sequence
+        endEncounters("run_ended")
+        trial, roster = nil, {}
+        protect(step)
+        return true, id
+    end
+    local function noteStrike(command)
+        if type(command) ~= "table" then return end
+        local strike = command.Kind == "Kick" or command.Kind == "RainbowFlick"
+            or command.Kind == "Tackle" and (command.Mode == "Kick" or command.Mode == "Volley")
+        if not strike then return end
+        for r in pairs(pending) do
+            if r.kind == "dribble" and sameContext(r) then
+                r.strikeIntent = command.PassType or command.Kind
+                r.strikeActionId, r.strikeSessionId = command.ActionId, command.SessionId
+                close(r, "strike_intent")
+            end
+        end
+    end
+    local function shotSent(detail, frame, command, predictedPosition)
+        local r = newRecord("shot", detail)
+        if not r then return end
+        -- Native Release has already stamped its identifiers; never guess by timing alone.
+        r.sessionId, r.actionId = command.SessionId, command.ActionId
+        r.charge = command.ChargeSeconds
+        r.curve = command.Curve or 0
+        r.predictionComparable = frame ~= nil and frame.character == r.character
+            and frame.context == r.context and frame.ballId == r.ballId
+        if r.predictionComparable then
+            r.goal = frame.goal
+            -- Engine vectors are private; the public report contains only scalar errors.
+            r.predictedPosition = predictedPosition
+            r.mouth = frame.mouth
+        end
+        detail.evaluationId = r.id
+    end
+    local function beginDribble(detail, target)
+        local r = newRecord("dribble", detail)
+        if not r then return end
+        detail.evaluationId = r.id
+        local episode = encounter(target, "eligible", detail.distance, os.clock())
+        if episode then
+            r.encounterId = episode.id
+            if #episode.attemptIds == 0 then r.observedEligibleDelaySeconds = os.clock() - episode.firstEligibleAt end
+            episode.attemptIds[#episode.attemptIds + 1] = r.id
+        end
+        local character = r.character
+        if character and type(character.GetAttributeChangedSignal) == "function" then
+            -- An already-active attribute is not evidence for this attempt.
+            local seenInactive = character:GetAttribute("Dribbling") ~= true
+            r.attributeConnection = character:GetAttributeChangedSignal("Dribbling"):Connect(function()
+                protect(function()
+                    if r.closed or not alive or not sameContext(r) or os.clock() > r.deadline then return end
+                    local active = character:GetAttribute("Dribbling") == true
+                    if not active then seenInactive = true end
+                    if active and seenInactive and not r.dribblingAttributeObserved then
+                        r.dribblingAttributeObserved = true
+                        stats.attributeDribbles += 1
+                    end
+                end)
+            end)
+        end
+        return r
+    end
+    function A.Dribble(detail, invoke, target)
+        local r = protect(beginDribble, detail, target)
+        local key = coroutine.running() or mainThread
+        local previous = dribbleScopes[key]
+        dribbleScopes[key] = r
+        local result = table.pack(pcall(invoke))
+        dribbleScopes[key] = previous
+        protect(function()
+            if not r then return end
+            r.localStarted = result[1] and d.M.Dodge.IsDribbling() == true
+            if not r.localStarted then close(r, result[1] and "native_did_not_start" or "native_error") end
+        end)
+        -- Only a native error propagates. Evidence failures never cancel an action.
+        if not result[1] then error(result[2], 0) end
+        return table.unpack(result, 2, result.n)
+    end
+    local function reject(packet)
+        if type(packet) ~= "table" or type(packet.Command) ~= "table" then return end
+        if not ((packet.Protocol == "ActionCommand" and packet.Phase == "ExecuteRejected")
+            or (packet.Protocol == "ActionSession" and packet.Phase == "StartRejected")) then return end
+        local command = packet.Command
+        for _, list in ipairs({ shots, dribbles }) do
+            for _, r in ipairs(list) do
+                local matched = r.kind == "dribble" and command.Mode == "Dodge"
+                    and r.actionId ~= nil and command.ActionId == r.actionId
+                    or r.kind == "shot" and command.PassType == "Shot"
+                    and ((r.sessionId ~= nil and command.SessionId == r.sessionId)
+                        or (r.actionId ~= nil and command.ActionId == r.actionId))
+                if matched and not r.rejected then
+                    r.rejected, r.serverStatus = true, "rejected"
+                    if r.kind == "shot" then stats.shotRejections += 1 else stats.dribbleRejections += 1 end
+                    close(r, "server_rejected")
+                end
+            end
+        end
+    end
+    local function matchesFlight(r, state)
+        return state.ActionId ~= nil and (state.ActionId == r.actionId or state.ActionId == r.sessionId)
+            and state.LastKickerUserId == d.Player.UserId and state.LastPassType == "Shot"
+    end
+    local function ballState(packet)
+        if type(packet) ~= "table" or packet.BallId == nil then return end
+        if packet.Kind == "Movement" then
+            local relevant = false
+            for r in pairs(pending) do
+                if r.kind == "shot" and r.ballId == packet.BallId then relevant = true; break end
+            end
+            if not relevant then return end
+            -- Only raw server packets qualify, never locally predicted Renderer states.
+            local state = type(packet.State) == "table" and packet.State or packet
+            if not vector(state.Position) or not finite(state.UpdatedAt or state.StartedAt) then
+                stats.unreadableMovements += 1
+                if not movementFields then
+                    local fields = {}
+                    for key in pairs(packet) do fields[#fields + 1] = tostring(key) end
+                    table.sort(fields); movementFields = table.concat(fields, ",")
+                end
+                return
+            end
+            local matched = false
+            for r in pairs(pending) do
+                if r.kind == "shot" and r.ballId == packet.BallId and sameContext(r) then
+                    if matchesFlight(r, state) then
+                        matched = true
+                        if not r.flightMatched then
+                            r.flightMatched, r.serverStatus = true, "flight_observed"
+                            stats.exactFlightMatches += 1
+                        end
+                        local stamp = state.UpdatedAt or state.StartedAt
+                        if not r.lastStateTime or stamp > r.lastStateTime then
+                            -- Bracketed goal-plane crossing is an observation, not a score event.
+                            local mouth, old = r.mouth, r.lastPosition
+                            if mouth and old and not r.crossingObserved then
+                                local a, b = (old - mouth.plane):Dot(mouth.forward), (state.Position - mouth.plane):Dot(mouth.forward)
+                                if a > 0 and b <= 0 then
+                                    local crossing = old:Lerp(state.Position, a / (a - b))
+                                    r.crossingObserved = true
+                                    r.crossingInsideOpening = math.abs((crossing - mouth.center):Dot(mouth.lateral)) <= mouth.halfWidth
+                                        and crossing.Y >= mouth.bottom and crossing.Y <= mouth.top
+                                    r.crossingSampleGapSeconds = stamp - r.lastStateTime
+                                    if vector(r.predictedPosition) then r.crossingPredictionErrorStuds = (crossing - r.predictedPosition).Magnitude end
+                                end
+                            end
+                            r.lastPosition, r.lastStateTime = state.Position, stamp
+                        end
+                    elseif r.flightMatched and state.ActionId ~= nil and state.ActionId ~= r.actionId and state.ActionId ~= r.sessionId
+                        and (state.UpdatedAt or state.StartedAt) > (r.lastStateTime or -math.huge) then
+                        close(r, "different_flight")
+                    end
+                end
+            end
+            if not matched then stats.unmatchedMovements += 1 end
+        elseif packet.Kind == "Owned" then
+            if not finite(packet.OwnerUserId) then return end
+            for r in pairs(pending) do
+                if r.ballId == packet.BallId and sameContext(r) then
+                    if r.kind == "shot" and r.flightMatched then
+                        r.ownerAfterFlight = packet.OwnerUserId
+                        r.catchFlagObserved = packet.IsDiveCatch == true or packet.IsGoalkeeperJumpCatch == true
+                        r.serverStatus = r.catchFlagObserved and "catch_after_flight" or "ownership_after_flight"
+                        close(r, "ownership_changed")
+                    elseif r.kind == "dribble" and packet.OwnerUserId ~= d.Player.UserId then
+                        r.serverPossessionLost = true
+                        r.ownerAfterDribble = packet.OwnerUserId
+                        close(r, "possession_changed")
+                    end
+                end
+            end
+        elseif packet.Kind == "Removed" then
+            for r in pairs(pending) do if r.ballId == packet.BallId then close(r, "ball_removed") end end
+        end
+    end
+    local allowed = { shot = { goal = true, saved = true, blocked = true, miss = true, unclear = true },
+        dribble = { kept_ball = true, lost_ball = true, interrupted = true, unclear = true } }
+    function A.Mark(kind, outcome, id)
+        if not allowed[kind] or not allowed[kind][outcome] then return false, "Unknown kind or outcome" end
+        local list = kind == "shot" and shots or dribbles
+        for i = #list, 1, -1 do
+            local r = list[i]
+            if id == nil or r.id == id then
+                r.userOutcome, r.outcomeSource = outcome, "user_reported"
+                return true, r.id
+            end
+        end
+        return false, "No matching recorded attempt"
+    end
+    function A.MarkTrial(kind, labels, trialId)
+        if not allowed[kind] or type(labels) ~= "string" then return false, "Use shot/dribble and a space-separated result list" end
+        local run = nil
+        for i = #trials, 1, -1 do
+            if trialId == nil or trials[i].id == trialId then run = trials[i]; break end
+        end
+        if not run or not run.endedAt then return false, "End the run before labelling it" end
+        local values, records = {}, {}
+        for value in labels:gmatch("%S+") do
+            if not allowed[kind][value] then return false, "Unknown outcome: " .. value end
+            values[#values + 1] = value
+        end
+        for _, r in ipairs(kind == "shot" and shots or dribbles) do
+            if r.trialId == run.id then records[#records + 1] = r end
+        end
+        if #records ~= run[kind == "shot" and "shots" or "dribbles"] then
+            return false, "Some records expired; label retained attempts by ID instead"
+        end
+        if #records == 0 or #records ~= #values then
+            return false, "Expected " .. tostring(#records) .. " outcomes in attempt order; no labels changed"
+        end
+        for i, r in ipairs(records) do r.userOutcome, r.outcomeSource = values[i], "user_reported" end
+        return true, #records
+    end
+    local function public(list)
+        local out = {}
+        for _, r in ipairs(list) do
+            local item = {}
+            for key, value in pairs(r) do
+                if key ~= "character" and key ~= "goal" and key ~= "mouth" and key ~= "attributeConnection"
+                    and key ~= "predictedPosition" and key ~= "lastPosition" then item[key] = plain(value) end
+            end
+            out[#out + 1] = item
+        end
+        return out
+    end
+    function A.Report()
+        protect(step)
+        local outcomes = { shots = {}, dribbles = {} }
+        for _, entry in ipairs({ { shots, outcomes.shots }, { dribbles, outcomes.dribbles } }) do
+            for _, r in ipairs(entry[1]) do
+                local label = r.userOutcome or "unlabelled"
+                entry[2][label] = (entry[2][label] or 0) + 1
+            end
+        end
+        local evidence = { localStarts = 0, localRetainedAtWindowEnd = 0, ownershipLossObserved = 0,
+            strikeInterruptions = 0, rejected = 0, unresolved = 0 }
+        for _, r in ipairs(dribbles) do
+            if r.localStarted then evidence.localStarts += 1 end
+            if r.rejected then evidence.rejected += 1
+            elseif r.strikeIntent then evidence.strikeInterruptions += 1
+            elseif r.serverPossessionLost then evidence.ownershipLossObserved += 1
+            elseif r.localOwnerAtWindowEnd == true then evidence.localRetainedAtWindowEnd += 1
+            else evidence.unresolved += 1 end
+        end
+        return { version = "Evaluation 0.2", build = d.build or "unlabelled_build", sessionIdTag = d.sessionId,
+            stats = table.clone(stats), lastError = lastError,
+            rawMovementFields = movementFields, recentShots = public(shots), recentDribbles = public(dribbles),
+            recentEncounters = plain(encounters), trials = plain(trials), activeTrialId = trial and trial.id or nil,
+            dribbleObservations = evidence, encounterSampling = "10 Hz during a run; 9-stud entry, 10.5-stud exit, 0.35s separation; sampled proximity, not every tackle",
+            userReportedOutcomes = outcomes, outcomeWindow = "last 40 of each kind",
+            automaticGoalConfirmation = false, globalBestShotProven = false }
+    end
+    function A.Call(name, ...)
+        if name == "ShotSent" then return protect(shotSent, ...) end
+        return nil
+    end
+    function A.Cleanup()
+        alive = false
+        if trial then A.EndTrial() end
+        for r in pairs(pending) do protect(close, r, "unloaded") end
+        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
+        for _, c in ipairs(connections) do c:Disconnect() end
+        table.clear(connections)
+        for name, hook in pairs(hooks) do
+            if d.M.Protocol[name] == hook.wrapper then d.M.Protocol[name] = hook.original end
+        end
+        return true
+    end
+    protect(function()
+        for _, name in ipairs({ "Send", "Release" }) do
+            local hook = { original = d.M.Protocol[name] }
+            if type(hook.original) ~= "function" then continue end
+            hook.wrapper = function(command, ...)
+                if not alive or not d.alive() then return hook.original(command, ...) end
+                local r = dribbleScopes[coroutine.running() or mainThread]
+                if not r and not next(pending) then return hook.original(command, ...) end
+                local result = table.pack(hook.original(command, ...))
+                protect(function()
+                    if r and command.Mode == "Dodge" then r.actionId = command.ActionId or result[1] end
+                    noteStrike(command)
+                end)
+                return table.unpack(result, 1, result.n)
+            end
+            hooks[name] = hook
+            d.M.Protocol[name] = hook.wrapper
+        end
+        connections[#connections + 1] = d.State.OnClientEvent:Connect(function(packet)
+            if alive and d.alive() and next(pending) then protect(ballState, packet) end
+        end)
+        for _, remote in ipairs(d.CommandRemotes) do
+            connections[#connections + 1] = remote.OnClientEvent:Connect(function(packet)
+                if alive and d.alive() then protect(reject, packet) end
+            end)
+        end
+    end)
+    return A
+end
+
+local evaluationRemotes = {}
+for _, remote in ipairs(BallRemotes:GetChildren()) do
+    if remote ~= StateRemote and (remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent")) then
+        evaluationRemotes[#evaluationRemotes + 1] = remote
+    end
+end
+local EVALUATION = createStrikerEvaluation({
+    M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
+    build = "Dmc 0.21 tackles and kicks",
+    sessionId = game:GetService("HttpService"):GenerateGUID(false),
+    CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
+    timestamp = function() return DateTime.now().UnixTimestampMillis end,
+})
+S.releaseEvaluation = EVALUATION.Cleanup
+ENV.DmcEvaluationReport = function()
+    local result = EVALUATION.Report()
+    local http = game:GetService("HttpService")
+    local summary = table.clone(result)
+    summary.recentShots, summary.recentDribbles, summary.recentEncounters = nil, nil, nil
+    print("[Dmc Evaluation]", http:JSONEncode(summary))
+    for _, record in ipairs(result.recentShots) do print("[Dmc Shot]", http:JSONEncode(record)) end
+    for _, record in ipairs(result.recentDribbles) do print("[Dmc Dribble]", http:JSONEncode(record)) end
+    for _, record in ipairs(result.recentEncounters) do print("[Dmc Encounter]", http:JSONEncode(record)) end
+    return result
+end
+ENV.DmcBeginTrial = function(label, scenario)
+    local ok, detail = EVALUATION.BeginTrial(label, scenario)
+    print("[Dmc Evaluation]", ok and "Run started" or "Not started", detail)
+    return ok, detail
+end
+ENV.DmcEndTrial = function()
+    local ok, detail = EVALUATION.EndTrial()
+    print("[Dmc Evaluation]", ok and "Run ended" or "Not ended", detail)
+    return ENV.DmcEvaluationReport()
+end
+ENV.DmcMarkTrial = function(kind, outcomes, trialId)
+    local ok, detail = EVALUATION.MarkTrial(kind, outcomes, trialId)
+    print("[Dmc Evaluation]", ok and "Run outcomes recorded" or "Not recorded", detail)
+    if ok then return ENV.DmcEvaluationReport() end
+    return ok, detail
+end
+ENV.DmcMarkOutcome = function(kind, outcome, id)
+    local ok, detail = EVALUATION.Mark(kind, outcome, id)
+    print("[Dmc Evaluation]", ok and "Outcome recorded" or "Not recorded", detail)
+    return ok, detail
+end
 local STR = createStriker({
     M = M, Player = LocalPlayer, Players = Players, Input = UserInputService,
     load = module, alive = function() return S.alive end,
-    uiBusy = function() return S.uiBusy end,
+    uiBusy = function() return S.uiBusy end, evaluation = EVALUATION,
 })
 S.releaseStriker = STR.Cleanup
 ENV.AutoSTR = STR
 ENV.AutoSTRDebug = function()
     local result = STR.Debug()
     print("[Auto STR]", game:GetService("HttpService"):JSONEncode(result))
+    return result
+end
+local MISC = createStrikerMisc({
+    M = M, Player = LocalPlayer, Players = Players, Input = UserInputService,
+    Run = RunService, Gui = game:GetService("GuiService"), load = module,
+    id = game:GetService("HttpService"):GenerateGUID(false),
+    alive = function() return S.alive end,
+    suspended = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
+})
+S.releaseMisc = MISC.Cleanup
+EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
+    return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
+        autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
+end)
+ENV.DmcMisc = MISC
+ENV.DmcMiscDebug = function()
+    local result = MISC.Debug()
+    print("[Dmc Misc]", game:GetService("HttpService"):JSONEncode(result))
     return result
 end
 
@@ -6719,7 +7878,13 @@ do
     )
 
     local gkRefresherCount = #refreshers
-    activeBody = frame(strikerContent, "Options", 0, 0, 292, 105)
+    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 127)
+    shootingSection.BackgroundTransparency = 1
+    text(shootingSection, "SHOOTING", 9, {
+        Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
+        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+    })
+    activeBody = frame(shootingSection, "Options", 0, 22, 292, 105)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -6728,23 +7893,37 @@ do
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 141, 292, 89)
+    miscellaneousSection.BackgroundTransparency = 1
+    text(miscellaneousSection, "MISCELLANEOUS", 9, {
+        Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
+        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+    })
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 67)
+    activeBody.BackgroundTransparency = 1
+    create("UIListLayout", {
+        Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, activeBody)
+    order = 0
+    toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
+    toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 119),
-        Size = UDim2.fromOffset(276, 36), TextWrapped = true,
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 240),
+        Size = UDim2.fromOffset(276, 30), TextWrapped = true,
         Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
     })
     local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 161),
+        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 274),
         Size = UDim2.fromOffset(276, 54), TextWrapped = true,
         TextColor3 = C.muted,
     })
-    text(strikerContent, "Within 55 studs of the goal opening.\nSmart release: hold shoot to let STR pick timing.\nManual release and volley timing take priority.", 11, {
-        Position = UDim2.fromOffset(8, 229), Size = UDim2.fromOffset(276, 64),
-        TextWrapped = true, TextColor3 = C.muted,
-    })
-    text(strikerContent, "Keeper reach is an estimate. A goal is not guaranteed.", 10, {
-        Position = UDim2.fromOffset(8, 315), Size = UDim2.fromOffset(276, 48),
+    local miscellaneousStatus = text(strikerContent, "", 9, {
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 331), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.accentDim,
+    })
+    text(strikerContent, "Shots: within 55 studs. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
+        Position = UDim2.fromOffset(8, 364), Size = UDim2.fromOffset(276, 32),
+        TextWrapped = true, TextColor3 = C.muted,
     })
 
     local dragInput, dragStart, hostStart
@@ -6855,6 +8034,7 @@ do
             for i = gkRefresherCount + 1, #refreshers do refreshers[i]() end
             writeChanged(strikerStatus, "Text", STR.Status)
             writeChanged(strikerDetail, "Text", STR.Detail)
+            writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus .. " | Stamina: " .. MISC.StaminaStatus)
             return
         end
         for i = 1, gkRefresherCount do refreshers[i]() end
