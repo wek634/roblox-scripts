@@ -9,7 +9,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.15 | Misc 0.5 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.6 | STR 0.15 | Misc 0.6 | Evaluation 0.2"
 local ENV = type(getgenv) == "function" and getgenv() or _G
 
 -- Keep the current instance running until all dependencies have loaded.
@@ -6217,6 +6217,7 @@ local function createStrikerMisc(d)
     local heartbeat, inputConnection = nil, nil
     local ownershipHook, nativeOwner = nil, nil
     local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
+    local placementHook = nil
     local nextStaminaRetry = 0
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
     local candidates, cachedCharacter = {}, nil
@@ -6224,7 +6225,8 @@ local function createStrikerMisc(d)
     local staminaOwned = false
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
-        staminaAutoOff = 0, observerErrors = 0, errors = 0, maxTickMs = 0 }
+        staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
+        observerErrors = 0, errors = 0, maxTickMs = 0 }
     local recent = {}
     local lastCorrection = nil
     local C = { Interval = 1 / 30, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
@@ -6259,10 +6261,85 @@ local function createStrikerMisc(d)
             if N.Guard.Validate == guardHook.observer then N.Guard.Validate = guardHook.original end
             guardHook = nil
         end
+        if placementHook then
+            placementHook.active = false
+            if N.Placement.RepairPosition == placementHook.observer then
+                N.Placement.RepairPosition = placementHook.original
+            end
+            placementHook = nil
+        end
         correctionPending = nil
+    end
+    local function noteCorrection(correction)
+        lastCorrection = correction
+        if not correctionPending then correctionPending = correction end
+        A.StaminaStatus = "CORRECTION DETECTED"
+    end
+    local function startPlacementWatch()
+        local hook = { original = N.Placement.RepairPosition, active = true }
+        local function capture(character, root, target)
+            if not (hook.active and alive and d.alive() and A.InfiniteStamina)
+                or character ~= d.Player.Character or not root or not vector(target)
+                or d.M.Replay.IsActive() or d.M.Freeze.IsFrozen() then return nil end
+            return { position = root.Position, velocity = root.AssemblyLinearVelocity,
+                context = d.M.Motion.GetContext(character) }
+        end
+        local function observe(sample, target, result)
+            if not sample or result[2] ~= true then return end
+            local origin = vector(result[1]) and result[1] or sample.position
+            local delta = target - origin
+            local horizontal = flat(delta)
+            if horizontal.Magnitude <= 0.5 then return end
+            local velocity = flat(sample.velocity)
+            -- Ignore forward/lateral repairs while moving and vertical floor recovery.
+            -- The native placement API alone does not prove why the repair was issued.
+            if velocity.Magnitude >= 1 and horizontal:Dot(velocity.Unit) >= -0.5 then return end
+            stats.positionRepairs += 1
+            noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
+                horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
+                staminaWasOn = true, serverConfirmed = false, offStatus = "OFF: POSITION REPAIR" })
+        end
+        hook.observer = function(character, root, target, ...)
+            local captured, sample = pcall(capture, character, root, target)
+            if not captured then stats.observerErrors += 1; sample = nil end
+            -- Preserve the native repair, all return values, and native errors exactly.
+            local result = table.pack(hook.original(character, root, target, ...))
+            if sample then
+                local ok = pcall(observe, sample, target, result)
+                if not ok then stats.observerErrors += 1 end
+            end
+            return table.unpack(result, 1, result.n)
+        end
+        placementHook = hook
+        N.Placement.RepairPosition = hook.observer
+    end
+    local function recoverStamina(correction)
+        -- Remove our local source before spending; otherwise native SpendStamina returns true, 0.
+        if staminaOwned then
+            N.Sprint.SetUnlimitedStamina(staminaSource, false)
+            staminaOwned = false
+        end
+        A.InfiniteStamina = false
+        if not correction.budgetReset then
+            local before = N.Sprint.GetStamina()
+            local multiplier = N.StaminaRules.GetStaminaMultiplier()
+            assert(finite(before) and finite(multiplier), "Native stamina recovery data unavailable")
+            if before > 0 then
+                -- The server's actual budget is unknown. Empty the artificially refilled local
+                -- budget conservatively, then let native recovery handle stamina and walk speed.
+                -- Game-owned unlimited sources/boosts still take priority inside SpendStamina.
+                N.Sprint.SpendStamina(before * math.max(1, multiplier), true)
+            end
+            local after = N.Sprint.GetStamina()
+            correction.staminaBeforeReset, correction.staminaAfterReset = before, after
+            correction.budgetReset = true
+            if finite(after) and after < before then stats.staminaBudgetResets += 1 end
+        end
+        return A.SetInfiniteStamina(false)
     end
     local function startStaminaWatch()
         assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
+        assert(type(N.Placement.RepairPosition) == "function", "Position repair observer unavailable")
         if guardHook then
             assert(guardHook.active, "Previous movement observer cleanup is incomplete")
             return
@@ -6274,9 +6351,7 @@ local function createStrikerMisc(d)
                 positionChange = (root.Position - claimedPosition).Magnitude,
                 velocityChange = (root.AssemblyLinearVelocity - claimedVelocity).Magnitude,
                 source = "LocalMovementGuard.Validate", staminaWasOn = true }
-            lastCorrection = correction
-            if not correctionPending then correctionPending = correction end
-            A.StaminaStatus = "CORRECTION DETECTED"
+            noteCorrection(correction)
         end
         hook.observer = function(root, ...)
             local character = d.Player.Character
@@ -6297,19 +6372,22 @@ local function createStrikerMisc(d)
         end
         guardHook = hook
         N.Guard.Validate = hook.observer
+        startPlacementWatch()
         staminaHeartbeat = d.Run.Heartbeat:Connect(function()
             if not (alive and d.alive() and correctionPending) or os.clock() < nextStaminaRetry then return end
             nextStaminaRetry = os.clock() + 1
             -- Apply the native switch outside Validate, after its physics correction.
             local correction = correctionPending
-            if A.SetInfiniteStamina(false) then
+            local ok, stopped = pcall(recoverStamina, correction)
+            if ok and stopped then
                 stats.staminaAutoOff += 1
                 lastCorrection = correction
-                A.StaminaStatus = "OFF: LOCAL CORRECTION"
+                A.StaminaStatus = correction.offStatus or "OFF: LOCAL CORRECTION"
             else
                 -- Keep the pending shutdown and observer until native release succeeds.
                 correctionPending = correction
                 A.StaminaStatus = "CLEANUP REQUIRED"
+                if not ok then stats.observerErrors += 1 end
             end
         end)
     end
@@ -6659,6 +6737,12 @@ local function createStrikerMisc(d)
             if not N.Sprint then N.Sprint = d.load("Client.Gameplay.Player.Sprint") end
             assert(type(N.Sprint.SetUnlimitedStamina) == "function", "Native stamina switch unavailable")
             if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
+            if value then
+                N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
+                N.StaminaRules = N.StaminaRules or d.load("Modules.Actions.Sprint")
+                assert(type(N.Sprint.GetStamina) == "function" and type(N.Sprint.SpendStamina) == "function"
+                    and type(N.StaminaRules.GetStaminaMultiplier) == "function", "Native stamina recovery unavailable")
+            end
             if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
             if value then startStaminaWatch() end
             -- Mark before calling: if native HUD refresh throws after setting the source,
@@ -6694,10 +6778,11 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.5",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.6",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = true, lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
+            correctionFallback = true, positionRepairFallback = true,
+            lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
             stats = table.clone(stats), recent = table.clone(recent) }
     end
     if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime } end
@@ -7239,7 +7324,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.21 tackles and kicks",
+    build = "Dmc 0.22 stamina recovery",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
