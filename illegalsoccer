@@ -1,3 +1,5 @@
+-- Small, dependency-free startup controller. Game modules are loaded only after
+-- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
@@ -130,7 +132,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.6 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.9 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -6420,11 +6422,14 @@ local function createStrikerMisc(d)
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
-        observerErrors = 0, errors = 0, maxTickMs = 0 }
+        observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
+        motionAligned = 0, kickStateWithoutPresentation = 0 }
     local recent = {}
+    local blockedBy, recentGates = {}, {}
+    local lastScan = nil
     local lastCorrection = nil
-    local C = { Interval = 1 / 30, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
-        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15 }
+    local C = { Interval = 1 / 60, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
+        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20 }
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
@@ -6622,6 +6627,7 @@ local function createStrikerMisc(d)
         local hook = { original = d.M.Dodge.SetOwnerUserId, active = true }
         assert(type(hook.original) == "function", "Native dribble ownership unavailable")
         hook.wrapper = function(userId, ...)
+            local previous = nativeOwner
             if hook.active then nativeOwner = nil end
             local result = table.pack(hook.original(userId, ...))
             if hook.active and alive and A.AutoDribble and d.alive() then
@@ -6629,6 +6635,13 @@ local function createStrikerMisc(d)
                     local ch = d.Player.Character
                     nativeOwner = ch and { character = ch, ballId = currentBallId(),
                         context = d.M.Motion.GetContext(ch), userId = userId } or nil
+                    if nativeOwner and userId == d.Player.UserId and (not previous
+                        or previous.userId ~= userId or previous.character ~= ch
+                        or previous.ballId ~= nativeOwner.ballId or previous.context ~= nativeOwner.context) then
+                        -- Receipt can follow a refused attempt or a roster refresh.
+                        -- Wake the next heartbeat, with all native gates still checked.
+                        nextTick, nextDiscovery, retryAt = 0, 0, 0
+                    end
                 end)
                 if not ok then nativeOwner = nil; stats.observerErrors += 1 end
             end
@@ -6667,6 +6680,23 @@ local function createStrikerMisc(d)
         if os.clock() < retryAt then return nil, "RETRY WAIT" end
         return ch, root
     end
+    local function noteGate(reason)
+        local gate = reason or "READY"
+        if gate == "COOLDOWN / BLOCKED" then
+            gate = N.Controls.IsOnCooldown("Dribble") and "COOLDOWN" or "NATIVE UNREADY"
+        end
+        if reason then
+            stats.blockedTicks += 1
+            blockedBy[gate] = (blockedBy[gate] or 0) + 1
+        else
+            stats.readyTicks += 1
+        end
+        local last = recentGates[#recentGates]
+        if not last or last.reason ~= gate then
+            recentGates[#recentGates + 1] = { reason = gate, clock = os.clock() }
+            if #recentGates > 12 then table.remove(recentGates, 1) end
+        end
+    end
     local function discover(ch)
         local seen, list = {}, {}
         local function add(character, actor)
@@ -6703,6 +6733,31 @@ local function createStrikerMisc(d)
             end
         end
         return true
+    end
+    local function alignDisplayedMotion(character, cf: CFrame, velocity: Vector3, slideAge: number?): (CFrame, number)
+        local motion = d.M.Motion
+        if type(motion.GetDisplayDelaySeconds) ~= "function"
+            or type(motion.GetSimulationRoot) == "function" and motion.GetSimulationRoot(character) then return cf, 0 end
+        local delay: number = motion.GetDisplayDelaySeconds(character)
+        if not finite(delay) or delay <= 0 then return cf, 0 end
+        delay = math.min(delay, C.MaximumDisplayLead)
+        local displacement = velocity * delay
+        if slideAge then
+            local direction = flat(velocity)
+            if direction.Magnitude < 1 then direction = flat(cf.LookVector) end
+            if direction.Magnitude > 1e-5 then
+                local constants = N.Tackle.Constants
+                local motionSeconds = math.min(delay, slideAge)
+                local travel = N.Tackle.GetMaximumTravelBetween(slideAge - motionSeconds, slideAge,
+                    constants.StartupDashDistance, constants.Distance)
+                displacement = flat(velocity) * (delay - motionSeconds) + direction.Unit * travel
+                    + Vector3.new(0, velocity.Y * delay, 0)
+            end
+        end
+        -- GetCFrame may be an interpolated display pose. Attack age is server time:
+        -- bring the pose onto that timeline before predicting future contact.
+        -- This is a bounded estimate, never a character movement write.
+        return cf + displacement, delay
     end
     local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age)
         local constants = N.Tackle.Constants
@@ -6746,7 +6801,10 @@ local function createStrikerMisc(d)
         -- Presentation alone can linger after cancellation. Require live native charge state too.
         -- This fill is elapsed / maximum, NOT KickCore's power alpha.
         local fill, compact = N.Effects.GetObservedChargeFill(actor.UserId)
-        if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then return nil end
+        if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then
+            if fill == nil then stats.kickStateWithoutPresentation += 1 end
+            return nil
+        end
         local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
         local maximum = constants and constants.MaximumChargeSeconds
         if not finite(maximum) or maximum <= 0 then return nil end
@@ -6776,7 +6834,20 @@ local function createStrikerMisc(d)
     end
     local function tick()
         local ch, rootOrReason = eligible()
-        if not ch then A.DribbleStatus = rootOrReason; return end
+        noteGate(not ch and rootOrReason or nil)
+        if not ch then
+            A.DribbleStatus = rootOrReason
+            if rootOrReason == "COOLDOWN / BLOCKED" then
+                if N.Controls.IsOnCooldown("Dribble") then
+                    local remaining = type(N.Controls.GetCooldownRemaining) == "function"
+                        and N.Controls.GetCooldownRemaining("Dribble") or nil
+                    A.DribbleStatus = finite(remaining) and string.format("COOLDOWN %.1fs", math.max(0, remaining)) or "COOLDOWN"
+                else
+                    A.DribbleStatus = "NOT READY"
+                end
+            end
+            return
+        end
         local root = rootOrReason
         local team = d.M.Teams.GetActorTeamName(d.Player)
         -- Neutral practice actors share one team; do not guess which is hostile.
@@ -6789,6 +6860,7 @@ local function createStrikerMisc(d)
         if cachedCharacter ~= ch or os.clock() >= nextDiscovery then discover(ch) end
         stats.scans += 1
         A.DribbleStatus = "WATCHING"
+        lastScan = { clock = os.clock(), activeSlides = 0, activeKicks = 0, contacts = 0, maximumDisplayLead = 0 }
         local now, best = workspace:GetServerTimeNow(), nil
         for _, candidate in ipairs(candidates) do
             local other = candidate.character
@@ -6802,6 +6874,8 @@ local function createStrikerMisc(d)
                 local sliding = age ~= nil and age >= 0 and age <= hitboxEndsAt
                 local kick = kickWindow(candidate)
                 if not sliding and not kick then continue end
+                if sliding then lastScan.activeSlides += 1 end
+                if kick then lastScan.activeKicks += 1 end
                 local hum = other:FindFirstChildOfClass("Humanoid")
                 local otherRoot = other:FindFirstChild("HumanoidRootPart")
                 if hum and hum.Health > 0 and otherRoot then
@@ -6809,17 +6883,22 @@ local function createStrikerMisc(d)
                     local otherVelocity = d.M.Motion.GetVelocity(other) or otherRoot.AssemblyLinearVelocity
                     if vector(otherCF.Position) and vector(otherVelocity)
                         and (otherCF.Position - ownCF.Position).Magnitude <= C.Range then
+                        local displayLead
+                        otherCF, displayLead = alignDisplayedMotion(other, otherCF, otherVelocity, sliding and age or nil)
+                        if displayLead > 0 then stats.motionAligned += 1 end
+                        lastScan.maximumDisplayLead = math.max(lastScan.maximumDisplayLead, displayLead)
                         local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age) or nil
                         local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first) or nil
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
+                        if eta then lastScan.contacts += 1 end
                         if eta and (not best or eta < best.eta or eta == best.eta and (distance or math.huge) < (best.distance or math.huge)) then
                             best = { character = other, eta = eta, distance = distance, reason = reason,
                                 tackleAge = reason == "tackle" and age or nil,
                                 hitboxRemaining = reason == "tackle" and hitboxEndsAt - age or nil,
                                 kickChargeFill = reason == "kick" and kick.fill or nil,
-                                earliestRelease = reason == "kick" and kick.first or nil }
+                                earliestRelease = reason == "kick" and kick.first or nil, displayLead = displayLead }
                         end
                     end
                 end
@@ -6836,6 +6915,7 @@ local function createStrikerMisc(d)
         local attempt = { target = best.character.Name, contactSeconds = best.eta, distance = best.distance, reason = best.reason,
             tackleAgeSeconds = best.tackleAge, hitboxRemainingSeconds = best.hitboxRemaining,
             kickChargeFill = best.kickChargeFill, earliestReleaseSeconds = best.earliestRelease,
+            displayLeadSeconds = best.displayLead,
             serverConfirmed = false }
         if d.evaluation then
             d.evaluation.Dribble(attempt, function() d.M.Dodge.HandleInputBegan(input, false) end, best.character)
@@ -6902,9 +6982,12 @@ local function createStrikerMisc(d)
                 if not checked then stopDribbleWatch(inputError) end
             end)
             heartbeat = d.Run.Heartbeat:Connect(function()
-                if not (alive and A.AutoDribble and d.alive()) or os.clock() < nextTick then return end
-                nextTick = os.clock() + C.Interval
                 local start = os.clock()
+                if not (alive and A.AutoDribble and d.alive()) or start < nextTick then return end
+                -- Keep the deadline cadence through uneven mobile frames. Never
+                -- run a catch-up loop or send multiple requests in one heartbeat.
+                if nextTick == 0 then nextTick = start + C.Interval
+                else nextTick += (math.floor((start - nextTick) / C.Interval) + 1) * C.Interval end
                 local succeeded, tickError = pcall(tick)
                 stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
                 if not succeeded then stopDribbleWatch(tickError) end
@@ -6972,14 +7055,20 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.6",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.9",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
             lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
+            inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
+            cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
+                and N.Controls.GetCooldownRemaining("Dribble") or nil,
+            blockedBy = table.clone(blockedBy), recentGates = table.clone(recentGates),
+            lastScan = lastScan and table.clone(lastScan) or nil,
             stats = table.clone(stats), recent = table.clone(recent) }
     end
-    if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime } end
+    if d.test then A.Test = { contactTime = contactTime, segmentBox = segmentBox, kickContactTime = kickContactTime,
+        alignDisplayedMotion = alignDisplayedMotion } end
     return A
 end
 
@@ -7518,7 +7607,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.23 startup and shot selection",
+    build = "Dmc 0.26 client stamina restored",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
