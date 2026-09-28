@@ -1,5 +1,3 @@
--- Small, dependency-free startup controller. Game modules are loaded only after
--- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
