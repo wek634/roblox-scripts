@@ -1,5 +1,3 @@
--- Small, dependency-free startup controller. Game modules are loaded only after
--- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
@@ -6411,6 +6409,11 @@ local function createStrikerMisc(d)
     local alive, loadingDribble, loadingStamina = true, false, false
     local generation, staminaGeneration = 0, 0
     local heartbeat, inputConnection = nil, nil
+    local attackConnections = {}
+    local characterConnections = {}
+    local characterIndex = setmetatable({}, { __mode = "k" })
+    local characterIndexReady = false
+    local attacks = setmetatable({}, { __mode = "k" })
     local ownershipHook, nativeOwner = nil, nil
     local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
     local placementHook = nil
@@ -6423,7 +6426,7 @@ local function createStrikerMisc(d)
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
         observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
-        motionAligned = 0, kickStateWithoutPresentation = 0 }
+        motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0 }
     local recent = {}
     local blockedBy, recentGates = {}, {}
     local lastScan = nil
@@ -6441,6 +6444,13 @@ local function createStrikerMisc(d)
     local function stopWatch()
         if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
         if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+        for _, connection in ipairs(attackConnections) do connection:Disconnect() end
+        table.clear(attackConnections)
+        for _, connection in ipairs(characterConnections) do connection:Disconnect() end
+        table.clear(characterConnections)
+        table.clear(characterIndex)
+        characterIndexReady = false
+        table.clear(attacks)
         if ownershipHook then
             ownershipHook.active = false
             if d.M.Dodge.SetOwnerUserId == ownershipHook.wrapper then
@@ -6660,14 +6670,19 @@ local function createStrikerMisc(d)
     end
     local function eligible()
         if not (alive and A.AutoDribble and d.alive()) then return nil, "OFF" end
-        if d.suspended() or N.Input.ShouldIgnoreKeybind(false) or d.Gui.MenuIsOpen
-            or os.clock() < manualUntil then return nil, "PAUSED" end
+        local suspended, suspendReason = d.suspended()
+        if suspended then return nil, suspendReason or "INPUT PAUSED" end
+        if d.Gui.MenuIsOpen then return nil, "MENU OPEN" end
+        if N.Input.ShouldIgnoreKeybind(false) then return nil, "TEXT / KEYBIND" end
+        if os.clock() < manualUntil then return nil, "MANUAL INPUT" end
         local ch = d.Player.Character
         local hum = ch and ch:FindFirstChildOfClass("Humanoid")
         local root = ch and ch:FindFirstChild("HumanoidRootPart")
         if not ch or not ch.Parent or not root or not hum or hum.Health <= 0 then return nil, "WAITING" end
         if d.M.Match.IsGoalkeeperCharacter(ch) then return nil, "GK ROLE" end
-        if d.M.Freeze.IsFrozen() or d.M.Replay.IsActive() or d.M.Controllers.IsSuspended(ch) then return nil, "PAUSED" end
+        if d.M.Freeze.IsFrozen() then return nil, "FROZEN" end
+        if d.M.Replay.IsActive() then return nil, "REPLAY" end
+        if d.M.Controllers.IsSuspended(ch) then return nil, "RECOVERING" end
         if not ownsBall(ch) then return nil, "NO BALL" end
         if N.Shoot.IsCharging() then return nil, "SHOOTING" end
         for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick" }) do
@@ -6697,14 +6712,132 @@ local function createStrikerMisc(d)
             if #recentGates > 12 then table.remove(recentGates, 1) end
         end
     end
+    local function resolveCharacter(character)
+        return character and type(d.M.Motion.ResolveCharacter) == "function"
+            and d.M.Motion.ResolveCharacter(character) or character
+    end
+    local function actorFor(character, actor)
+        if actor and actor ~= character and resolveCharacter(actor.Character) == character then return actor end
+        if type(d.M.Actors.GetFromCharacter) == "function" then
+            actor = d.M.Actors.GetFromCharacter(character)
+        else
+            local userId = character:GetAttribute("UserId")
+            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
+        end
+        return actor and resolveCharacter(actor.Character) == character and actor or nil
+    end
+    local function characterTeam(character, actor)
+        if actor then return d.M.Teams.GetActorTeamName(actor) end
+        if type(d.M.Teams.GetCharacterTeamName) == "function" then
+            return d.M.Teams.GetCharacterTeamName(character)
+        end
+        return d.M.Teams.GetActorTeamName(character)
+    end
+    local function watchCharacters()
+        if not workspace.DescendantAdded or not workspace.DescendantRemoving then return end
+        local function added(node)
+            local model
+            if node:IsA("Model") then
+                if node:FindFirstChildOfClass("Humanoid") or node:FindFirstChild("HumanoidRootPart") then model = node end
+            elseif node:IsA("Humanoid") or (node:IsA("BasePart") and node.Name == "HumanoidRootPart") then
+                model = node.Parent
+            end
+            if model and model:IsA("Model") then
+                characterIndex[model] = true
+                nextDiscovery, nextTick = 0, 0
+            end
+        end
+        characterConnections[#characterConnections + 1] = workspace.DescendantAdded:Connect(added)
+        characterConnections[#characterConnections + 1] = workspace.DescendantRemoving:Connect(function(node)
+            if characterIndex[node] then
+                characterIndex[node] = nil
+                nextDiscovery, nextTick = 0, 0
+            end
+        end)
+        for _, node in ipairs(workspace:GetDescendants()) do added(node) end
+        characterIndexReady = true
+    end
+    local function observeAttack(kind, userId, ...)
+        if kind ~= "TackleStarted" and kind ~= "KickChargeStarted" and kind ~= "KickChargeUpdated"
+            and kind ~= "KickReleased" and kind ~= "KickChargeCanceled" then return end
+        if not finite(userId) or userId == d.Player.UserId then return end
+        local actor = d.M.Actors.GetByUserId(userId)
+        local character = resolveCharacter(actor and actor.Character)
+        if not character or not character.Parent then return end
+        local now, context = workspace:GetServerTimeNow(), d.M.Motion.GetContext(character)
+        local state = attacks[character]
+        if not state or state.context ~= context then state = { context = context }; attacks[character] = state end
+        local started = select(7, ...)
+        if kind == "TackleStarted" then
+            if not finite(started) then return end
+            if started > now or now - started > N.Tackle.Constants.HitboxDelaySeconds + N.Tackle.Constants.HitboxSeconds then return end
+            state.slideStarted = math.max(state.slideStarted or -math.huge, started)
+        else
+            local actionId, presentationId, sequence = select(9, ...), select(11, ...), select(13, ...)
+            local previous = state.kick
+            if previous then
+                if finite(presentationId) and finite(previous.presentationId) then
+                    if presentationId < previous.presentationId then return end
+                elseif actionId ~= nil and previous.actionId ~= nil and actionId ~= previous.actionId
+                    and kind ~= "KickChargeStarted" then return end
+            end
+            local same = previous and ((presentationId ~= nil and presentationId == previous.presentationId)
+                or (presentationId == nil and actionId ~= nil and actionId == previous.actionId))
+            local terminal = kind == "KickReleased" or kind == "KickChargeCanceled"
+            if same and not terminal then
+                if previous.ended then return end
+                if finite(sequence) and finite(previous.sequence) and sequence <= previous.sequence then return end
+            end
+            if terminal then
+                state.kick = { ended = true, actionId = actionId, presentationId = presentationId }
+            else
+                local passType, charge = select(1, ...), select(3, ...)
+                if not finite(charge) or charge < 0 or not finite(started) or started > now then return end
+                if previous and finite(previous.started) and started < previous.started then return end
+                if passType ~= "Shot" then
+                    state.kick = { ended = true, actionId = actionId, presentationId = presentationId }
+                    return
+                end
+                local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
+                if not constants or not finite(constants.MaximumChargeSeconds) then return end
+                if now - started > constants.MaximumChargeSeconds + 0.25 then return end
+                state.kick = { started = started, charge = charge, at = now,
+                    actionId = actionId, presentationId = presentationId, sequence = sequence,
+                    sawCharging = N.ChargeState.IsCharging(actor) or (same and previous.sawCharging) or false,
+                    expires = started + constants.MaximumChargeSeconds + 0.25 }
+            end
+        end
+        stats.earlyAttackSamples += 1
+        nextTick, nextDiscovery = 0, 0
+    end
+    local function watchAttacks()
+        -- TackleEffects queues these same packets through ReplayEvents.PresentAt.
+        -- Read timing on receipt so presentation delay cannot hide the windup.
+        -- Ordered start/update packets supply charge evidence before attributes
+        -- replicate. Cancellation/end packets and predicted contact still gate it.
+        for _, remote in ipairs(d.AttackRemotes or {}) do
+            attackConnections[#attackConnections + 1] = remote.OnClientEvent:Connect(function(...)
+                if not (alive and A.AutoDribble and d.alive()) then return end
+                local ok = pcall(observeAttack, ...)
+                if not ok then stats.observerErrors += 1 end
+            end)
+        end
+    end
     local function discover(ch)
         local seen, list = {}, {}
         local function add(character, actor)
+            character = resolveCharacter(character)
             if not character or character == ch or seen[character] then return end
             seen[character] = true
-            list[#list + 1] = { character = character, actor = actor or character }
+            list[#list + 1] = { character = character, actor = actorFor(character, actor) }
         end
         for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+        for character in pairs(characterIndex) do
+            if character:IsDescendantOf(workspace) then add(character) end
+        end
+        -- An attack packet also identifies its actor even if its model has just
+        -- streamed in or has not appeared in a discovery snapshot yet.
+        for character in pairs(attacks) do if character.Parent then add(character) end end
         local folder = workspace:FindFirstChild("Characters")
         local function children(container)
             if not container then return end
@@ -6712,8 +6845,10 @@ local function createStrikerMisc(d)
                 if child:IsA("Model") then add(child) end
             end
         end
-        children(folder)
-        children(folder and folder:FindFirstChild("NPCs"))
+        if not characterIndexReady then
+            children(folder)
+            children(folder and folder:FindFirstChild("NPCs"))
+        end
         candidates, cachedCharacter = list, ch
         nextDiscovery = os.clock() + C.DiscoverySeconds
     end
@@ -6791,16 +6926,30 @@ local function createStrikerMisc(d)
         return nil
     end
     local function kickWindow(candidate)
-        local other, actor = candidate.character, candidate.actor
-        if actor == other then
-            local userId = other:GetAttribute("UserId")
-            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
-        end
-        if not actor or actor.Character ~= other or not finite(actor.UserId)
-            or d.M.Match.IsGoalkeeperCharacter(other) or not N.ChargeState.IsCharging(actor) then return nil end
-        -- Presentation alone can linger after cancellation. Require live native charge state too.
+        local other = candidate.character
+        local actor = actorFor(other, candidate.actor)
+        if not actor or not finite(actor.UserId) or d.M.Match.IsGoalkeeperCharacter(other) then return nil end
+        local charging = N.ChargeState.IsCharging(actor)
+        -- Presentation alone can linger after cancellation. It must have native
+        -- charge state or a still-live, ordered server start/update packet.
         -- This fill is elapsed / maximum, NOT KickCore's power alpha.
         local fill, compact = N.Effects.GetObservedChargeFill(actor.UserId)
+        local attack = attacks[other]
+        local early = attack and attack.context == d.M.Motion.GetContext(other) and attack.kick
+        if early then
+            local now = workspace:GetServerTimeNow()
+            if early.ended or now > early.expires then return nil end
+            if charging then early.sawCharging = true
+            elseif early.sawCharging then
+                early.ended = true
+                return nil
+            end
+            local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
+            local maximum = constants and constants.MaximumChargeSeconds
+            if not finite(maximum) or maximum <= 0 then return nil end
+            fill = math.clamp(math.max(now - early.started, early.charge + now - early.at) / maximum, 0, 1)
+            compact = false
+        elseif not charging then return nil end
         if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then
             if fill == nil then stats.kickStateWithoutPresentation += 1 end
             return nil
@@ -6864,11 +7013,16 @@ local function createStrikerMisc(d)
         local now, best = workspace:GetServerTimeNow(), nil
         for _, candidate in ipairs(candidates) do
             local other = candidate.character
+            candidate.actor = actorFor(other, candidate.actor)
             if other.Parent and d.M.Motion.GetContext(other) == context
-                and d.M.Teams.GetActorTeamName(candidate.actor) == opposing then
+                and characterTeam(other, candidate.actor) == opposing then
                 -- Require an observed slide or a live native kick charge, never proximity alone.
                 local untilTime = N.Tackle.GetSlidingUntil(other)
                 local constants = N.Tackle.Constants
+                local attack = attacks[other]
+                if attack and attack.context == context and attack.slideStarted then
+                    untilTime = math.max(finite(untilTime) and untilTime or 0, attack.slideStarted + constants.TotalMotionSeconds)
+                end
                 local age = finite(untilTime) and now - (untilTime - constants.TotalMotionSeconds) or nil
                 local hitboxEndsAt = constants.HitboxDelaySeconds + constants.HitboxSeconds
                 local sliding = age ~= nil and age >= 0 and age <= hitboxEndsAt
@@ -6972,6 +7126,8 @@ local function createStrikerMisc(d)
         A.AutoDribble, A.DribbleStatus, nextTick = true, "WATCHING", 0
         local connected, connectionError = pcall(function()
             watchNativeOwner()
+            watchCharacters()
+            watchAttacks()
             inputConnection = d.Input.InputBegan:Connect(function(input)
                 if not A.AutoDribble then return end
                 local checked, inputError = pcall(function()
@@ -7055,7 +7211,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.9",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.11",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
@@ -7663,6 +7819,7 @@ local MISC = createStrikerMisc({
     id = game:GetService("HttpService"):GenerateGUID(false),
     alive = function() return S.alive end,
     suspended = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
+    AttackRemotes = evaluationRemotes,
 })
 S.releaseMisc = MISC.Cleanup
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
