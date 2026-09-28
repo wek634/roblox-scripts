@@ -6950,8 +6950,25 @@ local function createStrikerMisc(d)
         -- This is a bounded estimate, never a character movement write.
         return cf + displacement, delay
     end
-    local function contactEnvelope(rootCF, box, observedPosition)
-        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
+    local function contactEnvelope(rootCF, box, observedPosition, ownCF, ownSize)
+        local extent = Vector3.new(C.Padding, C.Padding, C.Padding)
+        if ownCF and vector(ownSize) and ownSize.X > 0 and ownSize.Y > 0 and ownSize.Z > 0 then
+            -- Sweep the carrier's root volume, not just its center. Project its
+            -- oriented half-extents into the attack box's axes so rear/side grazes
+            -- remain visible as either character turns. This is a conservative
+            -- contact estimate; it never changes either character's hitbox.
+            local attackCF = rootCF * box.CFrameOffset
+            local right = attackCF:VectorToObjectSpace(ownCF.RightVector) * (ownSize.X * 0.5)
+            local up = attackCF:VectorToObjectSpace(ownCF.UpVector) * (ownSize.Y * 0.5)
+            local forward = attackCF:VectorToObjectSpace(ownCF.LookVector) * (ownSize.Z * 0.5)
+            -- The existing margin already covered the unrotated root. Replace it
+            -- only where the projected body is larger; do not stack two margins
+            -- and turn a nearby kick that misses into a dribble trigger.
+            extent = Vector3.new(math.max(C.Padding, math.abs(right.X) + math.abs(up.X) + math.abs(forward.X)),
+                math.max(C.Padding, math.abs(right.Y) + math.abs(up.Y) + math.abs(forward.Y)),
+                math.max(C.Padding, math.abs(right.Z) + math.abs(up.Z) + math.abs(forward.Z)))
+        end
+        local half = box.Size * 0.5 + extent
         if observedPosition then
             -- Extrapolation is an estimate. Cover the bounded space between the
             -- displayed and estimated pose rather than throwing the display pose
@@ -6963,7 +6980,7 @@ local function createStrikerMisc(d)
         end
         return rootCF, half
     end
-    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition)
+    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition, ownSize)
         local constants = N.Tackle.Constants
         local first = math.max(0, constants.HitboxDelaySeconds - age)
         local last = math.min(C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
@@ -6979,7 +6996,7 @@ local function createStrikerMisc(d)
         local box = d.M.Hitboxes.SlideTackle
         local facing = CFrame.lookAt(otherCF.Position, otherCF.Position + direction)
         local half
-        facing, half = contactEnvelope(facing, box, observedPosition)
+        facing, half = contactEnvelope(facing, box, observedPosition, ownCF, ownSize)
         local function point(t)
             local travel = N.Tackle.GetMaximumTravelBetween(age, age + t,
                 constants.StartupDashDistance, constants.Distance)
@@ -7033,13 +7050,13 @@ local function createStrikerMisc(d)
         if not finite(first) or first < 0 or first > C.KickLookahead then return nil end
         return { first = first, fill = fill, direction = early and early.direction or nil }
     end
-    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition)
+    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition, ownSize)
         local box = d.M.Hitboxes.Kick
         -- Predict the aimed hitbox from the received launch aim. The displayed
         -- torso may still face the previous direction when that packet arrives.
         if direction then otherCF = CFrame.lookAt(otherCF.Position, otherCF.Position + direction) end
         local half
-        otherCF, half = contactEnvelope(otherCF, box, observedPosition)
+        otherCF, half = contactEnvelope(otherCF, box, observedPosition, ownCF, ownSize)
         -- Standing kicks retain ordinary movement, not slide travel.
         -- Release can happen any time after minimum charge: this is a threat estimate.
         local function point(t)
@@ -7123,8 +7140,8 @@ local function createStrikerMisc(d)
                         if displayLead > 0 then stats.motionAligned += 1 end
                         lastScan.maximumDisplayLead = math.max(lastScan.maximumDisplayLead, displayLead)
                         local uncertainPosition = displayLead > 0 and observedPosition or nil
-                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition) or nil
-                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition) or nil
+                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition, root.Size) or nil
+                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition, root.Size) or nil
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
@@ -7313,7 +7330,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.13",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.14",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
