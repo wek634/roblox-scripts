@@ -130,7 +130,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.20 | Misc 0.10 | Evaluation 0.2"
+local BUILD = "Auto GK 3.2.6 | STR 0.20 | Misc 0.11 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -6499,6 +6499,9 @@ local function createStrikerMisc(d)
     local generation, staminaGeneration = 0, 0
     local heartbeat, inputConnection = nil, nil
     local attackConnections = {}
+    local characterConnections = {}
+    local characterIndex = setmetatable({}, { __mode = "k" })
+    local characterIndexReady = false
     local attacks = setmetatable({}, { __mode = "k" })
     local ownershipHook, nativeOwner = nil, nil
     local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
@@ -6532,6 +6535,10 @@ local function createStrikerMisc(d)
         if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
         for _, connection in ipairs(attackConnections) do connection:Disconnect() end
         table.clear(attackConnections)
+        for _, connection in ipairs(characterConnections) do connection:Disconnect() end
+        table.clear(characterConnections)
+        table.clear(characterIndex)
+        characterIndexReady = false
         table.clear(attacks)
         if ownershipHook then
             ownershipHook.active = false
@@ -6794,12 +6801,57 @@ local function createStrikerMisc(d)
             if #recentGates > 12 then table.remove(recentGates, 1) end
         end
     end
+    local function resolveCharacter(character)
+        return character and type(d.M.Motion.ResolveCharacter) == "function"
+            and d.M.Motion.ResolveCharacter(character) or character
+    end
+    local function actorFor(character, actor)
+        if actor and actor ~= character and resolveCharacter(actor.Character) == character then return actor end
+        if type(d.M.Actors.GetFromCharacter) == "function" then
+            actor = d.M.Actors.GetFromCharacter(character)
+        else
+            local userId = character:GetAttribute("UserId")
+            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
+        end
+        return actor and resolveCharacter(actor.Character) == character and actor or nil
+    end
+    local function characterTeam(character, actor)
+        if actor then return d.M.Teams.GetActorTeamName(actor) end
+        if type(d.M.Teams.GetCharacterTeamName) == "function" then
+            return d.M.Teams.GetCharacterTeamName(character)
+        end
+        return d.M.Teams.GetActorTeamName(character)
+    end
+    local function watchCharacters()
+        if not workspace.DescendantAdded or not workspace.DescendantRemoving then return end
+        local function added(node)
+            local model
+            if node:IsA("Model") then
+                if node:FindFirstChildOfClass("Humanoid") or node:FindFirstChild("HumanoidRootPart") then model = node end
+            elseif node:IsA("Humanoid") or (node:IsA("BasePart") and node.Name == "HumanoidRootPart") then
+                model = node.Parent
+            end
+            if model and model:IsA("Model") then
+                characterIndex[model] = true
+                nextDiscovery, nextTick = 0, 0
+            end
+        end
+        characterConnections[#characterConnections + 1] = workspace.DescendantAdded:Connect(added)
+        characterConnections[#characterConnections + 1] = workspace.DescendantRemoving:Connect(function(node)
+            if characterIndex[node] then
+                characterIndex[node] = nil
+                nextDiscovery, nextTick = 0, 0
+            end
+        end)
+        for _, node in ipairs(workspace:GetDescendants()) do added(node) end
+        characterIndexReady = true
+    end
     local function observeAttack(kind, userId, ...)
         if kind ~= "TackleStarted" and kind ~= "KickChargeStarted" and kind ~= "KickChargeUpdated"
             and kind ~= "KickReleased" and kind ~= "KickChargeCanceled" then return end
         if not finite(userId) or userId == d.Player.UserId then return end
         local actor = d.M.Actors.GetByUserId(userId)
-        local character = actor and actor.Character
+        local character = resolveCharacter(actor and actor.Character)
         if not character or not character.Parent then return end
         local now, context = workspace:GetServerTimeNow(), d.M.Motion.GetContext(character)
         local state = attacks[character]
@@ -6840,16 +6892,18 @@ local function createStrikerMisc(d)
                 if now - started > constants.MaximumChargeSeconds + 0.25 then return end
                 state.kick = { started = started, charge = charge, at = now,
                     actionId = actionId, presentationId = presentationId, sequence = sequence,
+                    sawCharging = N.ChargeState.IsCharging(actor) or (same and previous.sawCharging) or false,
                     expires = started + constants.MaximumChargeSeconds + 0.25 }
             end
         end
         stats.earlyAttackSamples += 1
-        nextTick = 0
+        nextTick, nextDiscovery = 0, 0
     end
     local function watchAttacks()
         -- TackleEffects queues these same packets through ReplayEvents.PresentAt.
         -- Read timing on receipt so presentation delay cannot hide the windup.
-        -- Native live charge state and predicted contact are still required below.
+        -- Ordered start/update packets supply charge evidence before attributes
+        -- replicate. Cancellation/end packets and predicted contact still gate it.
         for _, remote in ipairs(d.AttackRemotes or {}) do
             attackConnections[#attackConnections + 1] = remote.OnClientEvent:Connect(function(...)
                 if not (alive and A.AutoDribble and d.alive()) then return end
@@ -6861,11 +6915,18 @@ local function createStrikerMisc(d)
     local function discover(ch)
         local seen, list = {}, {}
         local function add(character, actor)
+            character = resolveCharacter(character)
             if not character or character == ch or seen[character] then return end
             seen[character] = true
-            list[#list + 1] = { character = character, actor = actor or character }
+            list[#list + 1] = { character = character, actor = actorFor(character, actor) }
         end
         for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+        for character in pairs(characterIndex) do
+            if character:IsDescendantOf(workspace) then add(character) end
+        end
+        -- An attack packet also identifies its actor even if its model has just
+        -- streamed in or has not appeared in a discovery snapshot yet.
+        for character in pairs(attacks) do if character.Parent then add(character) end end
         local folder = workspace:FindFirstChild("Characters")
         local function children(container)
             if not container then return end
@@ -6873,8 +6934,10 @@ local function createStrikerMisc(d)
                 if child:IsA("Model") then add(child) end
             end
         end
-        children(folder)
-        children(folder and folder:FindFirstChild("NPCs"))
+        if not characterIndexReady then
+            children(folder)
+            children(folder and folder:FindFirstChild("NPCs"))
+        end
         candidates, cachedCharacter = list, ch
         nextDiscovery = os.clock() + C.DiscoverySeconds
     end
@@ -6952,14 +7015,12 @@ local function createStrikerMisc(d)
         return nil
     end
     local function kickWindow(candidate)
-        local other, actor = candidate.character, candidate.actor
-        if actor == other then
-            local userId = other:GetAttribute("UserId")
-            actor = finite(userId) and d.M.Actors.GetByUserId(userId) or nil
-        end
-        if not actor or actor.Character ~= other or not finite(actor.UserId)
-            or d.M.Match.IsGoalkeeperCharacter(other) or not N.ChargeState.IsCharging(actor) then return nil end
-        -- Presentation alone can linger after cancellation. Require live native charge state too.
+        local other = candidate.character
+        local actor = actorFor(other, candidate.actor)
+        if not actor or not finite(actor.UserId) or d.M.Match.IsGoalkeeperCharacter(other) then return nil end
+        local charging = N.ChargeState.IsCharging(actor)
+        -- Presentation alone can linger after cancellation. It must have native
+        -- charge state or a still-live, ordered server start/update packet.
         -- This fill is elapsed / maximum, NOT KickCore's power alpha.
         local fill, compact = N.Effects.GetObservedChargeFill(actor.UserId)
         local attack = attacks[other]
@@ -6967,12 +7028,17 @@ local function createStrikerMisc(d)
         if early then
             local now = workspace:GetServerTimeNow()
             if early.ended or now > early.expires then return nil end
+            if charging then early.sawCharging = true
+            elseif early.sawCharging then
+                early.ended = true
+                return nil
+            end
             local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
             local maximum = constants and constants.MaximumChargeSeconds
             if not finite(maximum) or maximum <= 0 then return nil end
             fill = math.clamp(math.max(now - early.started, early.charge + now - early.at) / maximum, 0, 1)
             compact = false
-        end
+        elseif not charging then return nil end
         if not finite(fill) or fill < 0 or fill > 1 or compact ~= false then
             if fill == nil then stats.kickStateWithoutPresentation += 1 end
             return nil
@@ -7036,8 +7102,9 @@ local function createStrikerMisc(d)
         local now, best = workspace:GetServerTimeNow(), nil
         for _, candidate in ipairs(candidates) do
             local other = candidate.character
+            candidate.actor = actorFor(other, candidate.actor)
             if other.Parent and d.M.Motion.GetContext(other) == context
-                and d.M.Teams.GetActorTeamName(candidate.actor) == opposing then
+                and characterTeam(other, candidate.actor) == opposing then
                 -- Require an observed slide or a live native kick charge, never proximity alone.
                 local untilTime = N.Tackle.GetSlidingUntil(other)
                 local constants = N.Tackle.Constants
@@ -7148,6 +7215,7 @@ local function createStrikerMisc(d)
         A.AutoDribble, A.DribbleStatus, nextTick = true, "WATCHING", 0
         local connected, connectionError = pcall(function()
             watchNativeOwner()
+            watchCharacters()
             watchAttacks()
             inputConnection = d.Input.InputBegan:Connect(function(input)
                 if not A.AutoDribble then return end
@@ -7232,7 +7300,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.10",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.11",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
@@ -7784,7 +7852,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.30 live keeper discovery",
+    build = "Dmc 0.31 dribble actor and kick detection",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
