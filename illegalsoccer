@@ -6460,6 +6460,7 @@ local function createStrikerMisc(d)
     local characterIndexReady = false
     local attacks = setmetatable({}, { __mode = "k" })
     local ownershipHook, nativeOwner = nil, nil
+    local queuedScan, requestScan = nil, nil
     local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
     local placementHook = nil
     local nextStaminaRetry = 0
@@ -6493,6 +6494,7 @@ local function createStrikerMisc(d)
         warn("[Dmc Misc] " .. A.LastError)
     end
     local function stopWatch()
+        queuedScan = nil
         if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
         if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
         for _, connection in ipairs(attackConnections) do connection:Disconnect() end
@@ -6673,7 +6675,8 @@ local function createStrikerMisc(d)
             { N.Tackle, "GetMaximumTravelBetween" }, { N.Sprint, "CanSpendStamina" },
             { N.Shoot, "IsCharging" }, { N.ChargeState, "IsCharging" }, { N.Effects, "GetObservedChargeFill" },
             { N.KickCore, "GetMinimumReleaseDelaySeconds" }, { N.Power, "GetChargeConstants" },
-            { d.M.Dodge, "HandleInputBegan" }, { d.M.Dodge, "IsDribbling" } }) do
+            { d.M.Dodge, "HandleInputBegan" }, { d.M.Dodge, "IsDribbling" },
+            { d.M.Dodge, "UpdateControlState" } }) do
             assert(type(item[1][item[2]]) == "function", "Missing native dribble API: " .. item[2])
         end
         N.Dodge = N.Dodge or d.load("Modules.Actions.Dodge")
@@ -6700,8 +6703,9 @@ local function createStrikerMisc(d)
                         or previous.userId ~= userId or previous.character ~= ch
                         or previous.ballId ~= nativeOwner.ballId or previous.context ~= nativeOwner.context) then
                         -- Receipt can follow a refused attempt or a roster refresh.
-                        -- Wake the next heartbeat, with all native gates still checked.
+                        -- Finish the native handoff before evaluating the packet batch.
                         nextTick, nextDiscovery, retryAt = 0, 0, 0
+                        requestScan()
                     end
                 end)
                 if not ok then nativeOwner = nil; stats.observerErrors += 1 end
@@ -6740,7 +6744,9 @@ local function createStrikerMisc(d)
             if N.Controls.IsActive(name) then return nil, "STRIKING" end
         end
         if d.M.Dodge.IsDribbling() then return nil, "DRIBBLING" end
-        if d.M.Slide.IsSlideTackling() or not d.M.Controllers.IsLanded(ch, hum) then return nil, "MOVING" end
+        -- Native availability/HandleInputBegan own the action override. A slide's
+        -- presentation can outlast that override after a grounded ball pickup.
+        if not d.M.Controllers.IsLanded(ch, hum) then return nil, "MOVING" end
         if not N.Controls.IsAvailable("Dribble") or N.Controls.IsOnCooldown("Dribble") then return nil, "COOLDOWN / BLOCKED" end
         if not N.Sprint.CanSpendStamina(N.Dodge.Constants.StaminaCost, true) then return nil, "LOW STAMINA" end
         if os.clock() < retryAt then return nil, "RETRY WAIT" end
@@ -6865,6 +6871,7 @@ local function createStrikerMisc(d)
         end
         stats.earlyAttackSamples += 1
         nextTick, nextDiscovery = 0, 0
+        requestScan()
     end
     local function watchAttacks()
         -- TackleEffects queues these same packets through ReplayEvents.PresentAt.
@@ -7075,6 +7082,12 @@ local function createStrikerMisc(d)
         return nil
     end
     local function tick()
+        local character = d.Player.Character
+        if character and character.Parent and ownsBall(character) and not d.M.Dodge.IsDribbling() then
+            -- SetOwnerUserId updates NotOwner, but Unready/Recovery are refreshed
+            -- separately. Use the native refresh before reading those flags.
+            d.M.Dodge.UpdateControlState()
+        end
         local ch, rootOrReason = eligible()
         noteGate(not ch and rootOrReason or nil)
         if not ch then
@@ -7207,6 +7220,26 @@ local function createStrikerMisc(d)
         recent[#recent + 1] = attempt
         if #recent > 8 then table.remove(recent, 1) end
     end
+    local function runScan()
+        queuedScan = nil
+        local start = os.clock()
+        local succeeded, tickError = pcall(tick)
+        stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
+        if not succeeded then stopDribbleWatch(tickError) end
+    end
+    requestScan = function()
+        if queuedScan or not (alive and A.AutoDribble and d.alive()) then return end
+        local ticket = {}
+        queuedScan = ticket
+        task.defer(function()
+            if queuedScan ~= ticket or not (alive and A.AutoDribble and d.alive()) then return end
+            -- Evaluate every attacker using the latest packet batch. Coalesce
+            -- simultaneous starts/cancellations and never dispatch inside a
+            -- native ownership callback or recursively from our own input.
+            nextTick = os.clock() + C.Interval
+            runScan()
+        end)
+    end
     -- Read only; used at 10 Hz exclusively during an explicit comparison run.
     function A.ObserveDribbleGate()
         if not (alive and A.AutoDribble and d.alive()) then return nil end
@@ -7263,9 +7296,7 @@ local function createStrikerMisc(d)
                 -- run a catch-up loop or send multiple requests in one heartbeat.
                 if nextTick == 0 then nextTick = start + C.Interval
                 else nextTick += (math.floor((start - nextTick) / C.Interval) + 1) * C.Interval end
-                local succeeded, tickError = pcall(tick)
-                stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
-                if not succeeded then stopDribbleWatch(tickError) end
+                runScan()
             end)
         end)
         if not connected then stopDribbleWatch(connectionError); return false end
@@ -7330,7 +7361,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.14",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.15",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
