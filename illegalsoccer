@@ -1,3 +1,5 @@
+-- Small, dependency-free startup controller. Game modules are loaded only after
+-- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
@@ -5801,7 +5803,39 @@ local function createStriker(d)
         local incumbent = choice and choice.candidate or owner.selectedCandidate
         if incumbent then table.insert(shortlist, 1, incumbent) end
         owner.validationPass = (owner.validationPass or 0) + 1
-        local prioritizeBest = owner.validationPass % 2 == 0
+        local priorities = {}
+        local keeperMoved = false
+        for _, entry in ipairs(shortlist) do
+            local previous = entry.frame and entry.frame.keepers
+            local changed = not previous or #previous ~= #f.keepers
+            for i, keeper in ipairs(f.keepers) do
+                local old = previous and previous[i]
+                if not old or old.character ~= keeper.character or old.position ~= keeper.position
+                    or old.velocity ~= keeper.velocity or old.speed ~= keeper.speed or old.jump ~= keeper.jump
+                    or old.upright ~= keeper.upright then
+                    changed = true; break
+                end
+            end
+            local rating = entry.rating
+            if changed and previous and #previous > 0 and rating and rating.position and rating.eta then
+                -- Refresh ordering after keeper movement without rerunning every trajectory.
+                -- Preserve each route's flight score, adjusting its endpoint reach estimate.
+                -- This is only a proposal priority; the full current flight is checked below.
+                local before = table.clone(f); before.keepers = previous; before.reachProfiles = nil
+                local _, oldDemand = reachDemand(before, rating.position, rating.position, rating.eta)
+                local _, newDemand = reachDemand(f, rating.position, rating.position, rating.eta)
+                local priority = table.clone(rating)
+                priority.score += (newDemand - oldDemand) * d.M.Dive.Constants.Distance
+                priorities[entry] = priority
+                keeperMoved = true
+            elseif entry.checkedStage == owner.validationStage then
+                priorities[entry] = entry.checkedRating or false
+            else
+                priorities[entry] = rating
+            end
+        end
+        -- Changed coverage needs a fresh rival now; stationary scenes retain fair rotation.
+        local prioritizeBest = keeperMoved or owner.validationPass % 2 == 0
         table.sort(shortlist, function(a, b)
             -- Revalidate the previous winner, then fairly visit alternatives. Two stale
             -- top-ranked proposals must not hide every other lane until aim lock.
@@ -5811,9 +5845,7 @@ local function createStriker(d)
             -- Alternate strength and age: refresh a strong finished corner promptly,
             -- while stale or invalid leaders cannot permanently hide other lanes.
             if prioritizeBest then
-                local ar, br = a.rating, b.rating
-                if a.checkedStage == owner.validationStage then ar = a.checkedRating end
-                if b.checkedStage == owner.validationStage then br = b.checkedRating end
+                local ar, br = priorities[a], priorities[b]
                 if betterRating(ar, br) then return true end
                 if betterRating(br, ar) then return false end
             end
@@ -6004,14 +6036,21 @@ local function createStriker(d)
         if not inBudget() or not now then return nil end
         local remaining = f.maximumCharge - f.elapsed
         local laterBest
+        local function worthReleasing(later)
+            return not later
+                or ((now.defenderRisk or 0) ~= (later.defenderRisk or 0) and betterRating(now, later))
+                or ((now.defenderRisk or 0) == (later.defenderRisk or 0) and now.score >= later.score + C.ReleaseMargin)
+        end
         for _, delay in ipairs({ remaining / 2, remaining }) do
             local later, valid = evaluate(delay)
             if not inBudget() or not valid then return nil end
             if betterRating(later, laterBest) then laterBest = later end
+            -- One better future option is enough to keep holding. Only an early
+            -- release requires all comparisons; avoid an unnecessary full-power
+            -- simulation when the halfway option already rules release out.
+            if not worthReleasing(laterBest) then break end
         end
-        local release = not laterBest
-            or ((now.defenderRisk or 0) ~= (laterBest.defenderRisk or 0) and betterRating(now, laterBest))
-            or ((now.defenderRisk or 0) == (laterBest.defenderRisk or 0) and now.score >= laterBest.score + C.ReleaseMargin)
+        local release = worthReleasing(laterBest)
         owner.releaseTiming = { decision = release and "release" or "wait", charge = f.charge,
             nowScore = now.score, laterScore = laterBest and laterBest.score or nil,
             nowDefenderRisk = now.defenderRisk, laterDefenderRisk = laterBest and laterBest.defenderRisk or nil }
@@ -6376,6 +6415,14 @@ local function createStriker(d)
         if session and not A.SmartRelease then session.smartRelease = false end
         return true
     end
+    function A.GetAssistRange()
+        return C.MaxAssistDistance
+    end
+    function A.SetAssistRange(value)
+        if not alive or not num(value) then return false end
+        C.MaxAssistDistance = math.clamp(math.floor(value + 0.5), 40, 100)
+        return true
+    end
     function A.Cleanup()
         if not cancelPairedCharge() then return false end
         alive, A.Enabled = false, false
@@ -6387,7 +6434,7 @@ local function createStriker(d)
     function A.Debug()
         return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16.1",
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
             maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
@@ -6436,6 +6483,12 @@ local function createStrikerMisc(d)
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
+    local function attackDirection(value)
+        if typeof(value) == "table" or typeof(value) == "Ray" then value = value.Direction end
+        if not vector(value) then return nil end
+        local direction = flat(value)
+        return direction.Magnitude > 1e-5 and direction.Unit or nil
+    end
     local function problem(err)
         A.LastError = tostring(err)
         stats.errors += 1
@@ -6771,7 +6824,9 @@ local function createStrikerMisc(d)
         if kind == "TackleStarted" then
             if not finite(started) then return end
             if started > now or now - started > N.Tackle.Constants.HitboxDelaySeconds + N.Tackle.Constants.HitboxSeconds then return end
-            state.slideStarted = math.max(state.slideStarted or -math.huge, started)
+            if state.slideStarted and started <= state.slideStarted then return end
+            state.slideStarted = started
+            state.slideDirection = attackDirection(select(2, ...))
         else
             local actionId, presentationId, sequence = select(9, ...), select(11, ...), select(13, ...)
             local previous = state.kick
@@ -6803,6 +6858,9 @@ local function createStrikerMisc(d)
                 if now - started > constants.MaximumChargeSeconds + 0.25 then return end
                 state.kick = { started = started, charge = charge, at = now,
                     actionId = actionId, presentationId = presentationId, sequence = sequence,
+                    -- p274 is the launch aim, p285 its flat kick direction.
+                    -- p272 is animation direction and must not substitute for aim.
+                    direction = attackDirection(select(4, ...)) or attackDirection(select(15, ...)),
                     sawCharging = N.ChargeState.IsCharging(actor) or (same and previous.sawCharging) or false,
                     expires = started + constants.MaximumChargeSeconds + 0.25 }
             end
@@ -6869,7 +6927,7 @@ local function createStrikerMisc(d)
         end
         return true
     end
-    local function alignDisplayedMotion(character, cf: CFrame, velocity: Vector3, slideAge: number?): (CFrame, number)
+    local function alignDisplayedMotion(character, cf: CFrame, velocity: Vector3, slideAge: number?, slideDirection: Vector3?): (CFrame, number)
         local motion = d.M.Motion
         if type(motion.GetDisplayDelaySeconds) ~= "function"
             or type(motion.GetSimulationRoot) == "function" and motion.GetSimulationRoot(character) then return cf, 0 end
@@ -6878,8 +6936,8 @@ local function createStrikerMisc(d)
         delay = math.min(delay, C.MaximumDisplayLead)
         local displacement = velocity * delay
         if slideAge then
-            local direction = flat(velocity)
-            if direction.Magnitude < 1 then direction = flat(cf.LookVector) end
+            local direction = slideDirection or flat(velocity)
+            if not slideDirection and direction.Magnitude < 1 then direction = flat(cf.LookVector) end
             if direction.Magnitude > 1e-5 then
                 local constants = N.Tackle.Constants
                 local motionSeconds = math.min(delay, slideAge)
@@ -6894,20 +6952,36 @@ local function createStrikerMisc(d)
         -- This is a bounded estimate, never a character movement write.
         return cf + displacement, delay
     end
-    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age)
+    local function contactEnvelope(rootCF, box, observedPosition)
+        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
+        if observedPosition then
+            -- Extrapolation is an estimate. Cover the bounded space between the
+            -- displayed and estimated pose rather than throwing the display pose
+            -- away. Otherwise compensation can advance a close attack past us.
+            local delta = observedPosition - rootCF.Position
+            local offset = (rootCF * box.CFrameOffset):VectorToObjectSpace(delta)
+            half += Vector3.new(math.abs(offset.X), math.abs(offset.Y), math.abs(offset.Z)) * 0.5
+            rootCF += delta * 0.5
+        end
+        return rootCF, half
+    end
+    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition)
         local constants = N.Tackle.Constants
         local first = math.max(0, constants.HitboxDelaySeconds - age)
         local last = math.min(C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
         if last < first then return nil end
-        local direction = flat(otherVelocity)
-        if direction.Magnitude < 1 then direction = flat(otherCF.LookVector) end
+        -- A start packet reports the committed dash direction before motion
+        -- interpolation necessarily catches up with a turn into the tackle.
+        local direction = slideDirection or flat(otherVelocity)
+        if not slideDirection and direction.Magnitude < 1 then direction = flat(otherCF.LookVector) end
         if direction.Magnitude < 1e-5 then return nil end
         direction = direction.Unit
         -- The native maximum is conservative through the startup/main-dash handoff.
         -- Recompute from the observed root every scan; never integrate a stale origin.
         local box = d.M.Hitboxes.SlideTackle
-        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
         local facing = CFrame.lookAt(otherCF.Position, otherCF.Position + direction)
+        local half
+        facing, half = contactEnvelope(facing, box, observedPosition)
         local function point(t)
             local travel = N.Tackle.GetMaximumTravelBetween(age, age + t,
                 constants.StartupDashDistance, constants.Distance)
@@ -6959,12 +7033,16 @@ local function createStrikerMisc(d)
         if not finite(maximum) or maximum <= 0 then return nil end
         local first = N.KickCore.GetMinimumReleaseDelaySeconds(fill * maximum, constants)
         if not finite(first) or first < 0 or first > C.KickLookahead then return nil end
-        return { first = first, fill = fill }
+        return { first = first, fill = fill, direction = early and early.direction or nil }
     end
-    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first)
+    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition)
         local box = d.M.Hitboxes.Kick
-        local half = box.Size * 0.5 + Vector3.new(C.Padding, C.Padding, C.Padding)
-        -- Standing kicks use the facing hitbox, not slide travel or velocity-facing.
+        -- Predict the aimed hitbox from the received launch aim. The displayed
+        -- torso may still face the previous direction when that packet arrives.
+        if direction then otherCF = CFrame.lookAt(otherCF.Position, otherCF.Position + direction) end
+        local half
+        otherCF, half = contactEnvelope(otherCF, box, observedPosition)
+        -- Standing kicks retain ordinary movement, not slide travel.
         -- Release can happen any time after minimum charge: this is a threat estimate.
         local function point(t)
             local rootCF = otherCF + otherVelocity * t
@@ -7026,6 +7104,10 @@ local function createStrikerMisc(d)
                 local age = finite(untilTime) and now - (untilTime - constants.TotalMotionSeconds) or nil
                 local hitboxEndsAt = constants.HitboxDelaySeconds + constants.HitboxSeconds
                 local sliding = age ~= nil and age >= 0 and age <= hitboxEndsAt
+                -- Do not attach an old packet's direction to a newer replicated slide.
+                local slideDirection = sliding and attack and attack.context == context and attack.slideStarted
+                    and math.abs(untilTime - (attack.slideStarted + constants.TotalMotionSeconds)) < 1e-4
+                    and attack.slideDirection or nil
                 local kick = kickWindow(candidate)
                 if not sliding and not kick then continue end
                 if sliding then lastScan.activeSlides += 1 end
@@ -7037,15 +7119,37 @@ local function createStrikerMisc(d)
                     local otherVelocity = d.M.Motion.GetVelocity(other) or otherRoot.AssemblyLinearVelocity
                     if vector(otherCF.Position) and vector(otherVelocity)
                         and (otherCF.Position - ownCF.Position).Magnitude <= C.Range then
+                        local observedPosition = otherCF.Position
                         local displayLead
-                        otherCF, displayLead = alignDisplayedMotion(other, otherCF, otherVelocity, sliding and age or nil)
+                        otherCF, displayLead = alignDisplayedMotion(other, otherCF, otherVelocity, sliding and age or nil, slideDirection)
                         if displayLead > 0 then stats.motionAligned += 1 end
                         lastScan.maximumDisplayLead = math.max(lastScan.maximumDisplayLead, displayLead)
-                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age) or nil
-                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first) or nil
+                        local uncertainPosition = displayLead > 0 and observedPosition or nil
+                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition) or nil
+                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition) or nil
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
+                        local observedDistance = flat(observedPosition - ownCF.Position).Magnitude
+                        if not lastScan.nearestThreat or observedDistance < lastScan.nearestThreat.observedDistance then
+                            -- One bounded, read-only sample makes future misses diagnosable
+                            -- without inferring exact geometry from a video or contact count.
+                            lastScan.nearestThreat = { target = other.Name, observedDistance = observedDistance,
+                                alignedDistance = distance, displayLeadSeconds = displayLead,
+                                poseShiftStuds = (otherCF.Position - observedPosition).Magnitude,
+                                slideAgeSeconds = sliding and age or nil,
+                                hitboxRemainingSeconds = sliding and hitboxEndsAt - age or nil,
+                                kickEarliestReleaseSeconds = kick and kick.first or nil,
+                                predictedContactSeconds = eta, contactPredicted = eta ~= nil,
+                                ownPosition = { ownCF.Position.X, ownCF.Position.Y, ownCF.Position.Z },
+                                ownVelocity = { velocity.X, velocity.Y, velocity.Z },
+                                observedPosition = { observedPosition.X, observedPosition.Y, observedPosition.Z },
+                                alignedPosition = { otherCF.Position.X, otherCF.Position.Y, otherCF.Position.Z },
+                                opponentVelocity = { otherVelocity.X, otherVelocity.Y, otherVelocity.Z },
+                                observedFacing = { otherCF.LookVector.X, otherCF.LookVector.Y, otherCF.LookVector.Z },
+                                slideDirection = slideDirection and { slideDirection.X, slideDirection.Y, slideDirection.Z } or nil,
+                                kickDirection = kick and kick.direction and { kick.direction.X, kick.direction.Y, kick.direction.Z } or nil }
+                        end
                         if eta then lastScan.contacts += 1 end
                         if eta and (not best or eta < best.eta or eta == best.eta and (distance or math.huge) < (best.distance or math.huge)) then
                             best = { character = other, eta = eta, distance = distance, reason = reason,
@@ -7211,7 +7315,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.11",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.13",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
@@ -7960,7 +8064,7 @@ do
     local tabBar = frame(panel, "Tabs", 12, 44, 292, 26)
     tabBar.BackgroundTransparency = 1
     -- STR is independent of the goalkeeper automation toggle.
-    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 406)
+    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 458)
     strikerContent.BackgroundTransparency = 1
     strikerContent.Visible = false
     local live = round(frame(panel, "LiveStatus", 12, 76, 292, 28, C.surface), 5)
@@ -7987,6 +8091,7 @@ do
     local dropdowns = {}
     local expanded = nil
     local dragging = false
+    local rangeInput = nil
     local minimized = false
     local activeTab = "GK"
     local activeBody = nil
@@ -8072,6 +8177,7 @@ do
     hover(unload)
 
     local function closeDropdown(immediate)
+        rangeInput = nil
         local previous = expanded
         expanded = nil
         if immediate then
@@ -8403,13 +8509,13 @@ do
     )
 
     local gkRefresherCount = #refreshers
-    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 127)
+    local shootingSection = frame(strikerContent, "Shooting", 0, 0, 292, 179)
     shootingSection.BackgroundTransparency = 1
     text(shootingSection, "SHOOTING", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
     })
-    activeBody = frame(shootingSection, "Options", 0, 22, 292, 105)
+    activeBody = frame(shootingSection, "Options", 0, 22, 292, 157)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
@@ -8418,7 +8524,70 @@ do
     toggle("Best shot assist", function() return STR.Enabled end, STR.SetEnabled)
     toggle("Auto curve ball", function() return STR.AutoCurve end, STR.SetAutoCurve)
     toggle("Smart shot release", function() return STR.SmartRelease end, STR.SetSmartRelease)
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 141, 292, 89)
+    do
+        order += 1
+        local row = frame(activeBody, "ShotRange", 0, 0, 292, 49, C.control)
+        row.Size = UDim2.new(1, 0, 0, 49)
+        row.LayoutOrder = order
+        text(row, "Shot range  40–100", 10, {
+            Position = UDim2.fromOffset(12, 0), Size = UDim2.fromOffset(174, 24),
+        })
+        local value = text(row, "", 10, {
+            Name = "Value", Position = UDim2.new(1, -92, 0, 0),
+            Size = UDim2.fromOffset(80, 24), TextXAlignment = Enum.TextXAlignment.Right,
+            TextColor3 = C.accent,
+        })
+        local handle = button(row, {
+            Name = "RangeInput", Position = UDim2.fromOffset(12, 23),
+            Size = UDim2.new(1, -24, 0, 24), BackgroundTransparency = 1, Text = "",
+        })
+        local track = round(frame(handle, "Track", 7, 10, 0, 4, C.accentDim), 2)
+        track.Size = UDim2.new(1, -14, 0, 4)
+        local fill = round(frame(track, "Fill", 0, 0, 0, 4, C.accent), 2)
+        local knob = round(frame(track, "Knob", 0, -5, 14, 14, C.accent), 7)
+        knob.AnchorPoint = Vector2.new(0.5, 0)
+        local previous
+        local function drawRange()
+            local range = STR.GetAssistRange()
+            if range == previous then return end
+            previous = range
+            local alpha = (range - 40) / 60
+            value.Text = tostring(range) .. " studs"
+            fill.Size = UDim2.new(alpha, 0, 1, 0)
+            knob.Position = UDim2.new(alpha, 0, 0, -5)
+        end
+        local function setFromPoint(point)
+            local width = track.AbsoluteSize.X
+            if width <= 0 then return end
+            local alpha = math.clamp((point.X - track.AbsolutePosition.X) / width, 0, 1)
+            STR.SetAssistRange(40 + alpha * 60)
+            drawRange()
+        end
+        connect(handle.InputBegan, function(input)
+            if not S.alive or not Gui.Enabled or minimized or activeTab ~= "STR" or dragging or rangeInput then return end
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                closeDropdown(true)
+                rangeInput = input
+                S.uiBusy = true
+                setFromPoint(input.Position)
+            end
+        end)
+        connect(UserInputService.InputChanged, function(input)
+            if not S.alive or not rangeInput then return end
+            if input == rangeInput or (rangeInput.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseMovement) then setFromPoint(input.Position) end
+        end)
+        connect(UserInputService.InputEnded, function(input)
+            if rangeInput and (input == rangeInput or (rangeInput.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+                rangeInput = nil
+                S.uiBusy = dragging or expanded ~= nil
+            end
+        end)
+        drawRange()
+        table.insert(refreshers, drawRange)
+    end
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 89)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
@@ -8433,21 +8602,21 @@ do
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 240),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 292),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
         Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
     })
     local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 274),
+        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 326),
         Size = UDim2.fromOffset(276, 54), TextWrapped = true,
         TextColor3 = C.muted,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 331), Size = UDim2.fromOffset(276, 28),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 383), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.accentDim,
     })
-    text(strikerContent, "Shots: within 55 studs. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
-        Position = UDim2.fromOffset(8, 364), Size = UDim2.fromOffset(276, 32),
+    text(strikerContent, "Shots: use range above. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
+        Position = UDim2.fromOffset(8, 416), Size = UDim2.fromOffset(276, 32),
         TextWrapped = true, TextColor3 = C.muted,
     })
 
@@ -8464,7 +8633,7 @@ do
     local function fit(requestedX, requestedY)
         local viewport = viewportSize()
         local top = math.min(48, viewport.Y * 0.1)
-        local width, height = 316, minimized and 40 or 494
+        local width, height = 316, minimized and 40 or (activeTab == "STR" and 546 or 494)
         local scale = math.min(1, math.max(1, viewport.X - 32) / width,
             math.max(1, viewport.Y - top - 16) / height)
         if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab then
