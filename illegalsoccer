@@ -6542,6 +6542,8 @@ local function createStrikerMisc(d)
     local alive, loadingDribble, loadingStamina = true, false, false
     local generation, staminaGeneration = 0, 0
     local heartbeat, inputConnection = nil, nil
+    local controlConnection, pickupWindow = nil, nil
+    local scanning, manualHadBall = false, true
     local attackConnections = {}
     local characterConnections = {}
     local characterIndex = setmetatable({}, { __mode = "k" })
@@ -6549,6 +6551,7 @@ local function createStrikerMisc(d)
     local attacks = setmetatable({}, { __mode = "k" })
     local ownershipHook, nativeOwner = nil, nil
     local queuedScan, requestScan = nil, nil
+    local nextPingSample, networkLead = 0, 0
     local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
     local placementHook = nil
     local nextStaminaRetry = 0
@@ -6560,13 +6563,16 @@ local function createStrikerMisc(d)
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
         observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
-        motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0 }
+        motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
+        pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
     local blockedBy, recentGates = {}, {}
     local lastScan = nil
     local lastCorrection = nil
     local C = { Interval = 1 / 60, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
-        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20 }
+        RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20,
+        ChargeStateGrace = 0.10, MaximumNetworkLead = 0.12, PingSampleSeconds = 0.5,
+        PickupReadySeconds = 0.35 }
     local function flat(v) return Vector3.new(v.X, 0, v.Z) end
     local function finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vector(v) return typeof(v) == "Vector3" and finite(v.X) and finite(v.Y) and finite(v.Z) end
@@ -6583,8 +6589,11 @@ local function createStrikerMisc(d)
     end
     local function stopWatch()
         queuedScan = nil
+        nextPingSample, networkLead = 0, 0
         if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
         if inputConnection then inputConnection:Disconnect(); inputConnection = nil end
+        if controlConnection then controlConnection:Disconnect(); controlConnection = nil end
+        pickupWindow = nil
         for _, connection in ipairs(attackConnections) do connection:Disconnect() end
         table.clear(attackConnections)
         for _, connection in ipairs(characterConnections) do connection:Disconnect() end
@@ -6792,8 +6801,19 @@ local function createStrikerMisc(d)
                         or previous.ballId ~= nativeOwner.ballId or previous.context ~= nativeOwner.context) then
                         -- Receipt can follow a refused attempt or a roster refresh.
                         -- Finish the native handoff before evaluating the packet batch.
+                        pickupWindow = { character = ch, ballId = nativeOwner.ballId,
+                            context = nativeOwner.context, expires = os.clock() + C.PickupReadySeconds }
+                        -- A press made while chasing the loose ball must not carry
+                        -- its grace delay into the newly owned ball. Active native
+                        -- strikes, slides and jumps still enforce their own gates.
+                        if not manualHadBall and manualUntil > os.clock() then
+                            manualUntil = 0
+                            stats.pickupInputResets += 1
+                        end
                         nextTick, nextDiscovery, retryAt = 0, 0, 0
                         requestScan()
+                    elseif userId ~= d.Player.UserId then
+                        pickupWindow = nil
                     end
                 end)
                 if not ok then nativeOwner = nil; stats.observerErrors += 1 end
@@ -6810,6 +6830,35 @@ local function createStrikerMisc(d)
             return nativeOwner.userId == d.Player.UserId
         end
         return d.M.Renderer.GetOwnedUserId() == d.Player.UserId
+    end
+    local function watchPickupReadiness()
+        if type(N.Controls.OnStateChanged) ~= "function" then return end
+        local function changed(name, field, active, available, _, cooldown)
+            if scanning or not (alive and A.AutoDribble and d.alive()) then return end
+            local pickup = pickupWindow
+            if not pickup then return end
+            local ch = d.Player.Character
+            if os.clock() > pickup.expires or ch ~= pickup.character or not ch or not ch.Parent
+                or currentBallId() ~= pickup.ballId or d.M.Motion.GetContext(ch) ~= pickup.context then
+                pickupWindow = nil
+                return
+            end
+            local becameReady = name == "Dribble" and available == true and cooldown ~= true
+                and (field == "Available" or field == "Cooldown")
+            local strikeEnded = field == "Active" and active == false
+                and (name == "Kick" or name == "Pass" or name == "Lob" or name == "RainbowFlick")
+            if not (becameReady or strikeEnded) or not ownsBall(ch) or d.M.Dodge.IsDribbling() then return end
+            -- The ownership scan may have run before the native pickup/landing
+            -- handoff cleared Unready. Wake on that transition rather than wait
+            -- for another heartbeat; defer so the entire native callback finishes.
+            stats.pickupReadinessWakes += 1
+            nextTick = 0
+            requestScan()
+        end
+        controlConnection = N.Controls.OnStateChanged(function(...)
+            local ok = pcall(changed, ...)
+            if not ok then stats.observerErrors += 1 end
+        end)
     end
     local function eligible()
         if not (alive and A.AutoDribble and d.alive()) then return nil, "OFF" end
@@ -7075,10 +7124,22 @@ local function createStrikerMisc(d)
         end
         return rootCF, half
     end
-    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition, ownSize)
+    local function reactionLead()
+        local clock = os.clock()
+        if clock >= nextPingSample then
+            nextPingSample = clock + C.PingSampleSeconds
+            -- GetNetworkPing reports round-trip seconds. Half is a bounded
+            -- estimate of the outbound dodge request's travel time. Display
+            -- alignment corrects the opponent pose; it does not cover this trip.
+            local ok, ping = pcall(function() return d.Player:GetNetworkPing() end)
+            networkLead = ok and finite(ping) and ping >= 0 and math.min(ping * 0.5, C.MaximumNetworkLead) or 0
+        end
+        return networkLead
+    end
+    local function contactTime(ownCF, ownVelocity, otherCF, otherVelocity, age, slideDirection, observedPosition, ownSize, horizon)
         local constants = N.Tackle.Constants
         local first = math.max(0, constants.HitboxDelaySeconds - age)
-        local last = math.min(C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
+        local last = math.min(horizon or C.Lookahead, constants.HitboxDelaySeconds + constants.HitboxSeconds - age)
         if last < first then return nil end
         -- A start packet reports the committed dash direction before motion
         -- interpolation necessarily catches up with a turn into the tackle.
@@ -7109,7 +7170,7 @@ local function createStrikerMisc(d)
         end
         return nil
     end
-    local function kickWindow(candidate)
+    local function kickWindow(candidate, horizon)
         local other = candidate.character
         local actor = actorFor(other, candidate.actor)
         if not actor or not finite(actor.UserId) or d.M.Match.IsGoalkeeperCharacter(other) then return nil end
@@ -7124,8 +7185,11 @@ local function createStrikerMisc(d)
             local now = workspace:GetServerTimeNow()
             if early.ended or now > early.expires then return nil end
             if charging then early.sawCharging = true
-            elseif early.sawCharging then
-                early.ended = true
+            elseif early.sawCharging and now - early.at > C.ChargeStateGrace then
+                -- Attribute replication and ordered presentation packets can
+                -- disagree briefly. Only an explicit release/cancel is terminal.
+                -- A stale packet cannot keep a dropped charge live, but it must
+                -- not poison newer updates for the same action either.
                 return nil
             end
             local constants = N.Power.GetChargeConstants(actor, N.KickCore.Constants)
@@ -7142,11 +7206,13 @@ local function createStrikerMisc(d)
         local maximum = constants and constants.MaximumChargeSeconds
         if not finite(maximum) or maximum <= 0 then return nil end
         local first = N.KickCore.GetMinimumReleaseDelaySeconds(fill * maximum, constants)
-        if not finite(first) or first < 0 or first > C.KickLookahead then return nil end
+        if not finite(first) or first < 0 or first > (horizon or C.KickLookahead) then return nil end
         return { first = first, fill = fill, direction = early and early.direction or nil }
     end
-    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition, ownSize)
+    local function kickContactTime(ownCF, ownVelocity, otherCF, otherVelocity, first, direction, observedPosition, ownSize, horizon)
         local box = d.M.Hitboxes.Kick
+        local last = horizon or C.KickLookahead
+        if last < first then return nil end
         -- Predict the aimed hitbox from the received launch aim. The displayed
         -- torso may still face the previous direction when that packet arrives.
         if direction then otherCF = CFrame.lookAt(otherCF.Position, otherCF.Position + direction) end
@@ -7160,9 +7226,9 @@ local function createStrikerMisc(d)
         end
         local previous = point(first)
         if segmentBox(previous, previous, half) then return first end
-        local steps = math.max(1, math.ceil((C.KickLookahead - first) / C.Step))
+        local steps = math.max(1, math.ceil((last - first) / C.Step))
         for i = 1, steps do
-            local t = first + (C.KickLookahead - first) * i / steps
+            local t = first + (last - first) * i / steps
             local current = point(t)
             if segmentBox(previous, current, half) then return t end
             previous = current
@@ -7203,7 +7269,10 @@ local function createStrikerMisc(d)
         if cachedCharacter ~= ch or os.clock() >= nextDiscovery then discover(ch) end
         stats.scans += 1
         A.DribbleStatus = "WATCHING"
-        lastScan = { clock = os.clock(), activeSlides = 0, activeKicks = 0, contacts = 0, maximumDisplayLead = 0 }
+        local lead = reactionLead()
+        local tackleHorizon, kickHorizon = C.Lookahead + lead, C.KickLookahead + lead
+        lastScan = { clock = os.clock(), activeSlides = 0, activeKicks = 0, contacts = 0, maximumDisplayLead = 0,
+            networkLeadSeconds = lead, tackleHorizonSeconds = tackleHorizon, kickHorizonSeconds = kickHorizon }
         local now, best = workspace:GetServerTimeNow(), nil
         for _, candidate in ipairs(candidates) do
             local other = candidate.character
@@ -7224,7 +7293,7 @@ local function createStrikerMisc(d)
                 local slideDirection = sliding and attack and attack.context == context and attack.slideStarted
                     and math.abs(untilTime - (attack.slideStarted + constants.TotalMotionSeconds)) < 1e-4
                     and attack.slideDirection or nil
-                local kick = kickWindow(candidate)
+                local kick = kickWindow(candidate, kickHorizon)
                 if not sliding and not kick then continue end
                 if sliding then lastScan.activeSlides += 1 end
                 if kick then lastScan.activeKicks += 1 end
@@ -7241,8 +7310,8 @@ local function createStrikerMisc(d)
                         if displayLead > 0 then stats.motionAligned += 1 end
                         lastScan.maximumDisplayLead = math.max(lastScan.maximumDisplayLead, displayLead)
                         local uncertainPosition = displayLead > 0 and observedPosition or nil
-                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition, root.Size) or nil
-                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition, root.Size) or nil
+                        local eta = sliding and contactTime(ownCF, velocity, otherCF, otherVelocity, age, slideDirection, uncertainPosition, root.Size, tackleHorizon) or nil
+                        local kickEta = kick and kickContactTime(ownCF, velocity, otherCF, otherVelocity, kick.first, kick.direction, uncertainPosition, root.Size, kickHorizon) or nil
                         local reason = "tackle"
                         if kickEta and (not eta or kickEta < eta) then eta, reason = kickEta, "kick" end
                         local distance = flat(otherCF.Position - ownCF.Position).Magnitude
@@ -7290,6 +7359,7 @@ local function createStrikerMisc(d)
             tackleAgeSeconds = best.tackleAge, hitboxRemainingSeconds = best.hitboxRemaining,
             kickChargeFill = best.kickChargeFill, earliestReleaseSeconds = best.earliestRelease,
             displayLeadSeconds = best.displayLead,
+            networkLeadSeconds = lead,
             serverConfirmed = false }
         if d.evaluation then
             d.evaluation.Dribble(attempt, function() d.M.Dodge.HandleInputBegan(input, false) end, best.character)
@@ -7298,6 +7368,7 @@ local function createStrikerMisc(d)
         end
         local started = d.M.Dodge.IsDribbling() == true
         if started then
+            pickupWindow = nil
             stats.started += 1
             if best.reason == "kick" then stats.kickTriggers += 1 else stats.tackleTriggers += 1 end
         else
@@ -7311,7 +7382,9 @@ local function createStrikerMisc(d)
     local function runScan()
         queuedScan = nil
         local start = os.clock()
+        scanning = true
         local succeeded, tickError = pcall(tick)
+        scanning = false
         stats.maxTickMs = math.max(stats.maxTickMs, (os.clock() - start) * 1000)
         if not succeeded then stopDribbleWatch(tickError) end
     end
@@ -7366,13 +7439,19 @@ local function createStrikerMisc(d)
         A.AutoDribble, A.DribbleStatus, nextTick = true, "WATCHING", 0
         local connected, connectionError = pcall(function()
             watchNativeOwner()
+            watchPickupReadiness()
             watchCharacters()
             watchAttacks()
             inputConnection = d.Input.InputBegan:Connect(function(input)
                 if not A.AutoDribble then return end
                 local checked, inputError = pcall(function()
                     for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick", "Dribble", "Tackle", "Jump" }) do
-                        if N.Controls.IsInput(name, input) then manualUntil = os.clock() + C.ManualGrace; break end
+                        if N.Controls.IsInput(name, input) then
+                            manualUntil = os.clock() + C.ManualGrace
+                            local ch = d.Player.Character
+                            manualHadBall = ch ~= nil and ownsBall(ch)
+                            break
+                        end
                     end
                 end)
                 if not checked then stopDribbleWatch(inputError) end
@@ -7449,7 +7528,7 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.15",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
