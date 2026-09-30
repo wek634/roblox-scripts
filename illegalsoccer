@@ -1,39 +1,154 @@
 -- Small, dependency-free startup controller. Game modules are loaded only after
 -- its status panel is visible. No executor-specific GUI or identity API is needed.
+local DMC_VERSION = "Dmc 0.27.0"
+
+-- Mutable forwarding links allow our hooks to be removed from our own chains.
+-- Foreign wrappers are never overwritten; buried hooks become passive and
+-- retain their handles until detachment can actually be confirmed.
+local function createDmcHooks()
+    local H = { entries = setmetatable({}, { __mode = "k" }) }
+    function H.Install(object, key, build)
+        local entry = { object = object, key = key, original = object[key], active = true }
+        assert(type(entry.original) == "function", "Missing native function: " .. key)
+        local forward = function(...) return entry.original(...) end
+        local implementation = build(forward)
+        assert(type(implementation) == "function", "Invalid hook: " .. key)
+        entry.wrapper = function(...)
+            if not entry.active then return entry.original(...) end
+            return implementation(...)
+        end
+        H.entries[entry.wrapper] = entry
+        object[key] = entry.wrapper
+        return entry
+    end
+    function H.Remove(entry)
+        entry.active = false
+        local ok, detached = pcall(function()
+            local current = entry.object[entry.key]
+            if current == entry.wrapper then
+                entry.object[entry.key] = entry.original
+                return true
+            end
+            if current == entry.original then return true end
+            local seen = {}
+            while H.entries[current] and not seen[current] do
+                seen[current] = true
+                local parent = H.entries[current]
+                if parent.original == entry.wrapper then
+                    parent.original = entry.original
+                    return true
+                end
+                current = parent.original
+            end
+            return false
+        end)
+        if ok and detached then
+            H.entries[entry.wrapper] = nil
+            return true
+        end
+        return false, ok and ("Passive hook retained under another wrapper: " .. entry.key)
+            or tostring(detached)
+    end
+    function H.Restore(entries)
+        local remaining, errors = {}, {}
+        for i = #entries, 1, -1 do
+            local ok, detail = H.Remove(entries[i])
+            if not ok then
+                table.insert(remaining, 1, entries[i])
+                errors[#errors + 1] = detail
+            end
+        end
+        return remaining, #remaining == 0, table.concat(errors, "; ")
+    end
+    return H
+end
+
+local function createDmcRecentKeys(limit)
+    local keys, slots, cursor, count = {}, {}, 1, 0
+    local A = {}
+    function A.Add(key)
+        if keys[key] then return false end
+        local old = slots[cursor]
+        if old ~= nil then keys[old] = nil else count += 1 end
+        slots[cursor], keys[key] = key, true
+        cursor = cursor % limit + 1
+        return true
+    end
+    function A.Size() return count end
+    function A.Clear()
+        table.clear(keys); table.clear(slots)
+        cursor, count = 1, 0
+    end
+    return A
+end
+
 local function createDmcStartup(d)
     local B = {
         stage = "Waiting for the game", finished = false,
         cleanup = nil :: (() -> (boolean?, string?))?,
         error = nil :: string?,
+        activeLoads = {}, failedLoads = {}, stopped = false,
     }
     function B.Status(text)
         B.stage = text
         if not B.finished then pcall(d.show, "Dmc | Starting", text) end
     end
+    function B.CancelLoads()
+        B.stopped = true
+        local failures = {}
+        for ticket in pairs(B.activeLoads) do
+            ticket.closed = true
+            local ok, detail = pcall(d.cancel, ticket.worker)
+            if ok and detail ~= false then
+                B.activeLoads[ticket] = nil
+            else
+                failures[#failures + 1] = ticket.path .. ": " .. tostring(detail)
+            end
+        end
+        return #failures == 0, table.concat(failures, "; ")
+    end
     function B.Load(path)
         B.Status("Loading " .. path)
-        local object = d.resolve(path)
-        local result, closed
-        d.spawn(function()
-            local values = table.pack(pcall(d.require, object))
-            if not closed then result = values end
-        end)
+        assert(not B.stopped, "Dmc was unloaded during dependency loading")
+        assert(not B.failedLoads[path], "Previous load timed out: " .. path .. ". Rejoin before retrying.")
         local deadline = d.now() + 30
-        while not result and d.now() < deadline do d.wait() end
-        closed = true
-        assert(result, "Timed out loading " .. path .. ". The game module did not return within 30 seconds.")
+        local object = d.resolve(path, deadline)
+        assert(not B.stopped, "Dmc was unloaded during dependency loading")
+        assert(d.now() < deadline, "Timed out resolving " .. path .. "; no module worker was started")
+        local ticket = { path = path, closed = false }
+        B.activeLoads[ticket] = true
+        ticket.worker = d.spawn(function()
+            local values = table.pack(pcall(d.require, object))
+            if not ticket.closed then ticket.result = values end
+        end)
+        while not ticket.result and not B.stopped and d.now() < deadline do d.wait() end
+        ticket.closed = true
+        local result = ticket.result
+        if not result then
+            -- Cancel our suspended worker. This cannot undo module side effects
+            -- or stop initialization already owned by a different require caller.
+            B.failedLoads[path] = true
+            local canceled, detail = pcall(d.cancel, ticket.worker)
+            if canceled and detail ~= false then B.activeLoads[ticket] = nil end
+            error((B.stopped and "Unloaded while loading " or "Timed out loading ") .. path
+                .. ". Rejoin before retrying; module side effects cannot be rolled back."
+                .. ((canceled and detail ~= false) and "" or (" Worker cancellation failed: " .. tostring(detail))), 0)
+        end
+        B.activeLoads[ticket] = nil
         assert(result[1], "Cannot load " .. path .. ": " .. tostring(result[2]))
         assert(type(result[2]) == "table", "Unexpected module result: " .. path)
         return result[2]
     end
     function B.Run(main)
         B.Status(B.stage)
-        local ok, err = pcall(function() d.ready(); main(B) end)
+        local ok, err = pcall(function() d.ready(); main() end)
         B.finished = true
         if ok then
             pcall(d.hide)
         else
             local message = tostring(err)
+            local canceled, detail = B.CancelLoads()
+            if not canceled then message ..= "\nLoad cleanup incomplete: " .. detail end
             local cleanup = B.cleanup
             if cleanup then
                 local cleaned, released = pcall(cleanup)
@@ -96,6 +211,10 @@ end
 local startupShow, startupHide = createDmcStartupDisplay()
 local BOOT = createDmcStartup({
     now = os.clock, wait = function() task.wait(0.05) end, spawn = task.spawn,
+    cancel = function(worker)
+        if worker and coroutine.status(worker) ~= "dead" then task.cancel(worker) end
+        return true
+    end,
     require = require, warn = warn, show = startupShow, hide = startupHide,
     ready = function()
         local players = game:GetService("Players")
@@ -108,9 +227,9 @@ local BOOT = createDmcStartup({
         assert(players.LocalPlayer:WaitForChild("PlayerGui", 30), "PlayerGui is unavailable.")
         startupShow("Dmc | Starting", "Loading game modules...")
     end,
-    resolve = function(path)
+    resolve = function(path, deadline)
         local object = game:GetService("ReplicatedStorage")
-        local deadline = os.clock() + 30
+        deadline = deadline or os.clock() + 30
         for name in string.gmatch(path, "[^.]+") do
             object = object:WaitForChild(name, math.max(0.01, deadline - os.clock()))
             assert(object, "Missing dependency: " .. path .. ". Run Dmc in the supported game after it loads.")
@@ -132,7 +251,8 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.9 | Evaluation 0.2"
+local BUILD = DMC_VERSION
+local HOOKS = createDmcHooks()
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -249,6 +369,8 @@ local Config = {
     UIStatusDebounce = 0.18,
     UIEventHoldSeconds = 0.50,
     MaxFinalCandidates = 14,
+    PlannerBudgetMs = 6,
+    PlannerMaxSteps = 4096,
     RuntimeErrorRetrySeconds = 0.25,
     RuntimeErrorLimit = 3,
     Debug = false,
@@ -305,6 +427,7 @@ local S = {
     coverageNextAt = 0,
     coverageWrites = 0,
     plannerMilliseconds = 0,
+    plannerBudgetSkips = 0,
     immediatePlansChecked = 0,
     delayedPlansChecked = 0,
     lastPlanReason = "NONE",
@@ -312,7 +435,7 @@ local S = {
     runtimeFailures = 0,
     runtimeRetryAt = 0,
     runtimeError = nil,
-    countedFlights = {},
+    countedFlights = createDmcRecentKeys(2048),
     wasKeeper = false,
     manualActionUntil = 0,
     motionLease = nil,
@@ -380,6 +503,7 @@ local function cleanup()
         return true
     end
 
+    attempt("Module workers", BOOT.CancelLoads)
     if S.closeDropdown then attempt("UI close", S.closeDropdown) end
     if S.cancelUITweens then attempt("UI tweens", S.cancelUITweens) end
 
@@ -420,6 +544,7 @@ local function cleanup()
     S.cleaningUp = false
 
     if S.cleanupComplete then
+        S.countedFlights.Clear()
         ENV.__AUTO_GK_CONTROLLER = nil
     else
         warn("[Auto GK] Cleanup incomplete: " .. S.cleanupError)
@@ -541,7 +666,7 @@ local function now()
     return M.Clock.GetSmoothedServerTime()
 end
 
-local function inputActive()
+local function inputActive(ignoreUITouches)
     if not S.focused
         or UserInputService:GetFocusedTextBox() then
         return true
@@ -563,7 +688,7 @@ local function inputActive()
     end
 
     return S.stick.Magnitude > 0.12
-        or next(S.touches) ~= nil
+        or (not ignoreUITouches and next(S.touches) ~= nil)
 end
 
 connect(UserInputService.InputChanged, function(input)
@@ -613,8 +738,8 @@ local function recordRequest(kind, frame)
 
     local key = frame and frame.flightKey
 
-    if key and not S.countedFlights[key] then
-        S.countedFlights[key] = true
+    -- Deduplicate only the most recent 2048 flights; memory stays bounded.
+    if key and S.countedFlights.Add(key) then
         Stats.FlightsActedOn = Stats.FlightsActedOn + 1
     end
 end
@@ -653,7 +778,7 @@ local function releaseMove(allowWrite)
     if not character or not character.Parent then return released("CHARACTER_GONE") end
     if not allowWrite then return released("YIELD_WITHOUT_WRITE") end
 
-    if inputActive() and S.focused
+    if inputActive(S.uiBusy) and S.focused
         and not UserInputService:GetFocusedTextBox() then
         return released("MANUAL_INPUT")
     end
@@ -1187,6 +1312,25 @@ local function plannerSetting(value, fallback, low, high)
     return math.clamp(finite(value) and value or fallback, low, high)
 end
 
+local function beginPlanBudget(frame)
+    frame.budget = {
+        deadline = os.clock() + plannerSetting(Config.PlannerBudgetMs, 6, 0.25, 50) / 1000,
+        remaining = math.floor(plannerSetting(Config.PlannerMaxSteps, 4096, 32, 32768)),
+        exhausted = false,
+    }
+end
+
+local function planCheckpoint(frame)
+    local budget = frame.budget
+    if not budget then return true end
+    if budget.exhausted or budget.remaining <= 0 or os.clock() >= budget.deadline then
+        budget.exhausted = true
+        return false
+    end
+    budget.remaining -= 1
+    return true
+end
+
 local function plannerDeadline(frame)
     -- Match the original cadence from snapshot completion. Modelled launch
     -- deadlines still belong to the time at which that snapshot was read.
@@ -1448,11 +1592,7 @@ local function sampleFlight(f, horizon)
         return points
     end
 
-    local step = math.clamp(
-        Config.SampleStep,
-        0.0025,
-        0.025
-    )
+    local step = plannerSetting(Config.SampleStep, 0.01, 0.0025, 0.025)
 
     if f.eta and f.eta <= Config.UrgentShotSeconds then
         step = math.min(step, 0.005)
@@ -1463,6 +1603,7 @@ local function sampleFlight(f, horizon)
     local t = 0
 
     while t < horizon - 0.000001 do
+        if not planCheckpoint(f) then return nil end
         t = math.min(horizon, t + step)
 
         if not settled then
@@ -1488,6 +1629,7 @@ local function sampleFlight(f, horizon)
         }
     end
 
+    if not planCheckpoint(f) then return nil end
     return points
 end
 
@@ -1570,6 +1712,7 @@ local function diveContactBounds(f, plan)
 end
 
 local function inspectPath(f, plan, points, requireContact)
+    if not points or not planCheckpoint(f) then return nil end
     local first =
         (plan.kind == "DIVE" or plan.kind == "JUMP_DIVE")
             and plan.delay
@@ -1611,6 +1754,7 @@ local function inspectPath(f, plan, points, requireContact)
     end
 
     for i = 2, #points do
+        if not planCheckpoint(f) then return nil end
         local left, right = points[i - 1], points[i]
 
         if right.t > first and left.t < last then
@@ -1618,6 +1762,7 @@ local function inspectPath(f, plan, points, requireContact)
             local stop = math.min(last, right.t)
 
             while t0 < stop do
+                if not planCheckpoint(f) then return nil end
                 local airborne = airBox ~= nil and t0 < landingAt
                 local t1 = airborne and math.min(stop, landingAt) or stop
                 local box = airborne and airBox or groundBox
@@ -1746,6 +1891,7 @@ local function inspectPath(f, plan, points, requireContact)
         end
     end
 
+    if not planCheckpoint(f) then return nil end
     if requireContact and not contact then
         return nil
     end
@@ -1853,6 +1999,7 @@ local function actionCost(plan, hit)
 end
 
 local function prepareAssist(f, plan)
+    if not planCheckpoint(f) then return nil end
     local proxy = {
         CFrame = plan.origin,
         Position = plan.origin.Position,
@@ -1866,7 +2013,7 @@ local function prepareAssist(f, plan)
         f.at + plan.delay
     )
 
-    if not assist then return nil end
+    if not assist or not planCheckpoint(f) then return nil end
 
     assist = table.clone(assist)
 
@@ -1882,6 +2029,7 @@ local function prepareAssist(f, plan)
 end
 
 local function evaluateDive(f, kind, delay, name, points, prepared)
+    if not planCheckpoint(f) then return nil end
     local base = prepared or makeDive(f, kind, delay, name)
     base.useAssist = false
 
@@ -2004,12 +2152,17 @@ end
 
 local function planSave(f)
     local began = os.clock()
+    beginPlanBudget(f)
 
     S.immediatePlansChecked = 0
     S.delayedPlansChecked = 0
 
     local function finish(plan, reason)
         S.plannerMilliseconds = (os.clock() - began) * 1000
+        if f.budget.exhausted then
+            S.plannerBudgetSkips += 1
+            if not plan then reason = "SEARCH BUDGET / REPLAN" end
+        end
 
         S.lastPlanReason = reason
             or (plan and plan.kind)
@@ -2028,6 +2181,7 @@ local function planSave(f)
     end
 
     local points = sampleFlight(f, horizon)
+    if not points then return finish(nil, "SEARCH BUDGET / REPLAN") end
     local hold = { kind = "HOLD", delay = 0 }
     local holdFrame = f
 
@@ -2087,6 +2241,7 @@ local function planSave(f)
     local directions = allowedDirections(f)
 
     for _, name in ipairs(directions) do
+        if not planCheckpoint(f) then return finish(choosePlan(candidates)) end
         S.immediatePlansChecked =
             S.immediatePlansChecked + 1
 
@@ -2111,6 +2266,7 @@ local function planSave(f)
     local possible = {}
 
     local function consider(kind, delay, name)
+        if not planCheckpoint(f) then return end
         if delay >= horizon - 0.005 then
             return
         end
@@ -2126,6 +2282,7 @@ local function planSave(f)
     end
 
     for _, name in ipairs(directions) do
+        if not planCheckpoint(f) then return finish(choosePlan(candidates)) end
         for _, delay in ipairs({ 0.05, 0.10, 0.20, 0.30 }) do
             consider("DIVE", delay, name)
         end
@@ -2160,6 +2317,7 @@ local function planSave(f)
     local budgetHit = false
 
     for _, candidate in ipairs(possible) do
+        if not planCheckpoint(f) then return finish(choosePlan(candidates)) end
         if S.delayedPlansChecked >= Config.MaxFinalCandidates then
             budgetHit = true
             break
@@ -2271,6 +2429,7 @@ local function requestJump(f, plan)
 
     if horizon <= 0.0001 then return false end
 
+    beginPlanBudget(fresh)
     local hit = inspectPath(
         fresh,
         recheck,
@@ -2492,6 +2651,7 @@ local function confirmHold(f)
     local hit
 
     if horizon > 0.0001 then
+        beginPlanBudget(fresh)
         hit = inspectPath(
             fresh,
             { kind = "HOLD", delay = 0 },
@@ -2755,6 +2915,7 @@ local function requestDive(f, plan)
 
     if horizon <= 0.0001 then return false end
 
+    beginPlanBudget(fresh)
     local flight = sampleFlight(fresh, horizon)
     local hit = inspectPath(fresh, commit, flight, true)
 
@@ -4359,7 +4520,9 @@ local function tick(dt)
     end
 
     if S.uiBusy or os.clock() < S.manualActionUntil then
-        invalidateFrame(false)
+        -- UI interaction is not a native movement handoff. Stop the command
+        -- while its ownership can still be verified; retain it on write failure.
+        invalidateFrame(S.uiBusy)
 
         status(
             S.uiBusy and "INTERFACE OPEN" or "MANUAL ACTION",
@@ -4668,13 +4831,15 @@ end)
 -- STR: native aim input, bounded search, keeper and defender reach estimates.
 local function createStriker(d)
     local A = { Enabled = false, AutoCurve = false, SmartRelease = false, Ready = false, Status = "OFF", Detail = "", LastError = nil }
-    local C = { SliceMs = 2.5, CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
+    local C = { SliceMs = 2.5, AimBudgetMs = 6, SliceSteps = 256, AimSteps = 4096,
+        CallsPerSlice = 4, Horizon = 2.2, Step = 0.035,
         SampleHz = 30, CandidateAge = 0.35, NetworkMargin = 0.10, EdgeMargin = 0.65, TargetSlack = 0.35,
         MaxAssistDistance = 55, ClearGapThreshold = 0.75, VolleyPrepareSeconds = 0.30,
         ReleaseInterval = 0.05, ReleaseMargin = 0.35, ReleaseBudgetMs = 2.5 }
     local stats = { shots = 0, assisted = 0, redirected = 0, confirmed = 0, rejected = 0, candidates = 0, evaluations = 0,
         errors = 0, maxSliceMs = 0, maxAimMs = 0, lastCharge = 0, lastCurve = 0,
-        releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0 }
+        releaseChecks = 0, releaseBudgetSkips = 0, releaseRequests = 0, autoReleases = 0, maxReleaseMs = 0,
+        aimBudgetSkips = 0 }
     local recentShots = {}
     -- Native modules are populated by name during lazy installation.
     local N: { [string]: any } = {}
@@ -4684,6 +4849,24 @@ local function createStriker(d)
     local nativeLaunches = setmetatable({}, { __mode = "k" })
     local mainThread = {}
     local alive, busy, installing = true, false, false
+    local sliceBudget
+    local function strikeCheckpoint(f, yielding)
+        if yielding then
+            if sliceBudget and (sliceBudget.remaining <= 0 or os.clock() >= sliceBudget.deadline) then
+                coroutine.yield()
+            end
+            if sliceBudget then sliceBudget.remaining -= 1 end
+            return true
+        end
+        local budget = f and f.budget
+        if not budget then return true end
+        if budget.exhausted or budget.remaining <= 0 or os.clock() >= budget.deadline then
+            budget.exhausted = true
+            return false
+        end
+        budget.remaining -= 1
+        return true
+    end
     local V0, UP = Vector3.zero, Vector3.new(0, 1, 0)
     local function num(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
     local function vec(v) return typeof(v) == "Vector3" and num(v.X) and num(v.Y) and num(v.Z) end
@@ -4832,13 +5015,14 @@ local function createStriker(d)
             receive = padded(receive), airReceive = padded(airReceive), tackle = padded(d.M.Hitboxes.SlideTackle),
             slideAge = slideAge, slideDirection = direction, slideConstants = table.clone(slide) }
     end
-    local function keepersFor(ch, team, goal, practiceGoals)
+    local function keepersFor(ch, team, goal, practiceGoals, budget)
         local found, defenders, seen = {}, {}, {}
         local context = d.M.Motion.GetContext(ch)
         local opposing = not practiceGoals and d.M.Match.Constants.TeamDisplayNames[team]
             and type(d.M.Match.GetOpposingTeamName) == "function"
             and d.M.Match.GetOpposingTeamName(team) or nil
         local function add(character, actor)
+            if not strikeCheckpoint({ budget = budget }, false) then return end
             if not character or character == ch or seen[character] then return end
             seen[character] = true
             if d.M.Motion.GetContext(character) ~= context then return end
@@ -4878,13 +5062,17 @@ local function createStriker(d)
                 jump = math.max(0, jump), character = character,
                 upright = cf.UpVector.Y > 0.98 })
         end
-        for _, player in ipairs(d.Players:GetPlayers()) do add(player.Character, player) end
+        for _, player in ipairs(d.Players:GetPlayers()) do
+            if budget and budget.exhausted then break end
+            add(player.Character, player)
+        end
         -- The live practice bots are direct children of Characters.NPCs.
         -- Enumerate only these two small containers, never all workspace descendants per aim read.
         local folder = workspace:FindFirstChild("Characters")
         local function addChildren(container)
             if not container then return end
             for _, child in ipairs(container:GetChildren()) do
+                if budget and budget.exhausted then break end
                 if child:IsA("Model") then add(child) end
             end
         end
@@ -4892,7 +5080,8 @@ local function createStriker(d)
         addChildren(folder and folder:FindFirstChild("NPCs"))
         return found, defenders
     end
-    local function frame(sample, releaseDelay)
+    local function frame(sample, releaseDelay, budget)
+        if not strikeCheckpoint({ budget = budget }, false) then return nil end
         local timing = releaseDelay ~= nil
         if not session or (session.locked and not timing) then return nil end
         local allowed, reason = eligible()
@@ -4983,8 +5172,10 @@ local function createStriker(d)
             return nil
         end
         local curve = N.Curves.IsEnabled() and (session.curve or 0) or 0
-        local keepers, defenders = keepersFor(ch, team, goal, practiceGoals)
-        return { character = ch, root = root, origin = origin, velocity = velocity,
+        if not strikeCheckpoint({ budget = budget }, false) then return nil end
+        local keepers, defenders = keepersFor(ch, team, goal, practiceGoals, budget)
+        if not strikeCheckpoint({ budget = budget }, false) then return nil end
+        return { budget = budget, character = ch, root = root, origin = origin, velocity = velocity,
             verticalSpeed = math.abs(root.AssemblyLinearVelocity.Y),
             sample = sample, goal = goal, goalCF = goal.CFrame, world = world, mouth = mouth,
             charge = approachingLock and maximum or charge, charges = charges,
@@ -5009,7 +5200,8 @@ local function createStriker(d)
     local function angles(direction)
         return math.atan2(direction.X, direction.Z), math.atan2(direction.Y, flat(direction).Magnitude)
     end
-    local function launch(f, aim, charge)
+    local function launch(f, aim, charge, yielding)
+        if not strikeCheckpoint(f, yielding) then return nil end
         local kick = flat(aim.Direction)
         if kick.Magnitude < 1e-6 then return nil end
         stats.evaluations += 1
@@ -5019,7 +5211,7 @@ local function createStriker(d)
         local velocity = N.RawLaunch(f.character, charge or f.charge,
             d.M.Actions.PassTypes.Shot, predictedAim, f.origin, f.velocity, kick.Unit, nil,
             f.boost, f.world, nil, f.curve)
-        if not vec(velocity) then return nil end
+        if not vec(velocity) or not strikeCheckpoint(f, yielding) then return nil end
         local spin = N.RawSpin(f.character, velocity, f.velocity, f.curve, charge or f.charge)
         if not vec(spin) then return nil end
         return velocity, spin
@@ -5029,11 +5221,13 @@ local function createStriker(d)
         local startDistance = (f.origin - mouth.plane):Dot(mouth.forward)
         local lastT, lastD = 0, startDistance
         for t = 0.10, C.Horizon + 0.001, 0.10 do
+            strikeCheckpoint(f, true)
             local pos = d.M.Physics.GetAirFlight(f.origin, velocity, spin, t)
             local distance = (pos - mouth.plane):Dot(mouth.forward)
             if lastD > 0 and distance <= 0 then
                 local lo, hi = lastT, t
                 for _ = 1, 9 do
+                    strikeCheckpoint(f, true)
                     local mid = (lo + hi) / 2
                     local p = d.M.Physics.GetAirFlight(f.origin, velocity, spin, mid)
                     if (p - mouth.plane):Dot(mouth.forward) > 0 then lo = mid else hi = mid end
@@ -5047,7 +5241,7 @@ local function createStriker(d)
     end
     local function planeEval(f, yaw, pitch)
         local aim = aimAt(f, yaw, pitch)
-        local velocity, spin = launch(f, aim)
+        local velocity, spin = launch(f, aim, nil, true)
         local hit = velocity and freeCross(f, velocity, spin)
         coroutine.yield()
         return hit
@@ -5421,14 +5615,16 @@ local function createStriker(d)
         return best
     end
     local function validate(f, aim, charge, yielding)
-        local velocity, spin = launch(f, aim, charge)
+        if not strikeCheckpoint(f, yielding) then return nil end
+        local velocity, spin = launch(f, aim, charge, yielding)
         if yielding then coroutine.yield() end
         if not velocity then return nil end
+        if not strikeCheckpoint(f, yielding) then return nil end
         local launchAt = f.at + f.lead
         local state = d.M.Physics.NewState(f.origin, velocity, f.radius, launchAt, spin)
         local position, time = d.M.Prediction.GetGoalCrossing(state, f.world, f.goal, launchAt, C.Horizon)
         if yielding then coroutine.yield() end
-        if not vec(position) or not num(time) then return nil end
+        if not strikeCheckpoint(f, yielding) or not vec(position) or not num(time) then return nil end
         local eta = time - launchAt
         if eta <= 0 or eta > C.Horizon then return nil end
         local mouth = f.mouth
@@ -5444,6 +5640,7 @@ local function createStriker(d)
         local cursor = state
         local count = math.ceil(eta / C.Step)
         for i = 1, count do
+            if not strikeCheckpoint(f, yielding) then return nil end
             -- Common sample times reuse the frame's keeper envelopes across aims and
             -- charges. The final sample is still the exact goal-entry time.
             local t = math.min(C.Step * i, eta)
@@ -5474,6 +5671,7 @@ local function createStriker(d)
         local clearanceDepth = math.min(mouth.depth or 0, 2 * f.radius) + f.radius
         local passageTime = eta
         for _ = 1, 8 do
+            if not strikeCheckpoint(f, yielding) then return nil end
             local remaining = (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth
             if remaining <= 1e-4 then break end
             local motion = vec(cursor.Velocity) and cursor.Velocity or velocity
@@ -5496,6 +5694,7 @@ local function createStriker(d)
             if barPoint and barPoint.Y > topLimit then return nil, barPoint end
         end
         if (cursor.Position - mouth.plane):Dot(mouth.forward) + clearanceDepth > 1e-4 then return nil end
+        if not strikeCheckpoint(f, yielding) then return nil end
         if #f.keepers == 0 then minGap, minDemand, minDifficulty = nil, nil, nil end
         return { gap = minGap, reachDemand = minDemand, difficulty = minDifficulty, predictionCharge = charge,
             score = (minDifficulty and (minDifficulty - 1) * d.M.Dive.Constants.Distance or 0)
@@ -5777,22 +5976,27 @@ local function createStriker(d)
         end)
     end
     local function work(f, owner)
-        if busy then return end
+        if busy or not strikeCheckpoint(f, false) then return end
         busy = true
         local began, calls = os.clock(), 0
-        if not owner.job or coroutine.status(owner.job) == "dead" or not compatible(owner.jobFrame, f)
-            or os.clock() - owner.jobFrame.clock > C.CandidateAge then startJob(f, owner) end
-        -- Use otherwise idle slice capacity to cover both corners. The wall-time
-        -- deadline remains 2.5 ms, with no additional loop or update connection.
-        local callLimit = C.CallsPerSlice * 6
-        while owner.job and coroutine.status(owner.job) ~= "dead" and calls < callLimit do
-            local ok, err = coroutine.resume(owner.job)
-            if not ok then busy = false; error(err) end
-            calls += 1
-            if (os.clock() - began) * 1000 >= C.SliceMs then break end
-        end
-        stats.maxSliceMs = math.max(stats.maxSliceMs, (os.clock() - began) * 1000)
+        local ok, err = pcall(function()
+            if not owner.job or coroutine.status(owner.job) == "dead" or not compatible(owner.jobFrame, f)
+                or os.clock() - owner.jobFrame.clock > C.CandidateAge then startJob(f, owner) end
+            local deadline = math.min(began + C.SliceMs / 1000,
+                f.budget and f.budget.deadline or math.huge)
+            sliceBudget = { deadline = deadline, remaining = C.SliceSteps }
+            local callLimit = C.CallsPerSlice * 6
+            while owner.job and coroutine.status(owner.job) ~= "dead" and calls < callLimit
+                and os.clock() < deadline and sliceBudget.remaining > 0 do
+                local resumed, failure = coroutine.resume(owner.job)
+                if not resumed then error(failure, 0) end
+                calls += 1
+            end
+        end)
+        sliceBudget = nil
         busy = false
+        stats.maxSliceMs = math.max(stats.maxSliceMs, (os.clock() - began) * 1000)
+        if not ok then error(err, 0) end
     end
     local function decisionDetail(owner)
         local distance = owner.distance and string.format("%.2f / %d studs", owner.distance, C.MaxAssistDistance) or ""
@@ -5815,6 +6019,7 @@ local function createStriker(d)
         return string.format("%s | %d GK tracked | Searching", distance, count)
     end
     local function choose(sample)
+        local began = os.clock()
         local owner = session
         if not owner or owner.locked then return sample end
         owner.pair = nil
@@ -5823,8 +6028,13 @@ local function createStriker(d)
         owner.redirected = false
         owner.decisionAudit = nil
         owner.completedAlternatives, owner.checkedAlternatives = 0, 0
-        local f = frame(sample)
+        local budget = { deadline = began + C.AimBudgetMs / 1000, remaining = C.AimSteps, exhausted = false }
+        local f = frame(sample, nil, budget)
         if not f then
+            if budget.exhausted then
+                stats.aimBudgetSkips += 1
+                setStatus("SEARCH BUDGET", "Normal aim | Snapshot budget exhausted")
+            end
             owner.applied, owner.rating, owner.frame, owner.job = false, nil, nil, nil
             owner.curveChoice = nil
             table.clear(owner.candidates)
@@ -5892,6 +6102,7 @@ local function createStriker(d)
         local priorities = {}
         local keeperMoved = false
         for _, entry in ipairs(shortlist) do
+            if not strikeCheckpoint(f, false) then break end
             local previous = entry.frame and entry.frame.keepers
             local changed = not previous or #previous ~= #f.keepers
             for i, keeper in ipairs(f.keepers) do
@@ -5943,6 +6154,7 @@ local function createStriker(d)
             return betterRating(a.rating, b.rating)
         end)
         for _, entry in ipairs(shortlist) do
+            if not strikeCheckpoint(f, false) then break end
             if (requiredCurve == nil or entry.curve == requiredCurve)
                 and compatible(entry.frame, f) and clock - entry.at <= C.CandidateAge then
                 local aim = candidateAim(entry, f)
@@ -6000,6 +6212,12 @@ local function createStriker(d)
                 end
                 if checked >= 2 then break end
             end
+        end
+        if not strikeCheckpoint(f, false) then
+            stats.aimBudgetSkips += 1
+            owner.applied, owner.rating, owner.pair, owner.reason = false, nil, nil, "search_budget"
+            setStatus("SEARCH BUDGET", "Normal aim | Search will continue on the next update")
+            return sample
         end
         -- A valid current aim is also a candidate, including while alternatives are still solving.
         -- Retain it under the same scoped correction guard instead of giving it back to another aim helper.
@@ -6079,6 +6297,9 @@ local function createStriker(d)
         return pair.curve, pair
     end
     local function releaseDecision(owner)
+        local began = os.clock()
+        local releaseBudget = { deadline = began + C.ReleaseBudgetMs / 1000,
+            remaining = C.AimSteps, exhausted = false }
         if not owner.applied or not owner.frame or owner.input == nil or not num(owner.chargeStartedAt)
             or N.Client.IsVolleyCharging() or not ownsBall() then return nil end
         local sample = owner.nativeAim
@@ -6092,7 +6313,12 @@ local function createStriker(d)
             sample.Origin += delta
             sample.CameraCFrame += delta
         end
-        local f = frame(sample, 0)
+        local f = frame(sample, 0, releaseBudget)
+        if releaseBudget.exhausted then
+            stats.releaseBudgetSkips += 1
+            owner.releaseTiming = { decision = "budget" }
+            return nil
+        end
         if not f or #f.keepers == 0 or not compatible(owner.frame, f)
             or f.elapsed < f.minimumCharge + 0.005 or f.elapsed >= f.maximumCharge - 0.015 then return nil end
         -- Let auto curve make its per-shot choice before choosing its release time.
@@ -6101,18 +6327,17 @@ local function createStriker(d)
         if f.autoCurve then curve = pairedCurve(sample) end
         if curve == nil then return nil end
         local function evaluate(delay)
-            local at = delay == 0 and f or frame(sample, delay)
+            local at = delay == 0 and f or frame(sample, delay, releaseBudget)
             if not at or not compatible(f, at) then return nil, false end
             at = table.clone(at)
-            at.curve = curve
+            at.curve, at.budget = curve, f.budget
             return rate(at, sample, false), true
         end
         -- Compare the already selected trajectory now, halfway to full charge,
         -- and at full charge. Forecasts include the keeper's extra waiting time.
         -- This never changes a native locked direction or invents a charge value.
-        local began = os.clock()
         local function inBudget()
-            if (os.clock() - began) * 1000 <= C.ReleaseBudgetMs then return true end
+            if not releaseBudget.exhausted and os.clock() < releaseBudget.deadline then return true end
             stats.releaseBudgetSkips += 1
             owner.releaseTiming = { decision = "budget" }
             return false
@@ -6183,23 +6408,12 @@ local function createStriker(d)
         return table.unpack(result, 2, result.n)
     end
     local function hook(object, key, build)
-        local original = object[key]
-        assert(type(original) == "function", "Missing native function: " .. key)
-        local wrapper = build(original)
-        object[key] = wrapper
-        table.insert(hooks, { object = object, key = key, original = original, wrapper = wrapper })
+        table.insert(hooks, HOOKS.Install(object, key, build))
     end
     local function restore()
-        local failed = {}
-        for i = #hooks, 1, -1 do
-            local entry = hooks[i]
-            local ok = pcall(function()
-                if entry.object[entry.key] == entry.wrapper then entry.object[entry.key] = entry.original end
-            end)
-            if not ok then table.insert(failed, entry) end
-        end
-        hooks = failed
-        return #failed == 0
+        local ok, detail
+        hooks, ok, detail = HOOKS.Restore(hooks)
+        return ok, detail
     end
     local function install()
         local paths = { Client = "Client.Gameplay.Actions.Shoot", Reticle = "Client.Interface.Reticle",
@@ -6469,10 +6683,18 @@ local function createStriker(d)
         if value and A.Enabled then return true end
         if not value and not cancelPairedCharge() then return false end
         if value and not A.Ready then
+            if #hooks > 0 then
+                local restored, detail = restore()
+                if not restored then A.LastError = detail; return false end
+            end
             installing = true
             local ok, err = pcall(install)
             installing = false
-            if not ok then restore(); fail(err); return false end
+            if not ok then
+                local restored, detail = restore()
+                fail(tostring(err) .. (restored and "" or (" | Hook cleanup incomplete: " .. detail)))
+                return false
+            end
         end
         A.Enabled = value == true
         if A.Enabled then A.LastError = nil end
@@ -6484,8 +6706,9 @@ local function createStriker(d)
         if not alive or installing then return false end
         if (value == true) == A.AutoCurve and (not value or A.Enabled) then return true end
         if not value and not cancelPairedCharge() then return false end
-        A.AutoCurve = value == true
-        if A.AutoCurve and not A.Enabled and not A.SetEnabled(true) then return false end
+        value = value == true
+        if value and not A.Enabled and not A.SetEnabled(true) then return false end
+        A.AutoCurve = value
         if session and not session.locked then
             session.autoCurve, session.job = A.AutoCurve, nil
             session.curveChoice = nil
@@ -6520,16 +6743,18 @@ local function createStriker(d)
     function A.Debug()
         return { enabled = A.Enabled, autoCurve = A.AutoCurve, smartRelease = A.SmartRelease, ready = A.Ready, status = A.Status, detail = A.Detail,
             lastError = A.LastError, stats = table.clone(stats), active = session ~= nil,
-            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = "STR 0.16.3",
+            locked = session and session.locked or false, recentShots = table.clone(recentShots), prototype = DMC_VERSION,
             defenderAwareness = true,
             releaseTiming = session and session.releaseTiming or nil,
-            maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold }
+            maxAssistDistance = C.MaxAssistDistance, clearGapThreshold = C.ClearGapThreshold,
+            retainedHooks = #hooks, budgetMode = "cooperative", aimBudgetMs = C.AimBudgetMs }
     end
     if d.test then A.Test = { mouthFor = mouthFor, mouthDistance = mouthDistance, keeperGap = keeperGap,
         reachDemand = reachDemand, validate = validate, defenderDemand = defenderDemand, defenderProfile = defenderProfile,
         betterRating = betterRating,
         solve = solve, frame = frame, scopeCall = scopeCall, choose = choose, native = N,
         compatible = compatible, launch = launch, rate = rate, stats = stats, keepersFor = keepersFor, candidateAim = candidateAim,
+        work = work, checkpoint = strikeCheckpoint, config = C,
         horizontalReach = horizontalReach, searchTargets = searchTargets, shotZone = shotZone, insetAim = insetAim,
         setSession = function(value) session = value end, getSession = function() return session end } end
     return A
@@ -6592,33 +6817,32 @@ local function createStrikerMisc(d)
         table.clear(characterIndex)
         characterIndexReady = false
         table.clear(attacks)
+        local removed, detail = true, nil
         if ownershipHook then
             ownershipHook.active = false
-            if d.M.Dodge.SetOwnerUserId == ownershipHook.wrapper then
-                d.M.Dodge.SetOwnerUserId = ownershipHook.original
-            end
-            ownershipHook = nil
+            removed, detail = HOOKS.Remove(ownershipHook.entry)
+            if removed then ownershipHook = nil end
         end
         nativeOwner = nil
         candidates, cachedCharacter = {}, nil
         nextDiscovery = 0
+        return removed, detail
     end
     local function stopStaminaWatch()
         if staminaHeartbeat then staminaHeartbeat:Disconnect(); staminaHeartbeat = nil end
+        local failures = {}
         if guardHook then
             guardHook.active = false
-            -- A later wrapper belongs to its installer; leave our inner observer passive.
-            if N.Guard.Validate == guardHook.observer then N.Guard.Validate = guardHook.original end
-            guardHook = nil
+            local removed, detail = HOOKS.Remove(guardHook.entry)
+            if removed then guardHook = nil else failures[#failures + 1] = detail end
         end
         if placementHook then
             placementHook.active = false
-            if N.Placement.RepairPosition == placementHook.observer then
-                N.Placement.RepairPosition = placementHook.original
-            end
-            placementHook = nil
+            local removed, detail = HOOKS.Remove(placementHook.entry)
+            if removed then placementHook = nil else failures[#failures + 1] = detail end
         end
         correctionPending = nil
+        return #failures == 0, table.concat(failures, "; ")
     end
     local function noteCorrection(correction)
         lastCorrection = correction
@@ -6647,7 +6871,7 @@ local function createStrikerMisc(d)
             stats.positionRepairs += 1
             noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
                 horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
-                staminaWasOn = true, serverConfirmed = false, offStatus = "OFF: POSITION REPAIR" })
+                staminaWasOn = true, serverConfirmed = false, staminaCausalityConfirmed = false, offStatus = "OFF: POSITION REPAIR" })
         end
         hook.observer = function(character, root, target, ...)
             local captured, sample = pcall(capture, character, root, target)
@@ -6660,13 +6884,17 @@ local function createStrikerMisc(d)
             end
             return table.unpack(result, 1, result.n)
         end
+        hook.entry = HOOKS.Install(N.Placement, "RepairPosition", function(original)
+            hook.original = original
+            return hook.observer
+        end)
         placementHook = hook
-        N.Placement.RepairPosition = hook.observer
     end
     local function recoverStamina(correction)
         -- Remove our local source before spending; otherwise native SpendStamina returns true, 0.
         if staminaOwned then
-            N.Sprint.SetUnlimitedStamina(staminaSource, false)
+            assert(N.Sprint.SetUnlimitedStamina(staminaSource, false) ~= false,
+                "Native stamina source removal was refused")
             staminaOwned = false
         end
         A.InfiniteStamina = false
@@ -6694,13 +6922,15 @@ local function createStrikerMisc(d)
             assert(guardHook.active, "Previous movement observer cleanup is incomplete")
             return
         end
+        assert(not placementHook, "Previous placement observer cleanup is incomplete")
         local hook = { original = N.Guard.Validate, active = true }
         local function noteRejected(root, claimedPosition, claimedVelocity)
             stats.localCorrections += 1
             local correction = { clock = os.clock(), context = d.M.Motion.GetContext(d.Player.Character),
                 positionChange = (root.Position - claimedPosition).Magnitude,
                 velocityChange = (root.AssemblyLinearVelocity - claimedVelocity).Magnitude,
-                source = "LocalMovementGuard.Validate", staminaWasOn = true }
+                source = "LocalMovementGuard.Validate", staminaWasOn = true,
+                serverConfirmed = false, staminaCausalityConfirmed = false }
             noteCorrection(correction)
         end
         hook.observer = function(root, ...)
@@ -6720,8 +6950,11 @@ local function createStrikerMisc(d)
             end
             return result
         end
+        hook.entry = HOOKS.Install(N.Guard, "Validate", function(original)
+            hook.original = original
+            return hook.observer
+        end)
         guardHook = hook
-        N.Guard.Validate = hook.observer
         startPlacementWatch()
         staminaHeartbeat = d.Run.Heartbeat:Connect(function()
             if not (alive and d.alive() and correctionPending) or os.clock() < nextStaminaRetry then return end
@@ -6776,6 +7009,7 @@ local function createStrikerMisc(d)
         return type(d.M.Renderer.GetMatchBallId) == "function" and d.M.Renderer.GetMatchBallId() or nil
     end
     local function watchNativeOwner()
+        assert(not ownershipHook, "Previous dribble ownership hook is still retained")
         local hook = { original = d.M.Dodge.SetOwnerUserId, active = true }
         assert(type(hook.original) == "function", "Native dribble ownership unavailable")
         hook.wrapper = function(userId, ...)
@@ -6800,8 +7034,11 @@ local function createStrikerMisc(d)
             end
             return table.unpack(result, 1, result.n)
         end
+        hook.entry = HOOKS.Install(d.M.Dodge, "SetOwnerUserId", function(original)
+            hook.original = original
+            return hook.wrapper
+        end)
         ownershipHook = hook
-        d.M.Dodge.SetOwnerUserId = hook.wrapper
     end
     local function ownsBall(ch)
         -- Follow the same handoff as native Dodge; the renderer may lag on receipt.
@@ -7352,9 +7589,10 @@ local function createStrikerMisc(d)
         local request = generation
         if not value then
             A.AutoDribble = false
-            stopWatch()
-            A.DribbleStatus = "OFF"
-            return true
+            local removed, detail = stopWatch()
+            A.DribbleStatus = removed and "OFF" or "CLEANUP REQUIRED"
+            if not removed then A.LastError = detail end
+            return removed, detail
         end
         if not alive or not d.alive() or loadingDribble then return false end
         if A.AutoDribble then return true end
@@ -7397,11 +7635,12 @@ local function createStrikerMisc(d)
         if value and (not alive or not d.alive() or loadingStamina) then return false end
         if value and A.InfiniteStamina then return true end
         if not value and not staminaOwned then
-            local stopped, stopError = pcall(stopStaminaWatch)
+            local called, removed, detail = pcall(stopStaminaWatch)
+            local stopped = called and removed ~= false
             A.InfiniteStamina = false
             A.StaminaStatus = stopped and "OFF" or "CLEANUP REQUIRED"
-            if not stopped then problem(stopError) end
-            return stopped
+            if not stopped then problem(called and detail or removed) end
+            return stopped, called and detail or removed
         end
         loadingStamina = true
         local ok, err = pcall(function()
@@ -7419,37 +7658,48 @@ local function createStrikerMisc(d)
             -- Mark before calling: if native HUD refresh throws after setting the source,
             -- rollback and later cleanup must still know that removal is required.
             if value then staminaOwned = true end
-            N.Sprint.SetUnlimitedStamina(staminaSource, value)
+            assert(N.Sprint.SetUnlimitedStamina(staminaSource, value) ~= false,
+                "Native stamina source change was refused")
             staminaOwned = value
-            if not value then stopStaminaWatch() end
+            if not value then
+                local removed, detail = stopStaminaWatch()
+                assert(removed, detail)
+            end
         end)
         loadingStamina = false
         if not ok then
             if value and staminaOwned then
-                local removed = pcall(N.Sprint.SetUnlimitedStamina, staminaSource, false)
-                if removed then staminaOwned = false end
+                local removed, result = pcall(N.Sprint.SetUnlimitedStamina, staminaSource, false)
+                if removed and result ~= false then staminaOwned = false end
             end
-            if not staminaOwned then pcall(stopStaminaWatch) end
+            local cleanupPending = false
+            if not staminaOwned then
+                local called, removed = pcall(stopStaminaWatch)
+                cleanupPending = not called or removed == false
+            end
             A.InfiniteStamina = staminaOwned
-            A.StaminaStatus = staminaOwned and "CLEANUP REQUIRED" or "ERROR"
+            A.StaminaStatus = (staminaOwned or cleanupPending) and "CLEANUP REQUIRED" or "ERROR"
             problem(err)
             return false
         end
         if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
         A.InfiniteStamina = value
         if value then correctionPending, nextStaminaRetry = nil, 0 end
-        A.StaminaStatus = value and "LOCAL ON" or "OFF"
+        A.StaminaStatus = value and "LOCAL ON / SERVER UNVERIFIED" or "OFF"
         return true
     end
     function A.Cleanup()
         alive = false
-        A.SetAutoDribble(false)
-        return A.SetInfiniteStamina(false)
+        local dribbleStopped, dribbleError = A.SetAutoDribble(false)
+        local staminaStopped, staminaError = A.SetInfiniteStamina(false)
+        return dribbleStopped and staminaStopped,
+            table.concat({ dribbleError or "", staminaError or "" }, "; ")
     end
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.15",
+            staminaServerVerified = false, lastError = A.LastError, version = DMC_VERSION,
+            retainedHooks = (ownershipHook and 1 or 0) + (guardHook and 1 or 0) + (placementHook and 1 or 0),
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
             correctionFallback = true, positionRepairFallback = true,
@@ -7939,7 +8189,7 @@ local function createStrikerEvaluation(d)
             elseif r.localOwnerAtWindowEnd == true then evidence.localRetainedAtWindowEnd += 1
             else evidence.unresolved += 1 end
         end
-        return { version = "Evaluation 0.2", build = d.build or "unlabelled_build", sessionIdTag = d.sessionId,
+        return { version = DMC_VERSION, build = d.build or "unlabelled_build", sessionIdTag = d.sessionId,
             stats = table.clone(stats), lastError = lastError,
             rawMovementFields = movementFields, recentShots = public(shots), recentDribbles = public(dribbles),
             recentEncounters = plain(encounters), trials = plain(trials), activeTrialId = trial and trial.id or nil,
@@ -7958,28 +8208,27 @@ local function createStrikerEvaluation(d)
         if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
         for _, c in ipairs(connections) do c:Disconnect() end
         table.clear(connections)
+        local failures = {}
         for name, hook in pairs(hooks) do
-            if d.M.Protocol[name] == hook.wrapper then d.M.Protocol[name] = hook.original end
+            local removed, detail = HOOKS.Remove(hook)
+            if removed then hooks[name] = nil else failures[#failures + 1] = detail end
         end
-        return true
+        return #failures == 0, table.concat(failures, "; ")
     end
     protect(function()
         for _, name in ipairs({ "Send", "Release" }) do
-            local hook = { original = d.M.Protocol[name] }
-            if type(hook.original) ~= "function" then continue end
-            hook.wrapper = function(command, ...)
-                if not alive or not d.alive() then return hook.original(command, ...) end
+            if type(d.M.Protocol[name]) ~= "function" then continue end
+            hooks[name] = HOOKS.Install(d.M.Protocol, name, function(original) return function(command, ...)
+                if not alive or not d.alive() then return original(command, ...) end
                 local r = dribbleScopes[coroutine.running() or mainThread]
-                if not r and not next(pending) then return hook.original(command, ...) end
-                local result = table.pack(hook.original(command, ...))
+                if not r and not next(pending) then return original(command, ...) end
+                local result = table.pack(original(command, ...))
                 protect(function()
                     if r and command.Mode == "Dodge" then r.actionId = command.ActionId or result[1] end
                     noteStrike(command)
                 end)
                 return table.unpack(result, 1, result.n)
-            end
-            hooks[name] = hook
-            d.M.Protocol[name] = hook.wrapper
+            end end)
         end
         connections[#connections + 1] = d.State.OnClientEvent:Connect(function(packet)
             if alive and d.alive() and next(pending) then protect(ballState, packet) end
@@ -8001,7 +8250,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.26 client stamina restored",
+    build = BUILD,
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
@@ -8042,7 +8291,7 @@ end
 local STR = createStriker({
     M = M, Player = LocalPlayer, Players = Players, Input = UserInputService,
     load = module, alive = function() return S.alive end,
-    uiBusy = function() return S.uiBusy end, evaluation = EVALUATION,
+    uiBusy = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
 })
 S.releaseStriker = STR.Cleanup
 ENV.AutoSTR = STR
@@ -8967,7 +9216,8 @@ ENV.AutoGKDebug = function()
         "[Auto GK] actions:", Stats.Requests,
         "| jumps:", Stats.JumpRequests,
         "| dives:", Stats.DiveRequests,
-        "| distinct flights acted on:", Stats.FlightsActedOn
+        "| flights acted on (recent dedup):", Stats.FlightsActedOn,
+        "| dedup entries:", S.countedFlights.Size()
     )
 
     print(
@@ -8979,7 +9229,8 @@ ENV.AutoGKDebug = function()
         "[Auto GK] planner:", S.lastPlanReason,
         "| immediate directions:", S.immediatePlansChecked,
         "| delayed candidates:", S.delayedPlansChecked,
-        "| milliseconds:", S.plannerMilliseconds
+        "| milliseconds:", S.plannerMilliseconds,
+        "| budget skips:", S.plannerBudgetSkips
     )
 
     print(
