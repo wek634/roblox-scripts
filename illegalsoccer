@@ -1,123 +1,3 @@
-local function createAutoSprint(d)
-    local A = { AutoSprint = false, Status = "OFF", LastError = nil }
-    local native, heartbeat, removing, focus, removingCharacter = nil, nil, nil, nil, nil
-    local ownsToggle, loading, alive, revision, nextTick = false, false, true, 0, 0
-    local function publish()
-        if d.changed then d.changed(A) end
-    end
-    local function disconnect()
-        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
-        if removing then removing:Disconnect(); removing = nil end
-        if focus then focus:Disconnect(); focus = nil end
-    end
-    local function release()
-        if not ownsToggle then return true end
-        local ok, err = pcall(function()
-            if native.IsSprintButtonToggled() then native.ToggleSprintButton() end
-            assert(not native.IsSprintButtonToggled(), "Sprint toggle was not released")
-        end)
-        if ok then ownsToggle = false else A.LastError = tostring(err) end
-        return ok
-    end
-    local function fail(err)
-        A.LastError, A.AutoSprint = tostring(err), false
-        revision += 1
-        disconnect()
-        A.Status = release() and "ERROR" or "CLEANUP REQUIRED"
-        publish()
-        warn("[Dmc Auto sprint] " .. A.LastError)
-        return false
-    end
-    local function allowed()
-        if not (alive and A.AutoSprint and d.alive()) then return false end
-        if d.suspended() or d.Gui.MenuIsOpen or d.Input:GetFocusedTextBox() then return false end
-        local character = d.Player.Character
-        local humanoid = character and character.Parent and character ~= removingCharacter
-            and character:FindFirstChildOfClass("Humanoid") or nil
-        return humanoid ~= nil and humanoid.Parent == character and humanoid.Health > 0
-    end
-    local function sync()
-        if not allowed() then
-            assert(release(), A.LastError or "Could not release auto sprint")
-            A.Status = "PAUSED"
-        elseif native.IsSprintButtonToggled() then
-            A.Status = "ON"
-        elseif native.IsSprintButtonUsable() then
-            -- Keyboard Shift and joystick intent use separate native held flags.
-            -- Removing this toggle does not release either of those manual inputs.
-            ownsToggle = true
-            native.ToggleSprintButton()
-            assert(native.IsSprintButtonToggled(), "Sprint toggle was not accepted")
-            A.Status = "ON"
-        else
-            -- Native exhaustion clears the button. Wait until the game permits a restart.
-            ownsToggle = false
-            A.Status = "WAITING"
-        end
-        publish()
-    end
-    function A.SetAutoSprint(value)
-        value = value == true
-        if value and A.AutoSprint then return not loading end
-        revision += 1
-        local request = revision
-        if not value then
-            A.AutoSprint = false
-            disconnect()
-            local ok = release()
-            A.Status = ok and "OFF" or "CLEANUP REQUIRED"
-            publish()
-            return ok
-        end
-        if not alive or not d.alive() then return false end
-        A.AutoSprint, A.Status, loading = true, "STARTING", true
-        publish()
-        local ok, err = pcall(function()
-            native = native or d.load("Client.Gameplay.Player.Sprint")
-            for _, name in ipairs({ "ToggleSprintButton", "IsSprintButtonToggled", "IsSprintButtonUsable" }) do
-                assert(type(native[name]) == "function", "Native sprint API unavailable: " .. name)
-            end
-        end)
-        loading = false
-        if request ~= revision or not (alive and A.AutoSprint and d.alive()) then return false end
-        if not ok then return fail(err) end
-        ok, err = pcall(sync)
-        if not ok then return fail(err) end
-        nextTick = 0
-        heartbeat = d.Run.Heartbeat:Connect(function()
-            if not A.AutoSprint then return end
-            local now = os.clock()
-            if now < nextTick then return end
-            nextTick = now + 0.1
-            local worked, detail = pcall(sync)
-            if not worked then fail(detail) end
-        end)
-        removing = d.Player.CharacterRemoving:Connect(function(character)
-            removingCharacter = character
-            if A.AutoSprint then
-                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
-            end
-        end)
-        focus = d.Input.WindowFocusReleased:Connect(function()
-            if A.AutoSprint then
-                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
-            end
-        end)
-        return true
-    end
-    function A.Cleanup()
-        alive = false
-        return A.SetAutoSprint(false)
-    end
-    function A.Debug()
-        return { enabled = A.AutoSprint, status = A.Status, ownsToggle = ownsToggle,
-            lastError = A.LastError, version = "Auto sprint 1.0" }
-    end
-    return A
-end
-
-
--- Local settings storage. The fixed filename never depends on a config name.
 local function createDmcConfigStore(d)
     local A = { Accent = "DEC173", RainbowUI = false, Selected = "", Storage = "Session only", Notice = "" }
     local document = { schema = 1, profiles = {}, accent = A.Accent, rainbowUI = false, selected = "" }
@@ -161,12 +41,10 @@ local function createDmcConfigStore(d)
         local range = value.striker.Range
         if type(range) ~= "number" or range ~= range or range < 40 or range > 100 then return nil end
         striker.Range = math.floor(range + 0.5)
-        for _, key in ipairs({ "AutoDribble", "InfiniteStamina" }) do
+        for _, key in ipairs({ "AutoDribble" }) do
             if type(value.misc[key]) ~= "boolean" then return nil end
             misc[key] = value.misc[key]
         end
-        if value.misc.AutoSprint ~= nil and type(value.misc.AutoSprint) ~= "boolean" then return nil end
-        misc.AutoSprint = value.misc.AutoSprint == true
         local accent = A.Color(value.accent)
         if not accent then return nil end
         if value.rainbowUI ~= nil and type(value.rainbowUI) ~= "boolean" then return nil end
@@ -295,8 +173,7 @@ local function createDmcSettingsController(d)
         return { goalkeeper = gk,
             striker = { Enabled = d.striker.Enabled, AutoCurve = d.striker.AutoCurve,
                 SmartRelease = d.striker.SmartRelease, Range = d.striker.GetAssistRange() },
-            misc = { AutoDribble = d.misc.AutoDribble, AutoSprint = d.misc.AutoSprint == true,
-                InfiniteStamina = d.misc.InfiniteStamina },
+            misc = { AutoDribble = d.misc.AutoDribble },
             accent = d.accent(), rainbowUI = d.rainbow and d.rainbow() == true or false }
     end
     local function apply(profile)
@@ -310,8 +187,6 @@ local function createDmcSettingsController(d)
         feature(d.striker, "Enabled", profile.striker.Enabled)
         assert(d.striker.SetAssistRange(profile.striker.Range) ~= false, "Shot range could not be changed")
         feature(d.misc, "AutoDribble", profile.misc.AutoDribble)
-        feature(d.misc, "AutoSprint", profile.misc.AutoSprint)
-        feature(d.misc, "InfiniteStamina", profile.misc.InfiniteStamina)
         for key, value in pairs(profile.goalkeeper) do if key ~= "Enabled" then d.config[key] = value end end
         d.resetGoalkeeper()
         if d.gkEnabled() ~= profile.goalkeeper.Enabled then d.setGK(profile.goalkeeper.Enabled) end
@@ -507,8 +382,8 @@ local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
 -- Bump the release ID for every shipped update to trigger the one-time OK prompt.
-local RELEASE_VERSION = "2026.10.01.18"
-local BUILD = "Dmc Settings 1.5.1 | GK 3.2.7 | STR 0.16.3 | Misc 0.17.6 | Auto sprint 1.0 | Evaluation 0.2"
+local RELEASE_VERSION = "2026.10.02.1"
+local BUILD = "Dmc Settings 1.5.2 | GK 3.2.7 | STR 0.16.3 | Misc 0.18.0 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -7156,12 +7031,12 @@ local function createStriker(d)
     return A
 end
 
--- Optional STR extras. Native input/cooldowns and stamina source ownership stay intact.
+-- Auto dribble uses the game's native input, cooldowns and stamina rules.
 local function createStrikerMisc(d)
-    local A = { AutoDribble = false, InfiniteStamina = false, DribbleStatus = "OFF", StaminaStatus = "OFF" }
+    local A = { AutoDribble = false, DribbleStatus = "OFF" }
     local N: { [string]: any } = {}
-    local alive, loadingDribble, loadingStamina = true, false, false
-    local generation, staminaGeneration = 0, 0
+    local alive, loadingDribble = true, false
+    local generation = 0
     local heartbeat, inputConnection = nil, nil
     local controlConnection, pickupWindow = nil, nil
     local scanning, manualHadBall = false, true
@@ -7173,22 +7048,16 @@ local function createStrikerMisc(d)
     local ownershipHook, nativeOwner = nil, nil
     local queuedScan, requestScan = nil, nil
     local nextPingSample, networkLead = 0, 0
-    local guardHook = nil
-    local placementHook = nil
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
     local candidates, cachedCharacter = {}, nil
-    local staminaSource = "DmcStamina_" .. d.id
-    local staminaOwned = false
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
-        attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
-        staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
+        attempts = 0, started = 0, nativeBlocked = 0,
         observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
         motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
         pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
     local blockedBy, recentGates = {}, {}
     local lastScan = nil
-    local lastCorrection = nil
     local C = { Interval = 1 / 60, DiscoverySeconds = 0.15, Range = 40, Lookahead = 0.22, KickLookahead = 0.12,
         RetrySeconds = 0.25, Step = 0.025, Padding = 1.0, ManualGrace = 0.15, MaximumDisplayLead = 0.20,
         ChargeStateGrace = 0.10, MaximumNetworkLead = 0.12, PingSampleSeconds = 0.5,
@@ -7231,102 +7100,6 @@ local function createStrikerMisc(d)
         nativeOwner = nil
         candidates, cachedCharacter = {}, nil
         nextDiscovery = 0
-    end
-    local function stopStaminaWatch()
-        if guardHook then
-            guardHook.active = false
-            -- A later wrapper belongs to its installer; leave our inner observer passive.
-            if N.Guard.Validate == guardHook.observer then N.Guard.Validate = guardHook.original end
-            guardHook = nil
-        end
-        if placementHook then
-            placementHook.active = false
-            if N.Placement.RepairPosition == placementHook.observer then
-                N.Placement.RepairPosition = placementHook.original
-            end
-            placementHook = nil
-        end
-    end
-    local function noteCorrection(correction)
-        lastCorrection = correction
-        -- Corrections are observations, not requests to change the user's switch.
-        -- The native guard/placement functions still apply their normal repairs.
-        A.StaminaStatus = "LOCAL ON"
-    end
-    local function startPlacementWatch()
-        local hook = { original = N.Placement.RepairPosition, active = true }
-        local function capture(character, root, target)
-            if not (hook.active and alive and d.alive() and A.InfiniteStamina)
-                or character ~= d.Player.Character or not root or not vector(target)
-                or d.M.Replay.IsActive() or d.M.Freeze.IsFrozen() then return nil end
-            return { position = root.Position, velocity = root.AssemblyLinearVelocity,
-                context = d.M.Motion.GetContext(character) }
-        end
-        local function observe(sample, target, result)
-            if not sample or result[2] ~= true then return end
-            local origin = vector(result[1]) and result[1] or sample.position
-            local delta = target - origin
-            local horizontal = flat(delta)
-            if horizontal.Magnitude <= 0.5 then return end
-            local velocity = flat(sample.velocity)
-            -- Ignore forward/lateral repairs while moving and vertical floor recovery.
-            -- The native placement API alone does not prove why the repair was issued.
-            if velocity.Magnitude >= 1 and horizontal:Dot(velocity.Unit) >= -0.5 then return end
-            stats.positionRepairs += 1
-            noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
-                horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
-                staminaWasOn = true, serverConfirmed = false })
-        end
-        hook.observer = function(character, root, target, ...)
-            local captured, sample = pcall(capture, character, root, target)
-            if not captured then stats.observerErrors += 1; sample = nil end
-            -- Preserve the native repair, all return values, and native errors exactly.
-            local result = table.pack(hook.original(character, root, target, ...))
-            if sample then
-                local ok = pcall(observe, sample, target, result)
-                if not ok then stats.observerErrors += 1 end
-            end
-            return table.unpack(result, 1, result.n)
-        end
-        placementHook = hook
-        N.Placement.RepairPosition = hook.observer
-    end
-    local function startStaminaWatch()
-        assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
-        assert(type(N.Placement.RepairPosition) == "function", "Position repair observer unavailable")
-        if guardHook then
-            assert(guardHook.active, "Previous movement observer cleanup is incomplete")
-            return
-        end
-        local hook = { original = N.Guard.Validate, active = true }
-        local function noteRejected(root, claimedPosition, claimedVelocity)
-            stats.localCorrections += 1
-            local correction = { clock = os.clock(), context = d.M.Motion.GetContext(d.Player.Character),
-                positionChange = (root.Position - claimedPosition).Magnitude,
-                velocityChange = (root.AssemblyLinearVelocity - claimedVelocity).Magnitude,
-                source = "LocalMovementGuard.Validate", staminaWasOn = true }
-            noteCorrection(correction)
-        end
-        hook.observer = function(root, ...)
-            local character = d.Player.Character
-            local watching = hook.active and alive and d.alive() and A.InfiniteStamina
-                and root ~= nil and character and root == character:FindFirstChild("HumanoidRootPart")
-            local claimedPosition = watching and root.Position or nil
-            local claimedVelocity = watching and root.AssemblyLinearVelocity or nil
-            -- Run validation exactly once. Its corrections, result and errors stay native.
-            local result = hook.original(root, ...)
-            if watching and result == false then
-                local ok = pcall(noteRejected, root, claimedPosition, claimedVelocity)
-                if not ok then
-                    stats.observerErrors += 1
-                end
-            end
-            return result
-        end
-        guardHook = hook
-        N.Guard.Validate = hook.observer
-        startPlacementWatch()
-        -- No automatic shutoff, stamina drain, or correction retry loop.
     end
     local function stopDribbleWatch(err)
         A.AutoDribble = false
@@ -8051,66 +7824,16 @@ local function createStrikerMisc(d)
         if not connected then stopDribbleWatch(connectionError); return false end
         return true
     end
-    function A.SetInfiniteStamina(value)
-        value = value == true
-        staminaGeneration += 1
-        local request = staminaGeneration
-        if value and (not alive or not d.alive() or loadingStamina) then return false end
-        if value and A.InfiniteStamina then return true end
-        if not value and not staminaOwned then
-            local stopped, stopError = pcall(stopStaminaWatch)
-            A.InfiniteStamina = false
-            A.StaminaStatus = stopped and "OFF" or "CLEANUP REQUIRED"
-            if not stopped then problem(stopError) end
-            return stopped
-        end
-        loadingStamina = true
-        local ok, err = pcall(function()
-            if not N.Sprint then N.Sprint = d.load("Client.Gameplay.Player.Sprint") end
-            assert(type(N.Sprint.SetUnlimitedStamina) == "function", "Native stamina switch unavailable")
-            if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
-            if value then
-                N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
-            end
-            if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
-            if value then startStaminaWatch() end
-            -- Mark before calling: if native HUD refresh throws after setting the source,
-            -- rollback and later cleanup must still know that removal is required.
-            if value then staminaOwned = true end
-            N.Sprint.SetUnlimitedStamina(staminaSource, value)
-            staminaOwned = value
-            if not value then stopStaminaWatch() end
-        end)
-        loadingStamina = false
-        if not ok then
-            if value and staminaOwned then
-                local removed = pcall(N.Sprint.SetUnlimitedStamina, staminaSource, false)
-                if removed then staminaOwned = false end
-            end
-            if not staminaOwned then pcall(stopStaminaWatch) end
-            A.InfiniteStamina = staminaOwned
-            A.StaminaStatus = staminaOwned and "CLEANUP REQUIRED" or "ERROR"
-            problem(err)
-            return false
-        end
-        if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
-        A.InfiniteStamina = value
-        A.StaminaStatus = value and "LOCAL ON" or "OFF"
-        return true
-    end
     function A.Cleanup()
         alive = false
         A.SetAutoDribble(false)
-        return A.SetInfiniteStamina(false)
+        return true
     end
     function A.Debug()
-        return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
-            dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.6",
+        return { autoDribble = A.AutoDribble, dribbleStatus = A.DribbleStatus,
+            lastError = A.LastError, version = "Misc 0.18.0",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = false, positionRepairFallback = false, correctionPolicy = "observe_only",
-            lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
             inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
             cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
                 and N.Controls.GetCooldownRemaining("Dribble") or nil,
@@ -8658,7 +8381,7 @@ for _, remote in ipairs(BallRemotes:GetChildren()) do
 end
 local EVALUATION = createStrikerEvaluation({
     M = M, Player = LocalPlayer, Players = Players, Run = RunService, State = StateRemote,
-    build = "Dmc 0.26 client stamina restored",
+    build = "Dmc 2026.10.02.1",
     sessionId = game:GetService("HttpService"):GenerateGUID(false),
     CommandRemotes = evaluationRemotes, alive = function() return S.alive end,
     timestamp = function() return DateTime.now().UnixTimestampMillis end,
@@ -8719,36 +8442,10 @@ local MISC = createStrikerMisc({
     ignoreManualInput = function(input) return S.isUIInput and S.isUIInput(input) or false end,
     AttackRemotes = evaluationRemotes,
 })
--- Auto sprint owns only the game's native button toggle.
-do
-    local sprint = createAutoSprint({
-        Player = LocalPlayer, Input = UserInputService, Run = RunService,
-        Gui = game:GetService("GuiService"), load = module,
-        alive = function() return S.alive end,
-        suspended = function() return S.uiBusy or not S.focused end,
-        changed = function(state) MISC.AutoSprint, MISC.SprintStatus = state.AutoSprint, state.Status end,
-    })
-    MISC.AutoSprint, MISC.SprintStatus = false, "OFF"
-    MISC.SetAutoSprint = sprint.SetAutoSprint
-    local originalCleanup, originalDebug = MISC.Cleanup, MISC.Debug
-    MISC.Cleanup = function()
-        local sprintCalled, sprintResult = pcall(sprint.Cleanup)
-        local miscCalled, miscResult, miscDetail = pcall(originalCleanup)
-        if not sprintCalled or sprintResult == false then return false, "Auto sprint could not be released" end
-        if not miscCalled then return false, tostring(miscResult) end
-        return miscResult, miscDetail
-    end
-    MISC.Debug = function()
-        local result = originalDebug()
-        result.autoSprint, result.sprintStatus, result.sprint = MISC.AutoSprint, MISC.SprintStatus, sprint.Debug()
-        return result
-    end
-end
-
 S.releaseMisc = MISC.Cleanup
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
-        autoDribble = MISC.AutoDribble, infiniteStamina = MISC.InfiniteStamina }
+        autoDribble = MISC.AutoDribble }
 end)
 ENV.DmcMisc = MISC
 ENV.DmcMiscDebug = function()
@@ -8935,7 +8632,7 @@ do
     local tabBar = frame(panel, "Tabs", 12, 44, 292, 26)
     tabBar.BackgroundTransparency = 1
     -- STR is independent of the goalkeeper automation toggle.
-    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 403)
+    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 333)
     strikerContent.BackgroundTransparency = 1
     strikerContent.Visible = false
     local live = round(frame(panel, "LiveStatus", 12, 76, 292, 28, C.surface), 5)
@@ -9499,28 +9196,26 @@ do
         drawRange()
         table.insert(refreshers, drawRange)
     end
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 124)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 54)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
         Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 102)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 32)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
-    toggle("Auto sprint", function() return MISC.AutoSprint end, MISC.SetAutoSprint)
-    toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 327),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 257),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
         Font = Enum.Font.FredokaOne, TextColor3 = C.accent,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 361), Size = UDim2.fromOffset(276, 28),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 291), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.muted,
     })
 
@@ -10035,7 +9730,7 @@ do
     fit = function(requestedX, requestedY)
         local viewport = viewportSize()
         local top = math.min(48, viewport.Y * 0.1)
-        local width, height = 316, minimized and 40 or (activeTab == "GK" and 494 or (activeTab == "STR" and 491 or (colorPickerOpen and 581 or 419)))
+        local width, height = 316, minimized and 40 or (activeTab == "GK" and 494 or (activeTab == "STR" and 421 or (colorPickerOpen and 581 or 419)))
         local scale = math.min(1, math.max(1, viewport.X - 32) / width,
             math.max(1, viewport.Y - top - 16) / height)
         if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab or height ~= lastHeight then
@@ -10132,7 +9827,7 @@ do
         if activeTab == "STR" then
             for i = gkRefresherCount + 1, #refreshers do refreshers[i]() end
             writeChanged(strikerStatus, "Text", STR.Status)
-            writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus .. " | Stamina: " .. MISC.StaminaStatus)
+            writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus)
             return
         end
         for i = 1, gkRefresherCount do refreshers[i]() end
