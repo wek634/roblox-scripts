@@ -507,8 +507,8 @@ local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
 -- Bump the release ID for every shipped update to trigger the one-time OK prompt.
-local RELEASE_VERSION = "2026.10.01.17-test"
-local BUILD = "Dmc Settings 1.5.1 | GK 3.2.7 | STR 0.16.3 | Misc 0.17.5 TEST | Auto sprint 1.0 | Evaluation 0.2"
+local RELEASE_VERSION = "2026.10.01.18"
+local BUILD = "Dmc Settings 1.5.1 | GK 3.2.7 | STR 0.16.3 | Misc 0.17.6 | Auto sprint 1.0 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
@@ -7175,11 +7175,6 @@ local function createStrikerMisc(d)
     local nextPingSample, networkLead = 0, 0
     local guardHook = nil
     local placementHook = nil
-    -- Separate test edition: this setting is runtime-only and is not saved in configs.
-    local correctionExperiment = true
-    local lastSkippedCorrection = nil
-    local lastOwnedCorrection = nil
-    local repairsAllowedBy = {}
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
     local candidates, cachedCharacter = {}, nil
     local staminaSource = "DmcStamina_" .. d.id
@@ -7187,7 +7182,7 @@ local function createStrikerMisc(d)
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
-        observerErrors = 0, positionRepairsSkipped = 0, teleportRepairsSkipped = 0, ownedRepairsApplied = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
+        observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
         motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
         pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
@@ -7249,9 +7244,6 @@ local function createStrikerMisc(d)
             if N.Placement.RepairPosition == placementHook.observer then
                 N.Placement.RepairPosition = placementHook.original
             end
-            if N.Placement.TryRepairOwnedPosition == placementHook.ownedObserver then
-                N.Placement.TryRepairOwnedPosition = placementHook.originalOwned
-            end
             placementHook = nil
         end
     end
@@ -7261,63 +7253,14 @@ local function createStrikerMisc(d)
         -- The native guard/placement functions still apply their normal repairs.
         A.StaminaStatus = "LOCAL ON"
     end
-    local function correctionCaller()
-        local trace = {}
-        if type(debug) ~= "table" or type(debug.info) ~= "function" then return nil, trace end
-        -- Inspect only known controllers, allowing existing diagnostic wrappers.
-        for level = 2, 16 do
-            local source, line = debug.info(level, "sl")
-            if not source then break end
-            if #trace < 8 then table.insert(trace, string.sub(source, 1, 180) .. ":" .. tostring(line)) end
-            for _, entry in ipairs({
-                { "ReplicatedStorage.Client.Player.CharacterReplication", "replication" },
-                { "ReplicatedStorage.Client.Player.CharacterTeleport", "teleport_repair" },
-            }) do
-                local name = entry[1]
-                if source == name or source == "@" .. name or source == "=" .. name
-                    or source == '[string "' .. name .. '"]' then return source, trace, entry[2] end
-            end
-        end
-        return nil, trace
-    end
-    local function verifiedTeleportRepair(character, target)
-        local state = N.TeleportState
-        local pending = type(state) == "table" and state.PendingPlacement or nil
-        if type(pending) ~= "table" or pending.IsRepair ~= true
-            or pending.IsLobbyDestination or pending.Character ~= character
-            or typeof(pending.CFrame) ~= "CFrame"
-            or not finite(pending.Revision) or pending.Revision <= 0
-            or pending.Revision ~= state.ReceivedPlacementRevision
-            or pending.Epoch ~= state.TeleportEpoch then return nil end
-        local destination = pending.CFrame.Position
-        if not vector(destination) or (destination - target).Magnitude > 0.0001 then return nil end
-        return pending
-    end
     local function startPlacementWatch()
-        local hook = { original = N.Placement.RepairPosition,
-            originalOwned = N.Placement.TryRepairOwnedPosition, active = true }
+        local hook = { original = N.Placement.RepairPosition, active = true }
         local function capture(character, root, target)
             if not (hook.active and alive and d.alive() and A.InfiniteStamina)
                 or character ~= d.Player.Character or not root or not vector(target)
                 or d.M.Replay.IsActive() or d.M.Freeze.IsFrozen() then return nil end
-            local caller, trace, route = correctionCaller()
-            local humanoid = character:FindFirstChildOfClass("Humanoid")
-            local pending = route == "teleport_repair" and verifiedTeleportRepair(character, target) or nil
-            local reason = "eligible"
-            if not correctionExperiment then reason = "experiment_off"
-            elseif d.M.Motion.GetContext(character) ~= "Match" then reason = "outside_match"
-            elseif root ~= character:FindFirstChild("HumanoidRootPart") then reason = "different_root"
-            elseif not humanoid or humanoid.Health <= 0 then reason = "dead_or_missing_humanoid"
-            elseif d.M.Match.IsGoalkeeperCharacter(character) then reason = "goalkeeper_role"
-            elseif not caller then reason = "unmatched_caller"
-            elseif route == "teleport_repair" and not pending then reason = "unverified_teleport_repair" end
             return { position = root.Position, velocity = root.AssemblyLinearVelocity,
-                context = d.M.Motion.GetContext(character), caller = caller, callerTrace = trace,
-                route = route, pendingPlacement = pending, placementEpoch = pending and pending.Epoch or nil,
-                placementRevision = pending and pending.Revision or nil,
-                reason = reason, health = humanoid and humanoid.Health or nil,
-                ragdolled = d.M.Ragdoll and type(d.M.Ragdoll.IsEnabled) == "function"
-                    and d.M.Ragdoll.IsEnabled(character) or false }
+                context = d.M.Motion.GetContext(character) }
         end
         local function observe(sample, target, result)
             if not sample or result[2] ~= true then return end
@@ -7326,58 +7269,18 @@ local function createStrikerMisc(d)
             local horizontal = flat(delta)
             if horizontal.Magnitude <= 0.5 then return end
             local velocity = flat(sample.velocity)
+            -- Ignore forward/lateral repairs while moving and vertical floor recovery.
+            -- The native placement API alone does not prove why the repair was issued.
             if velocity.Magnitude >= 1 and horizontal:Dot(velocity.Unit) >= -0.5 then return end
             stats.positionRepairs += 1
-            repairsAllowedBy[sample.reason] = (repairsAllowedBy[sample.reason] or 0) + 1
             noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
-                horizontalChange = horizontal.Magnitude, verticalChange = delta.Y,
-                source = "CharacterPlacement.RepairPosition", caller = sample.caller,
-                callerTrace = sample.callerTrace, reason = sample.reason, route = sample.route,
-                health = sample.health, ragdolled = sample.ragdolled, applied = true,
+                horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
                 staminaWasOn = true, serverConfirmed = false })
-        end
-        hook.ownedObserver = function(character, target, ...)
-            local root = character == d.Player.Character and character:FindFirstChild("HumanoidRootPart") or nil
-            local captured, sample = pcall(capture, character, root, target)
-            if not captured then stats.observerErrors += 1; sample = nil end
-            -- Always preserve native owned/replay/repair-controller handling first.
-            local result = table.pack(hook.originalOwned(character, target, ...))
-            if sample and sample.caller and result[1] and result[2] == true then
-                stats.ownedRepairsApplied += 1
-                lastOwnedCorrection = { clock = os.clock(), context = sample.context,
-                    positionChange = (target - sample.position).Magnitude,
-                    source = "CharacterPlacement.TryRepairOwnedPosition", caller = sample.caller,
-                    route = sample.route, applied = true, reason = "native_owned_repair", serverConfirmed = false }
-            end
-            local stillPending = true
-            if sample and sample.reason == "eligible" and sample.route == "teleport_repair" then
-                local checked, pending = pcall(verifiedTeleportRepair, character, target)
-                if not checked then stats.observerErrors += 1 end
-                stillPending = checked and pending == sample.pendingPlacement
-            end
-            if sample and sample.reason == "eligible" and stillPending and not result[1]
-                and hook.active and alive and d.alive() and A.InfiniteStamina and correctionExperiment
-                and character == d.Player.Character then
-                local delta = target - sample.position
-                stats.positionRepairsSkipped += 1
-                if sample.route == "teleport_repair" then stats.teleportRepairsSkipped += 1 end
-                lastSkippedCorrection = { clock = os.clock(), context = sample.context,
-                    positionChange = delta.Magnitude, horizontalChange = flat(delta).Magnitude,
-                    source = "CharacterPlacement.TryRepairOwnedPosition", caller = sample.caller,
-                    route = sample.route, placementEpoch = sample.placementEpoch,
-                    placementRevision = sample.placementRevision,
-                    skipped = true, applied = false, staminaWasOn = true, serverConfirmed = false }
-                -- Replication cancels its pending smoothing. RepairPosition returns
-                -- target,false; CharacterTeleport's existing IsRepair branch then clears
-                -- this pending repair and exits without a camera snap or an applied ack.
-                -- SnapToCFrame, teleport revisions and all remotes stay native.
-                return true, false, target
-            end
-            return table.unpack(result, 1, result.n)
         end
         hook.observer = function(character, root, target, ...)
             local captured, sample = pcall(capture, character, root, target)
             if not captured then stats.observerErrors += 1; sample = nil end
+            -- Preserve the native repair, all return values, and native errors exactly.
             local result = table.pack(hook.original(character, root, target, ...))
             if sample then
                 local ok = pcall(observe, sample, target, result)
@@ -7386,13 +7289,11 @@ local function createStrikerMisc(d)
             return table.unpack(result, 1, result.n)
         end
         placementHook = hook
-        N.Placement.TryRepairOwnedPosition = hook.ownedObserver
         N.Placement.RepairPosition = hook.observer
     end
     local function startStaminaWatch()
         assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
         assert(type(N.Placement.RepairPosition) == "function", "Position repair observer unavailable")
-        assert(type(N.Placement.TryRepairOwnedPosition) == "function", "Owned position repair observer unavailable")
         if guardHook then
             assert(guardHook.active, "Previous movement observer cleanup is incomplete")
             return
@@ -8150,11 +8051,6 @@ local function createStrikerMisc(d)
         if not connected then stopDribbleWatch(connectionError); return false end
         return true
     end
-    function A.SetCorrectionExperiment(value)
-        if not alive or not d.alive() then return false end
-        correctionExperiment = value == true
-        return true
-    end
     function A.SetInfiniteStamina(value)
         value = value == true
         staminaGeneration += 1
@@ -8175,15 +8071,6 @@ local function createStrikerMisc(d)
             if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
             if value then
                 N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
-                if not N.TeleportState then
-                    -- Optional inspection; failure preserves every teleport repair.
-                    local inspected, state = pcall(function()
-                        local context = d.load("Modules.ContextState")
-                        assert(type(context.Get) == "function", "Teleport state inspection unavailable")
-                        return context.Get("CharacterTeleportClient")
-                    end)
-                    if inspected and type(state) == "table" then N.TeleportState = state end
-                end
             end
             if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
             if value then startStaminaWatch() end
@@ -8219,17 +8106,10 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.5 TEST",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.6",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = false, positionRepairFallback = false,
-            correctionPolicy = correctionExperiment and "skip_verified_movement_repairs_test" or "observe_only",
-            correctionExperiment = correctionExperiment,
-            callerInspectionSupported = type(debug) == "table" and type(debug.info) == "function",
-            lastSkippedCorrection = lastSkippedCorrection and table.clone(lastSkippedCorrection) or nil,
-            teleportRepairInspectionSupported = type(N.TeleportState) == "table",
-            repairsAllowedBy = table.clone(repairsAllowedBy),
-            lastOwnedCorrection = lastOwnedCorrection and table.clone(lastOwnedCorrection) or nil,
+            correctionFallback = false, positionRepairFallback = false, correctionPolicy = "observe_only",
             lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
             inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
             cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
