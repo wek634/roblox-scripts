@@ -1,3 +1,377 @@
+local function createAutoSprint(d)
+    local A = { AutoSprint = false, Status = "OFF", LastError = nil }
+    local native, heartbeat, removing, focus, removingCharacter = nil, nil, nil, nil, nil
+    local ownsToggle, loading, alive, revision, nextTick = false, false, true, 0, 0
+    local function publish()
+        if d.changed then d.changed(A) end
+    end
+    local function disconnect()
+        if heartbeat then heartbeat:Disconnect(); heartbeat = nil end
+        if removing then removing:Disconnect(); removing = nil end
+        if focus then focus:Disconnect(); focus = nil end
+    end
+    local function release()
+        if not ownsToggle then return true end
+        local ok, err = pcall(function()
+            if native.IsSprintButtonToggled() then native.ToggleSprintButton() end
+            assert(not native.IsSprintButtonToggled(), "Sprint toggle was not released")
+        end)
+        if ok then ownsToggle = false else A.LastError = tostring(err) end
+        return ok
+    end
+    local function fail(err)
+        A.LastError, A.AutoSprint = tostring(err), false
+        revision += 1
+        disconnect()
+        A.Status = release() and "ERROR" or "CLEANUP REQUIRED"
+        publish()
+        warn("[Dmc Auto sprint] " .. A.LastError)
+        return false
+    end
+    local function allowed()
+        if not (alive and A.AutoSprint and d.alive()) then return false end
+        if d.suspended() or d.Gui.MenuIsOpen or d.Input:GetFocusedTextBox() then return false end
+        local character = d.Player.Character
+        local humanoid = character and character.Parent and character ~= removingCharacter
+            and character:FindFirstChildOfClass("Humanoid") or nil
+        return humanoid ~= nil and humanoid.Parent == character and humanoid.Health > 0
+    end
+    local function sync()
+        if not allowed() then
+            assert(release(), A.LastError or "Could not release auto sprint")
+            A.Status = "PAUSED"
+        elseif native.IsSprintButtonToggled() then
+            A.Status = "ON"
+        elseif native.IsSprintButtonUsable() then
+            -- Keyboard Shift and joystick intent use separate native held flags.
+            -- Removing this toggle does not release either of those manual inputs.
+            ownsToggle = true
+            native.ToggleSprintButton()
+            assert(native.IsSprintButtonToggled(), "Sprint toggle was not accepted")
+            A.Status = "ON"
+        else
+            -- Native exhaustion clears the button. Wait until the game permits a restart.
+            ownsToggle = false
+            A.Status = "WAITING"
+        end
+        publish()
+    end
+    function A.SetAutoSprint(value)
+        value = value == true
+        if value and A.AutoSprint then return not loading end
+        revision += 1
+        local request = revision
+        if not value then
+            A.AutoSprint = false
+            disconnect()
+            local ok = release()
+            A.Status = ok and "OFF" or "CLEANUP REQUIRED"
+            publish()
+            return ok
+        end
+        if not alive or not d.alive() then return false end
+        A.AutoSprint, A.Status, loading = true, "STARTING", true
+        publish()
+        local ok, err = pcall(function()
+            native = native or d.load("Client.Gameplay.Player.Sprint")
+            for _, name in ipairs({ "ToggleSprintButton", "IsSprintButtonToggled", "IsSprintButtonUsable" }) do
+                assert(type(native[name]) == "function", "Native sprint API unavailable: " .. name)
+            end
+        end)
+        loading = false
+        if request ~= revision or not (alive and A.AutoSprint and d.alive()) then return false end
+        if not ok then return fail(err) end
+        ok, err = pcall(sync)
+        if not ok then return fail(err) end
+        nextTick = 0
+        heartbeat = d.Run.Heartbeat:Connect(function()
+            if not A.AutoSprint then return end
+            local now = os.clock()
+            if now < nextTick then return end
+            nextTick = now + 0.1
+            local worked, detail = pcall(sync)
+            if not worked then fail(detail) end
+        end)
+        removing = d.Player.CharacterRemoving:Connect(function(character)
+            removingCharacter = character
+            if A.AutoSprint then
+                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
+            end
+        end)
+        focus = d.Input.WindowFocusReleased:Connect(function()
+            if A.AutoSprint then
+                if not release() then fail(A.LastError) else A.Status = "PAUSED"; publish() end
+            end
+        end)
+        return true
+    end
+    function A.Cleanup()
+        alive = false
+        return A.SetAutoSprint(false)
+    end
+    function A.Debug()
+        return { enabled = A.AutoSprint, status = A.Status, ownsToggle = ownsToggle,
+            lastError = A.LastError, version = "Auto sprint 1.0" }
+    end
+    return A
+end
+
+
+-- Local settings storage. The fixed filename never depends on a config name.
+local function createDmcConfigStore(d)
+    local A = { Accent = "DEC173", RainbowUI = false, Selected = "", Storage = "Session only", Notice = "" }
+    local document = { schema = 1, profiles = {}, accent = A.Accent, rainbowUI = false, selected = "" }
+    local blockedFile = false
+    local boolKeys = { "Enabled", "CloseRangeRush", "HighBallJumps", "JumpThenDive",
+        "BackwardRecovery", "PositionAssist", "PreShotCoverage", "RespectManualMovement" }
+    local diveModes = { SMART = true, FORWARD = true, LEFT = true, RIGHT = true, SIDES = true }
+    local function copy(value)
+        if type(value) ~= "table" then return value end
+        local result = {}
+        for key, item in pairs(value) do result[key] = copy(item) end
+        return result
+    end
+    function A.Color(value)
+        if type(value) ~= "string" then return nil end
+        local hex = value:match("^%s*#?([%x]+)%s*$")
+        return hex and #hex == 6 and string.upper(hex) or nil
+    end
+    local function name(value)
+        if type(value) ~= "string" then return nil end
+        value = value:match("^%s*(.-)%s*$")
+        if #value < 1 or #value > 40 or value:find("[%c]") then return nil end
+        return value
+    end
+    function A.Validate(value)
+        if type(value) ~= "table" or type(value.goalkeeper) ~= "table"
+            or type(value.striker) ~= "table" or type(value.misc) ~= "table" then return nil end
+        local gk, striker, misc = {}, {}, {}
+        for _, key in ipairs(boolKeys) do
+            if type(value.goalkeeper[key]) ~= "boolean" then return nil end
+            gk[key] = value.goalkeeper[key]
+        end
+        if not diveModes[value.goalkeeper.DiveFilter] then return nil end
+        if value.goalkeeper.PositionMode ~= "THREATS"
+            and value.goalkeeper.PositionMode ~= "HOME_AND_THREATS" then return nil end
+        gk.DiveFilter, gk.PositionMode = value.goalkeeper.DiveFilter, value.goalkeeper.PositionMode
+        for _, key in ipairs({ "Enabled", "AutoCurve", "SmartRelease" }) do
+            if type(value.striker[key]) ~= "boolean" then return nil end
+            striker[key] = value.striker[key]
+        end
+        local range = value.striker.Range
+        if type(range) ~= "number" or range ~= range or range < 40 or range > 100 then return nil end
+        striker.Range = math.floor(range + 0.5)
+        for _, key in ipairs({ "AutoDribble", "InfiniteStamina" }) do
+            if type(value.misc[key]) ~= "boolean" then return nil end
+            misc[key] = value.misc[key]
+        end
+        if value.misc.AutoSprint ~= nil and type(value.misc.AutoSprint) ~= "boolean" then return nil end
+        misc.AutoSprint = value.misc.AutoSprint == true
+        local accent = A.Color(value.accent)
+        if not accent then return nil end
+        if value.rainbowUI ~= nil and type(value.rainbowUI) ~= "boolean" then return nil end
+        return { goalkeeper = gk, striker = striker, misc = misc, accent = accent, rainbowUI = value.rainbowUI == true }
+    end
+    local function decode(raw)
+        if type(raw) ~= "string" or #raw > 262144 then return false end
+        local ok, value = pcall(d.decode, raw)
+        if not ok or type(value) ~= "table" or value.schema ~= 1 or type(value.profiles) ~= "table" then return false end
+        local profiles, count = {}, 0
+        for key, profile in pairs(value.profiles) do
+            local validName, validProfile = name(key), A.Validate(profile)
+            if validName == key and validProfile and count < 50 then
+                profiles[key], count = validProfile, count + 1
+            else A.Notice = "Some invalid configs were skipped." end
+        end
+        document = { schema = 1, profiles = profiles, accent = A.Color(value.accent) or A.Accent,
+            rainbowUI = value.rainbowUI == true,
+            selected = name(value.selected) or "",
+            acknowledgedVersion = type(value.acknowledgedVersion) == "string" and value.acknowledgedVersion or nil }
+        if not profiles[document.selected] then document.selected = "" end
+        return true
+    end
+    local canFile = type(d.read) == "function" and type(d.write) == "function"
+    if type(d.cache) == "string" then decode(d.cache) end
+    if canFile then
+        local exists = true
+        if type(d.exists) == "function" then
+            local ok, result = pcall(d.exists, d.path)
+            if ok then exists = result == true end
+        end
+        if exists then
+            local ok, raw = pcall(d.read, d.path)
+            if ok and not decode(raw) then
+                blockedFile = true
+                A.Notice = "Settings file is unreadable; saved configs in that file were kept untouched."
+            elseif not ok and type(d.exists) == "function" then
+                blockedFile = true
+                A.Notice = "Settings file could not be read; using this session."
+            end
+        end
+        A.Storage = blockedFile and "Session only · file unavailable" or "Local file · " .. d.path
+    end
+    A.Accent, A.RainbowUI, A.Selected = document.accent, document.rainbowUI, document.selected
+    local function persist()
+        document.accent, document.rainbowUI, document.selected = A.Accent, A.RainbowUI, A.Selected
+        local ok, encoded = pcall(d.encode, document)
+        if not ok then return false, "Could not encode settings." end
+        d.remember(encoded)
+        if canFile and not blockedFile then
+            local written, result = pcall(d.write, d.path, encoded)
+            if written and result ~= false then A.Storage = "Local file · " .. d.path; return true, "Saved to local file." end
+            A.Storage = "Session only · file write failed"
+            return true, "Saved for this session; the executor could not write the file."
+        end
+        return true, "Saved for this session; file storage is unavailable."
+    end
+    function A.List()
+        local names = {}
+        for key in pairs(document.profiles) do names[#names + 1] = key end
+        table.sort(names, function(a, b)
+            if string.lower(a) == string.lower(b) then return a < b end
+            return string.lower(a) < string.lower(b)
+        end)
+        return names
+    end
+    function A.Select(value)
+        if not document.profiles[value] then return false end
+        A.Selected = value
+        return true
+    end
+    function A.Save(value, profile, creating)
+        local validName, validProfile = name(value), A.Validate(profile)
+        if not validName then return false, "Enter a config name (1–40 characters)." end
+        if not validProfile then return false, "Current settings could not be saved." end
+        if creating and document.profiles[validName] then return false, "Name already exists. Select it and press Save." end
+        if not creating and not document.profiles[validName] then return false, "Select a config before saving." end
+        if creating and #A.List() >= 50 then return false, "Config limit reached (50)." end
+        local previous, selected = document.profiles[validName], A.Selected
+        document.profiles[validName], A.Selected = validProfile, validName
+        local ok, detail = persist()
+        if not ok then document.profiles[validName], A.Selected = previous, selected end
+        return ok, detail
+    end
+    function A.Get(value)
+        return copy(document.profiles[value])
+    end
+    function A.SetAppearance(value, rainbow)
+        local hex = A.Color(value)
+        if not hex then return false, "Use a six-digit hex color, for example #DEC173." end
+        if type(rainbow) ~= "boolean" then return false, "Rainbow UI must be on or off." end
+        local previousAccent, previousRainbow = A.Accent, A.RainbowUI
+        A.Accent, A.RainbowUI = hex, rainbow
+        local ok, detail = persist()
+        if not ok then A.Accent, A.RainbowUI = previousAccent, previousRainbow end
+        return ok, detail
+    end
+    function A.SetAccent(value)
+        return A.SetAppearance(value, A.RainbowUI)
+    end
+    function A.SetRainbowUI(value)
+        return A.SetAppearance(A.Accent, value)
+    end
+    function A.ShouldPrompt(previousBuild, currentBuild)
+        if document.acknowledgedVersion then return document.acknowledgedVersion ~= d.version end
+        return type(previousBuild) == "string" and previousBuild ~= currentBuild
+    end
+    function A.Acknowledge()
+        if document.acknowledgedVersion == d.version then return true end
+        document.acknowledgedVersion = d.version
+        return persist()
+    end
+    return A
+end
+
+-- Configs use the same feature setters as the controls. A refused native setter
+-- rolls settings back instead of displaying a successful load.
+local function createDmcSettingsController(d)
+    local A = {}
+    function A.Snapshot()
+        local gk = {}
+        for _, key in ipairs({ "CloseRangeRush", "HighBallJumps", "JumpThenDive", "BackwardRecovery",
+            "PositionAssist", "PreShotCoverage", "RespectManualMovement", "PositionMode" }) do gk[key] = d.config[key] end
+        gk.Enabled = d.gkEnabled()
+        gk.DiveFilter = d.config.DiveFilter == "ALL" and "SMART" or d.config.DiveFilter
+        return { goalkeeper = gk,
+            striker = { Enabled = d.striker.Enabled, AutoCurve = d.striker.AutoCurve,
+                SmartRelease = d.striker.SmartRelease, Range = d.striker.GetAssistRange() },
+            misc = { AutoDribble = d.misc.AutoDribble, AutoSprint = d.misc.AutoSprint == true,
+                InfiniteStamina = d.misc.InfiniteStamina },
+            accent = d.accent(), rainbowUI = d.rainbow and d.rainbow() == true or false }
+    end
+    local function apply(profile)
+        local function feature(object, key, value)
+            if object[key] == value then return end
+            assert(object["Set" .. key](value) ~= false, key .. " could not be changed")
+            assert(object[key] == value, key .. " did not accept the setting")
+        end
+        feature(d.striker, "AutoCurve", profile.striker.AutoCurve)
+        feature(d.striker, "SmartRelease", profile.striker.SmartRelease)
+        feature(d.striker, "Enabled", profile.striker.Enabled)
+        assert(d.striker.SetAssistRange(profile.striker.Range) ~= false, "Shot range could not be changed")
+        feature(d.misc, "AutoDribble", profile.misc.AutoDribble)
+        feature(d.misc, "AutoSprint", profile.misc.AutoSprint)
+        feature(d.misc, "InfiniteStamina", profile.misc.InfiniteStamina)
+        for key, value in pairs(profile.goalkeeper) do if key ~= "Enabled" then d.config[key] = value end end
+        d.resetGoalkeeper()
+        if d.gkEnabled() ~= profile.goalkeeper.Enabled then d.setGK(profile.goalkeeper.Enabled) end
+        d.theme(profile.accent)
+        if d.setRainbow then d.setRainbow(profile.rainbowUI == true) end
+    end
+    function A.Load(profile)
+        local valid = d.validate(profile)
+        if not valid then return false, "Config is invalid; settings were not changed." end
+        local previous = A.Snapshot()
+        local ok, err = pcall(apply, valid)
+        if ok then return true, "Config loaded." end
+        local restored = pcall(apply, previous)
+        return false, "Config load failed: " .. tostring(err)
+            .. (restored and ". Previous settings restored." or ". Some settings could not be restored; check the toggles.")
+    end
+    return A
+end
+
+local function showDmcUpdatePrompt(parent, hex)
+    local gui = Instance.new("ScreenGui")
+    gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "DmcUpdate", false, 1001
+    gui.IgnoreGuiInset = true
+    local shade = Instance.new("Frame")
+    shade.Size, shade.BackgroundColor3, shade.BackgroundTransparency = UDim2.fromScale(1, 1), Color3.fromRGB(0, 0, 0), 0.45
+    shade.Active, shade.BorderSizePixel, shade.Parent = true, 0, gui
+    local accent = Color3.fromRGB(tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16))
+    local panel = Instance.new("Frame")
+    panel.AnchorPoint, panel.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.4)
+    panel.Size, panel.BackgroundColor3, panel.BorderSizePixel = UDim2.new(0.9, 0, 0, 200), Color3.fromRGB(16, 16, 15), 0
+    panel.Parent = shade
+    local limit = Instance.new("UISizeConstraint")
+    limit.MaxSize, limit.Parent = Vector2.new(460, 200), panel
+    local heading = Instance.new("TextLabel")
+    heading.Position, heading.Size = UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 28)
+    heading.BackgroundTransparency, heading.TextSize, heading.Font = 1, 18, Enum.Font.FredokaOne
+    heading.TextXAlignment, heading.TextColor3, heading.Text, heading.Parent = Enum.TextXAlignment.Left, accent, "Dmc | Script updated", panel
+    local message = Instance.new("TextLabel")
+    message.Position, message.Size = UDim2.fromOffset(14, 52), UDim2.new(1, -28, 0, 56)
+    message.BackgroundTransparency, message.TextWrapped, message.TextSize = 1, true, 16
+    message.Font, message.TextColor3 = Enum.Font.Nunito, Color3.fromRGB(242, 243, 240)
+    message.Text, message.Parent = "Script updated press OK to continue", panel
+    local okButton = Instance.new("TextButton")
+    okButton.AnchorPoint, okButton.Position, okButton.Size = Vector2.new(0.5, 0), UDim2.new(0.5, 0, 1, -58), UDim2.fromOffset(100, 36)
+    okButton.Name, okButton.Text, okButton.TextSize, okButton.Font = "OK", "OK", 16, Enum.Font.FredokaOne
+    okButton.BackgroundColor3, okButton.TextColor3, okButton.BorderSizePixel = accent, Color3.fromRGB(16, 16, 15), 0
+    okButton.Modal, okButton.Parent = true, panel
+    local acknowledged = false
+    local connection = okButton.Activated:Connect(function() acknowledged = true end)
+    gui.Parent = parent
+    local waited, err = pcall(function()
+        while gui.Parent and not acknowledged do task.wait(0.05) end
+    end)
+    connection:Disconnect()
+    gui:Destroy()
+    assert(waited, err)
+    return acknowledged
+end
+
+
 -- Small, dependency-free startup controller. Game modules are loaded only after
 -- its status panel is visible. No executor-specific GUI or identity API is needed.
 local function createDmcStartup(d)
@@ -132,12 +506,23 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local LocalPlayer = assert(Players.LocalPlayer, "Run this on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-local BUILD = "Auto GK 3.2.6 | STR 0.16 | Misc 0.9 | Evaluation 0.2"
+-- Bump the release ID for every shipped update to trigger the one-time OK prompt.
+local RELEASE_VERSION = "2026.10.01.17-test"
+local BUILD = "Dmc Settings 1.5.1 | GK 3.2.7 | STR 0.16.3 | Misc 0.17.5 TEST | Auto sprint 1.0 | Evaluation 0.2"
 local ENV = _G
 if type(getgenv) == "function" then
     local ok, environment = pcall(getgenv)
     if ok and type(environment) == "table" then ENV = environment end
 end
+
+local settingsHttp = game:GetService("HttpService")
+local SettingsStore = createDmcConfigStore({
+    version = RELEASE_VERSION, path = "Dmc_settings.json", cache = ENV.__DMC_CONFIG_CACHE,
+    read = readfile, write = writefile, exists = isfile,
+    encode = function(value) return settingsHttp:JSONEncode(value) end,
+    decode = function(value) return settingsHttp:JSONDecode(value) end,
+    remember = function(value) ENV.__DMC_CONFIG_CACHE = value end,
+})
 
 -- Keep the current instance running until all dependencies have loaded.
 
@@ -193,6 +578,12 @@ local TackleRemote = BallRemotes:WaitForChild("Tackle", 5)
 local StateRemote = BallRemotes:WaitForChild("State", 5)
 
 assert(TackleRemote and StateRemote and PlayerGui, "Client is not ready")
+
+if SettingsStore.ShouldPrompt(ENV.AutoGKBuild, BUILD) then
+    BOOT.Status("Waiting for update confirmation")
+    assert(showDmcUpdatePrompt(PlayerGui, SettingsStore.Accent), "Update confirmation was closed before OK.")
+    SettingsStore.Acknowledge()
+end
 
 if type(ENV.__AUTO_GK_CLEANUP) == "function" then
     local called, released, detail = pcall(ENV.__AUTO_GK_CLEANUP)
@@ -404,6 +795,7 @@ local function cleanup()
         S.ui = nil
         S.closeDropdown = nil
         S.cancelUITweens = nil
+        S.isUIInput = nil
     end
 
     if S.loopBusy then
@@ -671,6 +1063,8 @@ end
 
 local function invalidateFrame(allowWrite)
     S.lastFrame = nil
+    S.keeperWait = nil
+    S.keeperContact = nil
     S.allowPositioning = false
     S.coverageFrame = nil
     S.coverageNextAt = 0
@@ -1315,6 +1709,7 @@ local function snapshot(character, root, humanoid)
         at = timestamp,
         readClock = readClock,
         sourceTrajectory = sourceTrajectory,
+        lastKickerUserId = state.LastKickerUserId,
         launchAt = nil,
         context = context,
         ballId = ball.ballId,
@@ -2002,6 +2397,207 @@ local function divePathMayReach(f, points, horizon)
         or minZ > math.max(start.Z, finish.Z) + reach)
 end
 
+-- Receiver/blocker forecasts only postpone an already verified dive. They
+-- never suppress a goal-bound ball or authorize a contact on a guessed bounce.
+local KeeperTiming = {
+    ForecastSeconds = 0.35,
+    LaunchReserveSeconds = 0.10,
+    ContactOrderMarginSeconds = 0.035,
+    MinimumWaitSeconds = 0.015,
+    UrgentGoalSeconds = 0.25,
+    Delays = { 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50 },
+}
+
+function KeeperTiming.RootAt(body, t)
+    local dy = body.airborne and math.max(body.floor - body.cf.Position.Y,
+        body.velocity.Y * t - 0.5 * body.gravity * t * t) or 0
+    return body.cf + body.horizontal * t + Vector3.new(0, dy, 0)
+end
+
+function KeeperTiming.PlayerContact(f, character, actor, points, limit)
+    if character == f.character or not character.Parent
+        or M.Motion.GetContext(character) ~= M.Motion.GetContext(f.character) then return nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = type(M.Motion.GetQueryRoot) == "function" and M.Motion.GetQueryRoot(character)
+        or character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or humanoid.Health <= 0 or not root or not root.Parent then return nil end
+    local cf = M.Motion.GetCFrame(character)
+    local velocity = M.Motion.GetVelocity(character) or root.AssemblyLinearVelocity
+    if typeof(cf) ~= "CFrame" or not finiteVector(cf.Position)
+        or not finiteVector(velocity) then return nil end
+    local state = M.Controllers.GetHumanoidState(character, humanoid)
+    local airborne = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+    local floor = M.Grounding.GetStandingY(humanoid, root)
+    if not finite(floor) then floor = cf.Position.Y end
+    local body = { cf = cf, velocity = velocity, horizontal = flat(velocity),
+        floor = floor, airborne = airborne, gravity = math.max(0, f.gravity) }
+    local landing = airborne and holdLandingTime({ receiveAirborne = true,
+        rootCF = cf, velocity = velocity, floorY = floor, gravity = body.gravity }) or 0
+    -- Match Receiving.GetReceiveHitbox, including the transition at landing.
+    -- Use its exact oval, without inflating proximity into a predicted touch.
+    local groundBox = M.Hitboxes.ExtendToFeet(M.Hitboxes.Receive, humanoid, root)
+    local airBox = airborne and M.Hitboxes.ExtendToFeet(M.Hitboxes.AirReceive, humanoid, root) or nil
+    local initialBox = airBox or groundBox
+    actor = actor or M.Actors.GetFromCharacter(character)
+    local kicker = actor and finite(actor.UserId) and actor.UserId == f.lastKickerUserId
+    local leavingKicker = kicker and M.Hitboxes.ContainsPoint({ CFrame = cf }, initialBox, points[1].p)
+
+    -- Reject distant bodies before running native swept-oval intersection.
+    local reach = initialBox.Size.Magnitude * 0.5 + initialBox.CFrameOffset.Position.Magnitude
+    local endRoot = KeeperTiming.RootAt(body, limit).Position
+    local lowX, highX = math.min(cf.Position.X, endRoot.X) - reach, math.max(cf.Position.X, endRoot.X) + reach
+    local lowZ, highZ = math.min(cf.Position.Z, endRoot.Z) - reach, math.max(cf.Position.Z, endRoot.Z) + reach
+    local possible = false
+    for i = 2, #points do
+        local a, b = points[i - 1], points[i]
+        if a.t >= limit then break end
+        if math.max(a.p.X, b.p.X) >= lowX and math.min(a.p.X, b.p.X) <= highX
+            and math.max(a.p.Z, b.p.Z) >= lowZ and math.min(a.p.Z, b.p.Z) <= highZ then
+            possible = true; break
+        end
+    end
+    if not possible then return nil end
+
+    for i = 2, #points do
+        local left, right = points[i - 1], points[i]
+        if left.t >= limit then break end
+        local start, stop = left.t, math.min(limit, right.t)
+        while start < stop do
+            local inAir = airBox ~= nil and start < landing
+            local finish = inAir and math.min(stop, landing) or stop
+            local box = inAir and airBox or groundBox
+            local width = right.t - left.t
+            local a = left.p:Lerp(right.p, (start - left.t) / width)
+            local b = left.p:Lerp(right.p, (finish - left.t) / width)
+            local r0, r1 = KeeperTiming.RootAt(body, start), KeeperTiming.RootAt(body, finish)
+            if leavingKicker then
+                -- The ball leaving its shooter is not a future reception.
+                -- A later re-entry after it leaves the oval is still checked.
+                leavingKicker = M.Hitboxes.ContainsPoint({ CFrame = r1 }, box, b)
+            else
+                local alpha = M.Hitboxes.GetSegmentEnterAlpha({ CFrame = r1 }, box,
+                    a + r1.Position - r0.Position, b)
+                if finite(alpha) and alpha >= 0 and alpha <= 1 then
+                    local time = start + (finish - start) * alpha
+                    if time < limit and (not inAir or time < landing) then
+                        return { character = character, time = time }
+                    end
+                end
+            end
+            start = finish
+        end
+    end
+    return nil
+end
+
+function KeeperTiming.FindContact(f, plan, points)
+    local limit = math.min(KeeperTiming.ForecastSeconds,
+        plan.contact.time - KeeperTiming.ContactOrderMarginSeconds,
+        f.eta - Config.GoalMarginSeconds)
+    if limit <= 0 or M.Motion.GetContext(f.character) == nil then return nil end
+    local seen, best = {}, nil
+    local function add(character, actor)
+        if not character or character == f.character or seen[character] then return end
+        seen[character] = true
+        -- A missing/incompatible opponent rig cannot disable goalkeeper saves.
+        local ok, hit = pcall(KeeperTiming.PlayerContact, f, character, actor, points,
+            best and math.min(limit, best.time) or limit)
+        if ok and hit then best = hit
+        elseif not ok then
+            S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
+            S.keeperTimingError = tostring(hit)
+        end
+    end
+    for _, player in ipairs(Players:GetPlayers()) do add(player.Character, player) end
+    local characters = workspace:FindFirstChild("Characters")
+    local function addChildren(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Model") then add(child) end
+        end
+    end
+    addChildren(characters)
+    addChildren(characters and characters:FindFirstChild("Players"))
+    addChildren(characters and characters:FindFirstChild("NPCs"))
+    return best
+end
+
+function KeeperTiming.SameWindow(f, window)
+    return window and window.character == f.character and window.root == f.root
+        and window.ballId == f.ballId and window.flightKey == f.flightKey and window.world == f.world
+        and window.goal == f.context.goal and window.team == f.context.team
+        and sameTrajectory(window.trajectory, f.sourceTrajectory)
+end
+
+function KeeperTiming.Refine(f, immediate, points)
+    if not KeeperTiming.SameWindow(f, S.keeperWait) then S.keeperWait = nil end
+    S.keeperContact = nil
+    if not immediate or immediate.kind ~= "DIVE" or immediate.delay ~= 0 then return immediate end
+    local reserve = KeeperTiming.LaunchReserveSeconds
+    local clock = math.max(f.readClock, os.clock())
+    if f.eta <= KeeperTiming.UrgentGoalSeconds or immediate.contact.time <= reserve
+        or (S.keeperWait and clock >= S.keeperWait.deadline - KeeperTiming.MinimumWaitSeconds) then
+        return immediate
+    end
+    local hit = KeeperTiming.FindContact(f, immediate, points)
+    S.keeperContact = hit
+    if not hit then return immediate end
+
+    -- Compare actual native contact paths. Do not infer that reachability is
+    -- monotonic: curves and airborne contacts can have separate valid windows.
+    local latest, candidates = nil, {}
+    local minimumClearance = math.min(0.12, immediate.contact.clearance)
+    for _, delay in ipairs(KeeperTiming.Delays) do
+        if delay < f.eta - Config.GoalMarginSeconds - reserve then
+            S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
+            local candidate = evaluateDive(f, "DIVE", delay, immediate.name, points)
+            if candidate and candidate.contact.clearance >= minimumClearance then
+                candidates[#candidates + 1] = candidate
+                latest = candidate
+            end
+        end
+    end
+    if not latest then return immediate end
+    local safeDelay = latest.delay - reserve
+    if S.keeperWait then safeDelay = math.min(safeDelay, S.keeperWait.deadline - f.readClock) end
+    if safeDelay <= KeeperTiming.MinimumWaitSeconds or safeDelay <= clock - f.readClock then return immediate end
+
+    -- Validate the reserved launch itself; an earlier launch is not necessarily
+    -- valid just because a later launch was. Fall back to another verified path.
+    S.delayedPlansChecked = (S.delayedPlansChecked or 0) + 1
+    local selected = evaluateDive(f, "DIVE", safeDelay, immediate.name, points)
+    if not selected or selected.contact.clearance < minimumClearance then
+        selected = nil
+        for i = #candidates, 1, -1 do
+            if candidates[i].delay <= safeDelay + 0.000001 then selected = candidates[i]; break end
+        end
+    end
+    if not selected or selected.delay <= KeeperTiming.MinimumWaitSeconds
+        or selected.delay <= clock - f.readClock then return immediate end
+
+    local deadline = f.readClock + selected.delay
+    if deadline <= os.clock() + KeeperTiming.MinimumWaitSeconds then return immediate end
+    if not S.keeperWait then
+        S.keeperWait = { character = f.character, root = f.root, ballId = f.ballId,
+            flightKey = f.flightKey, world = f.world, goal = f.context.goal, team = f.context.team,
+            trajectory = f.sourceTrajectory, deadline = deadline }
+        S.keeperWaits = (S.keeperWaits or 0) + 1
+    else
+        -- The deadline may tighten, but never slides later on repeated samples.
+        S.keeperWait.deadline = math.min(S.keeperWait.deadline, deadline)
+    end
+    selected.waitForContact = true
+    return selected
+end
+
+function KeeperTiming.Protect(f, plan, points)
+    local ok, result = pcall(KeeperTiming.Refine, f, plan, points)
+    if ok then return result end
+    S.keeperTimingErrors = (S.keeperTimingErrors or 0) + 1
+    S.keeperTimingError = tostring(result)
+    return plan
+end
+
 local function planSave(f)
     local began = os.clock()
 
@@ -2105,7 +2701,7 @@ local function planSave(f)
     end
 
     if #candidates > 0 then
-        return finish(choosePlan(candidates))
+        return finish(KeeperTiming.Protect(f, choosePlan(candidates), points))
     end
 
     local possible = {}
@@ -2772,6 +3368,22 @@ local function requestDive(f, plan)
         return false
     end
 
+    commit.contact = hit
+    local timed = KeeperTiming.Protect(fresh, commit, flight)
+    if timed.delay > 0 then
+        S.lastFrame = fresh
+        trackPlanWindow(fresh, timed)
+        S.nextPlanAt = plannerDeadline(fresh)
+        S.allowPositioning = true
+        status("TIMING DIVE " .. timed.name, "Rechecking receiver/blocker before committing")
+        return false
+    end
+    if os.clock() - fresh.readClock > 0.09 then
+        S.nextPlanAt = 0
+        status("REPLAN", "Final contact sample expired")
+        return false
+    end
+
     local exclusions = { fresh.character }
     local renderedBall = M.Renderer.GetBall()
 
@@ -3322,6 +3934,15 @@ connect(StateRemote.OnClientEvent, function(payload)
 
         if payload.BallId == M.Renderer.GetMatchBallId() then
             S.nextPlanAt = 0
+            local revision = payload.Kind == "Movement" and trajectoryStamp(payload.State) or nil
+            local identified = revision and (revision.movementSequence ~= nil
+                or revision.actionId ~= nil or revision.flightStartedAt ~= nil)
+            -- A rebased copy of the same server trajectory may wake the planner,
+            -- but must not restart its absolute launch deadline.
+            if not (identified and S.keeperWait and sameTrajectory(S.keeperWait.trajectory, revision)) then
+                S.keeperWait = nil
+                S.keeperContact = nil
+            end
         end
 
         return
@@ -6552,9 +7173,13 @@ local function createStrikerMisc(d)
     local ownershipHook, nativeOwner = nil, nil
     local queuedScan, requestScan = nil, nil
     local nextPingSample, networkLead = 0, 0
-    local staminaHeartbeat, guardHook, correctionPending = nil, nil, nil
+    local guardHook = nil
     local placementHook = nil
-    local nextStaminaRetry = 0
+    -- Separate test edition: this setting is runtime-only and is not saved in configs.
+    local correctionExperiment = true
+    local lastSkippedCorrection = nil
+    local lastOwnedCorrection = nil
+    local repairsAllowedBy = {}
     local nextTick, nextDiscovery, manualUntil, retryAt = 0, 0, 0, 0
     local candidates, cachedCharacter = {}, nil
     local staminaSource = "DmcStamina_" .. d.id
@@ -6562,7 +7187,7 @@ local function createStrikerMisc(d)
     local stats = { scans = 0, threats = 0, proximityTriggers = 0, tackleTriggers = 0, kickTriggers = 0,
         attempts = 0, started = 0, nativeBlocked = 0, localCorrections = 0,
         staminaAutoOff = 0, positionRepairs = 0, staminaBudgetResets = 0,
-        observerErrors = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
+        observerErrors = 0, positionRepairsSkipped = 0, teleportRepairsSkipped = 0, ownedRepairsApplied = 0, errors = 0, maxTickMs = 0, readyTicks = 0, blockedTicks = 0,
         motionAligned = 0, kickStateWithoutPresentation = 0, earlyAttackSamples = 0,
         pickupReadinessWakes = 0, pickupInputResets = 0 }
     local recent = {}
@@ -6613,7 +7238,6 @@ local function createStrikerMisc(d)
         nextDiscovery = 0
     end
     local function stopStaminaWatch()
-        if staminaHeartbeat then staminaHeartbeat:Disconnect(); staminaHeartbeat = nil end
         if guardHook then
             guardHook.active = false
             -- A later wrapper belongs to its installer; leave our inner observer passive.
@@ -6625,23 +7249,75 @@ local function createStrikerMisc(d)
             if N.Placement.RepairPosition == placementHook.observer then
                 N.Placement.RepairPosition = placementHook.original
             end
+            if N.Placement.TryRepairOwnedPosition == placementHook.ownedObserver then
+                N.Placement.TryRepairOwnedPosition = placementHook.originalOwned
+            end
             placementHook = nil
         end
-        correctionPending = nil
     end
     local function noteCorrection(correction)
         lastCorrection = correction
-        if not correctionPending then correctionPending = correction end
-        A.StaminaStatus = "CORRECTION DETECTED"
+        -- Corrections are observations, not requests to change the user's switch.
+        -- The native guard/placement functions still apply their normal repairs.
+        A.StaminaStatus = "LOCAL ON"
+    end
+    local function correctionCaller()
+        local trace = {}
+        if type(debug) ~= "table" or type(debug.info) ~= "function" then return nil, trace end
+        -- Inspect only known controllers, allowing existing diagnostic wrappers.
+        for level = 2, 16 do
+            local source, line = debug.info(level, "sl")
+            if not source then break end
+            if #trace < 8 then table.insert(trace, string.sub(source, 1, 180) .. ":" .. tostring(line)) end
+            for _, entry in ipairs({
+                { "ReplicatedStorage.Client.Player.CharacterReplication", "replication" },
+                { "ReplicatedStorage.Client.Player.CharacterTeleport", "teleport_repair" },
+            }) do
+                local name = entry[1]
+                if source == name or source == "@" .. name or source == "=" .. name
+                    or source == '[string "' .. name .. '"]' then return source, trace, entry[2] end
+            end
+        end
+        return nil, trace
+    end
+    local function verifiedTeleportRepair(character, target)
+        local state = N.TeleportState
+        local pending = type(state) == "table" and state.PendingPlacement or nil
+        if type(pending) ~= "table" or pending.IsRepair ~= true
+            or pending.IsLobbyDestination or pending.Character ~= character
+            or typeof(pending.CFrame) ~= "CFrame"
+            or not finite(pending.Revision) or pending.Revision <= 0
+            or pending.Revision ~= state.ReceivedPlacementRevision
+            or pending.Epoch ~= state.TeleportEpoch then return nil end
+        local destination = pending.CFrame.Position
+        if not vector(destination) or (destination - target).Magnitude > 0.0001 then return nil end
+        return pending
     end
     local function startPlacementWatch()
-        local hook = { original = N.Placement.RepairPosition, active = true }
+        local hook = { original = N.Placement.RepairPosition,
+            originalOwned = N.Placement.TryRepairOwnedPosition, active = true }
         local function capture(character, root, target)
             if not (hook.active and alive and d.alive() and A.InfiniteStamina)
                 or character ~= d.Player.Character or not root or not vector(target)
                 or d.M.Replay.IsActive() or d.M.Freeze.IsFrozen() then return nil end
+            local caller, trace, route = correctionCaller()
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local pending = route == "teleport_repair" and verifiedTeleportRepair(character, target) or nil
+            local reason = "eligible"
+            if not correctionExperiment then reason = "experiment_off"
+            elseif d.M.Motion.GetContext(character) ~= "Match" then reason = "outside_match"
+            elseif root ~= character:FindFirstChild("HumanoidRootPart") then reason = "different_root"
+            elseif not humanoid or humanoid.Health <= 0 then reason = "dead_or_missing_humanoid"
+            elseif d.M.Match.IsGoalkeeperCharacter(character) then reason = "goalkeeper_role"
+            elseif not caller then reason = "unmatched_caller"
+            elseif route == "teleport_repair" and not pending then reason = "unverified_teleport_repair" end
             return { position = root.Position, velocity = root.AssemblyLinearVelocity,
-                context = d.M.Motion.GetContext(character) }
+                context = d.M.Motion.GetContext(character), caller = caller, callerTrace = trace,
+                route = route, pendingPlacement = pending, placementEpoch = pending and pending.Epoch or nil,
+                placementRevision = pending and pending.Revision or nil,
+                reason = reason, health = humanoid and humanoid.Health or nil,
+                ragdolled = d.M.Ragdoll and type(d.M.Ragdoll.IsEnabled) == "function"
+                    and d.M.Ragdoll.IsEnabled(character) or false }
         end
         local function observe(sample, target, result)
             if not sample or result[2] ~= true then return end
@@ -6650,18 +7326,58 @@ local function createStrikerMisc(d)
             local horizontal = flat(delta)
             if horizontal.Magnitude <= 0.5 then return end
             local velocity = flat(sample.velocity)
-            -- Ignore forward/lateral repairs while moving and vertical floor recovery.
-            -- The native placement API alone does not prove why the repair was issued.
             if velocity.Magnitude >= 1 and horizontal:Dot(velocity.Unit) >= -0.5 then return end
             stats.positionRepairs += 1
+            repairsAllowedBy[sample.reason] = (repairsAllowedBy[sample.reason] or 0) + 1
             noteCorrection({ clock = os.clock(), context = sample.context, positionChange = delta.Magnitude,
-                horizontalChange = horizontal.Magnitude, source = "CharacterPlacement.RepairPosition",
-                staminaWasOn = true, serverConfirmed = false, offStatus = "OFF: POSITION REPAIR" })
+                horizontalChange = horizontal.Magnitude, verticalChange = delta.Y,
+                source = "CharacterPlacement.RepairPosition", caller = sample.caller,
+                callerTrace = sample.callerTrace, reason = sample.reason, route = sample.route,
+                health = sample.health, ragdolled = sample.ragdolled, applied = true,
+                staminaWasOn = true, serverConfirmed = false })
+        end
+        hook.ownedObserver = function(character, target, ...)
+            local root = character == d.Player.Character and character:FindFirstChild("HumanoidRootPart") or nil
+            local captured, sample = pcall(capture, character, root, target)
+            if not captured then stats.observerErrors += 1; sample = nil end
+            -- Always preserve native owned/replay/repair-controller handling first.
+            local result = table.pack(hook.originalOwned(character, target, ...))
+            if sample and sample.caller and result[1] and result[2] == true then
+                stats.ownedRepairsApplied += 1
+                lastOwnedCorrection = { clock = os.clock(), context = sample.context,
+                    positionChange = (target - sample.position).Magnitude,
+                    source = "CharacterPlacement.TryRepairOwnedPosition", caller = sample.caller,
+                    route = sample.route, applied = true, reason = "native_owned_repair", serverConfirmed = false }
+            end
+            local stillPending = true
+            if sample and sample.reason == "eligible" and sample.route == "teleport_repair" then
+                local checked, pending = pcall(verifiedTeleportRepair, character, target)
+                if not checked then stats.observerErrors += 1 end
+                stillPending = checked and pending == sample.pendingPlacement
+            end
+            if sample and sample.reason == "eligible" and stillPending and not result[1]
+                and hook.active and alive and d.alive() and A.InfiniteStamina and correctionExperiment
+                and character == d.Player.Character then
+                local delta = target - sample.position
+                stats.positionRepairsSkipped += 1
+                if sample.route == "teleport_repair" then stats.teleportRepairsSkipped += 1 end
+                lastSkippedCorrection = { clock = os.clock(), context = sample.context,
+                    positionChange = delta.Magnitude, horizontalChange = flat(delta).Magnitude,
+                    source = "CharacterPlacement.TryRepairOwnedPosition", caller = sample.caller,
+                    route = sample.route, placementEpoch = sample.placementEpoch,
+                    placementRevision = sample.placementRevision,
+                    skipped = true, applied = false, staminaWasOn = true, serverConfirmed = false }
+                -- Replication cancels its pending smoothing. RepairPosition returns
+                -- target,false; CharacterTeleport's existing IsRepair branch then clears
+                -- this pending repair and exits without a camera snap or an applied ack.
+                -- SnapToCFrame, teleport revisions and all remotes stay native.
+                return true, false, target
+            end
+            return table.unpack(result, 1, result.n)
         end
         hook.observer = function(character, root, target, ...)
             local captured, sample = pcall(capture, character, root, target)
             if not captured then stats.observerErrors += 1; sample = nil end
-            -- Preserve the native repair, all return values, and native errors exactly.
             local result = table.pack(hook.original(character, root, target, ...))
             if sample then
                 local ok = pcall(observe, sample, target, result)
@@ -6670,35 +7386,13 @@ local function createStrikerMisc(d)
             return table.unpack(result, 1, result.n)
         end
         placementHook = hook
+        N.Placement.TryRepairOwnedPosition = hook.ownedObserver
         N.Placement.RepairPosition = hook.observer
-    end
-    local function recoverStamina(correction)
-        -- Remove our local source before spending; otherwise native SpendStamina returns true, 0.
-        if staminaOwned then
-            N.Sprint.SetUnlimitedStamina(staminaSource, false)
-            staminaOwned = false
-        end
-        A.InfiniteStamina = false
-        if not correction.budgetReset then
-            local before = N.Sprint.GetStamina()
-            local multiplier = N.StaminaRules.GetStaminaMultiplier()
-            assert(finite(before) and finite(multiplier), "Native stamina recovery data unavailable")
-            if before > 0 then
-                -- The server's actual budget is unknown. Empty the artificially refilled local
-                -- budget conservatively, then let native recovery handle stamina and walk speed.
-                -- Game-owned unlimited sources/boosts still take priority inside SpendStamina.
-                N.Sprint.SpendStamina(before * math.max(1, multiplier), true)
-            end
-            local after = N.Sprint.GetStamina()
-            correction.staminaBeforeReset, correction.staminaAfterReset = before, after
-            correction.budgetReset = true
-            if finite(after) and after < before then stats.staminaBudgetResets += 1 end
-        end
-        return A.SetInfiniteStamina(false)
     end
     local function startStaminaWatch()
         assert(type(N.Guard.Validate) == "function", "Movement correction observer unavailable")
         assert(type(N.Placement.RepairPosition) == "function", "Position repair observer unavailable")
+        assert(type(N.Placement.TryRepairOwnedPosition) == "function", "Owned position repair observer unavailable")
         if guardHook then
             assert(guardHook.active, "Previous movement observer cleanup is incomplete")
             return
@@ -6724,7 +7418,6 @@ local function createStrikerMisc(d)
                 local ok = pcall(noteRejected, root, claimedPosition, claimedVelocity)
                 if not ok then
                     stats.observerErrors += 1
-                    correctionPending = correctionPending or { source = "LocalMovementGuard.Validate", detail = "diagnostic unavailable" }
                 end
             end
             return result
@@ -6732,23 +7425,7 @@ local function createStrikerMisc(d)
         guardHook = hook
         N.Guard.Validate = hook.observer
         startPlacementWatch()
-        staminaHeartbeat = d.Run.Heartbeat:Connect(function()
-            if not (alive and d.alive() and correctionPending) or os.clock() < nextStaminaRetry then return end
-            nextStaminaRetry = os.clock() + 1
-            -- Apply the native switch outside Validate, after its physics correction.
-            local correction = correctionPending
-            local ok, stopped = pcall(recoverStamina, correction)
-            if ok and stopped then
-                stats.staminaAutoOff += 1
-                lastCorrection = correction
-                A.StaminaStatus = correction.offStatus or "OFF: LOCAL CORRECTION"
-            else
-                -- Keep the pending shutdown and observer until native release succeeds.
-                correctionPending = correction
-                A.StaminaStatus = "CLEANUP REQUIRED"
-                if not ok then stats.observerErrors += 1 end
-            end
-        end)
+        -- No automatic shutoff, stamina drain, or correction retry loop.
     end
     local function stopDribbleWatch(err)
         A.AutoDribble = false
@@ -7442,9 +8119,13 @@ local function createStrikerMisc(d)
             watchPickupReadiness()
             watchCharacters()
             watchAttacks()
-            inputConnection = d.Input.InputBegan:Connect(function(input)
+            inputConnection = d.Input.InputBegan:Connect(function(input, processed)
                 if not A.AutoDribble then return end
                 local checked, inputError = pcall(function()
+                    -- A GUI click can share the Kick binding without starting
+                    -- a native strike. Do not give it a manual-action grace.
+                    if N.Input.ShouldIgnoreKeybind(processed)
+                        or (d.ignoreManualInput and d.ignoreManualInput(input)) then return end
                     for _, name in ipairs({ "Kick", "Pass", "Lob", "RainbowFlick", "Dribble", "Tackle", "Jump" }) do
                         if N.Controls.IsInput(name, input) then
                             manualUntil = os.clock() + C.ManualGrace
@@ -7469,6 +8150,11 @@ local function createStrikerMisc(d)
         if not connected then stopDribbleWatch(connectionError); return false end
         return true
     end
+    function A.SetCorrectionExperiment(value)
+        if not alive or not d.alive() then return false end
+        correctionExperiment = value == true
+        return true
+    end
     function A.SetInfiniteStamina(value)
         value = value == true
         staminaGeneration += 1
@@ -7489,9 +8175,15 @@ local function createStrikerMisc(d)
             if value and not N.Guard then N.Guard = d.load("Modules.Characters.LocalMovementGuard") end
             if value then
                 N.Placement = N.Placement or d.load("Modules.Characters.CharacterPlacement")
-                N.StaminaRules = N.StaminaRules or d.load("Modules.Actions.Sprint")
-                assert(type(N.Sprint.GetStamina) == "function" and type(N.Sprint.SpendStamina) == "function"
-                    and type(N.StaminaRules.GetStaminaMultiplier) == "function", "Native stamina recovery unavailable")
+                if not N.TeleportState then
+                    -- Optional inspection; failure preserves every teleport repair.
+                    local inspected, state = pcall(function()
+                        local context = d.load("Modules.ContextState")
+                        assert(type(context.Get) == "function", "Teleport state inspection unavailable")
+                        return context.Get("CharacterTeleportClient")
+                    end)
+                    if inspected and type(state) == "table" then N.TeleportState = state end
+                end
             end
             if value and (request ~= staminaGeneration or not alive or not d.alive()) then return end
             if value then startStaminaWatch() end
@@ -7516,7 +8208,6 @@ local function createStrikerMisc(d)
         end
         if value and (request ~= staminaGeneration or not alive or not d.alive()) then return false end
         A.InfiniteStamina = value
-        if value then correctionPending, nextStaminaRetry = nil, 0 end
         A.StaminaStatus = value and "LOCAL ON" or "OFF"
         return true
     end
@@ -7528,10 +8219,17 @@ local function createStrikerMisc(d)
     function A.Debug()
         return { autoDribble = A.AutoDribble, infiniteStamina = A.InfiniteStamina,
             dribbleStatus = A.DribbleStatus, staminaStatus = A.StaminaStatus,
-            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17",
+            staminaServerVerified = false, lastError = A.LastError, version = "Misc 0.17.5 TEST",
             dribbleTrigger = "incoming_tackle_or_kick", tackleLookaheadSeconds = C.Lookahead,
             kickLookaheadSeconds = C.KickLookahead,
-            correctionFallback = true, positionRepairFallback = true,
+            correctionFallback = false, positionRepairFallback = false,
+            correctionPolicy = correctionExperiment and "skip_verified_movement_repairs_test" or "observe_only",
+            correctionExperiment = correctionExperiment,
+            callerInspectionSupported = type(debug) == "table" and type(debug.info) == "function",
+            lastSkippedCorrection = lastSkippedCorrection and table.clone(lastSkippedCorrection) or nil,
+            teleportRepairInspectionSupported = type(N.TeleportState) == "table",
+            repairsAllowedBy = table.clone(repairsAllowedBy),
+            lastOwnedCorrection = lastOwnedCorrection and table.clone(lastOwnedCorrection) or nil,
             lastCorrection = lastCorrection and table.clone(lastCorrection) or nil,
             inputMode = N.Input and type(N.Input.GetLastInputType) == "function" and N.Input.GetLastInputType() or nil,
             cooldownRemaining = N.Controls and type(N.Controls.GetCooldownRemaining) == "function"
@@ -8135,9 +8833,38 @@ local MISC = createStrikerMisc({
     Run = RunService, Gui = game:GetService("GuiService"), load = module,
     id = game:GetService("HttpService"):GenerateGUID(false),
     alive = function() return S.alive end,
-    suspended = function() return S.uiBusy or not S.focused end, evaluation = EVALUATION,
+    -- Visual UI interactions do not suspend the defensive threat watcher.
+    -- Native text/chat, menu, strike and recovery gates still apply.
+    suspended = function() return not S.focused end, evaluation = EVALUATION,
+    ignoreManualInput = function(input) return S.isUIInput and S.isUIInput(input) or false end,
     AttackRemotes = evaluationRemotes,
 })
+-- Auto sprint owns only the game's native button toggle.
+do
+    local sprint = createAutoSprint({
+        Player = LocalPlayer, Input = UserInputService, Run = RunService,
+        Gui = game:GetService("GuiService"), load = module,
+        alive = function() return S.alive end,
+        suspended = function() return S.uiBusy or not S.focused end,
+        changed = function(state) MISC.AutoSprint, MISC.SprintStatus = state.AutoSprint, state.Status end,
+    })
+    MISC.AutoSprint, MISC.SprintStatus = false, "OFF"
+    MISC.SetAutoSprint = sprint.SetAutoSprint
+    local originalCleanup, originalDebug = MISC.Cleanup, MISC.Debug
+    MISC.Cleanup = function()
+        local sprintCalled, sprintResult = pcall(sprint.Cleanup)
+        local miscCalled, miscResult, miscDetail = pcall(originalCleanup)
+        if not sprintCalled or sprintResult == false then return false, "Auto sprint could not be released" end
+        if not miscCalled then return false, tostring(miscResult) end
+        return miscResult, miscDetail
+    end
+    MISC.Debug = function()
+        local result = originalDebug()
+        result.autoSprint, result.sprintStatus, result.sprint = MISC.AutoSprint, MISC.SprintStatus, sprint.Debug()
+        return result
+    end
+end
+
 S.releaseMisc = MISC.Cleanup
 EVALUATION.ConfigureComparison(MISC.ObserveDribbleGate, function()
     return { bestShot = STR.Enabled, autoCurve = STR.AutoCurve, smartRelease = STR.SmartRelease,
@@ -8185,16 +8912,53 @@ do
         hover = Color3.fromRGB(39, 37, 30),
         pressed = Color3.fromRGB(53, 47, 32),
         stroke = Color3.fromRGB(49, 47, 39),
-        text = Color3.fromRGB(233, 231, 220),
-        muted = Color3.fromRGB(145, 144, 131),
+        text = Color3.fromRGB(242, 243, 240),
+        muted = Color3.fromRGB(178, 181, 175),
         accent = Color3.fromRGB(222, 193, 115),
         accentDim = Color3.fromRGB(131, 111, 61),
         active = Color3.fromRGB(43, 39, 27),
     }
 
+    local readableFont = Font.new(Font.fromEnum(Enum.Font.Nunito).Family, Enum.FontWeight.SemiBold, Enum.FontStyle.Normal)
+    local themeBindings = {}
+    local function trackTheme(object, properties)
+        local bindings = themeBindings[object] or {}
+        for _, property in ipairs({ "BackgroundColor3", "TextColor3", "PlaceholderColor3", "Color", "ScrollBarImageColor3" }) do
+            local value = properties[property]
+            if value ~= nil then
+                bindings[property] = nil
+                for key, color in pairs(C) do
+                    if value == color then bindings[property] = key; break end
+                end
+            end
+        end
+        themeBindings[object] = bindings
+    end
+    local function setThemed(object, property, value)
+        trackTheme(object, { [property] = value })
+        object[property] = value
+    end
+    local function setPalette(hex)
+        local r, g, b = tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16)
+        C.accent = Color3.fromRGB(r, g, b)
+        if hex == "DEC173" then
+            C.accentDim, C.active = Color3.fromRGB(131, 111, 61), Color3.fromRGB(43, 39, 27)
+            C.hover, C.pressed, C.stroke = Color3.fromRGB(39, 37, 30), Color3.fromRGB(53, 47, 32), Color3.fromRGB(49, 47, 39)
+        else
+            local function blend(base, weight)
+                return Color3.fromRGB(math.floor(base + (r - base) * weight + 0.5),
+                    math.floor(base + (g - base) * weight + 0.5), math.floor(base + (b - base) * weight + 0.5))
+            end
+            C.accentDim, C.active = blend(16, 0.55), blend(16, 0.13)
+            C.hover, C.pressed, C.stroke = blend(24, 0.08), blend(24, 0.16), blend(35, 0.09)
+        end
+    end
+
     local function create(class, properties, parent)
         local object = Instance.new(class)
         for key, value in pairs(properties) do object[key] = value end
+        if properties.Font == Enum.Font.Nunito then object.FontFace = readableFont end
+        trackTheme(object, properties)
         object.Parent = parent
         return object
     end
@@ -8222,7 +8986,7 @@ do
 
     local function text(parent, value, size, properties)
         local p = {
-            Text = value, TextSize = size, Font = Enum.Font.Gotham,
+            Text = value, TextSize = math.max(13, size + 3), Font = Enum.Font.Nunito,
             TextColor3 = C.text, BackgroundTransparency = 1,
             TextXAlignment = Enum.TextXAlignment.Left,
             BorderSizePixel = 0,
@@ -8233,13 +8997,27 @@ do
 
     local function button(parent, properties)
         local p = {
-            Text = "", TextSize = 12, Font = Enum.Font.GothamMedium,
+            Text = "", TextSize = 14, Font = Enum.Font.FredokaOne,
             TextColor3 = C.text, BackgroundColor3 = C.control,
             BorderSizePixel = 0, AutoButtonColor = false,
             Modal = false, Selectable = true,
         }
         for key, value in pairs(properties) do p[key] = value end
         return round(create("TextButton", p, parent), 5)
+    end
+
+    local function chevron(parent, name, x, y)
+        local icon = frame(parent, name, x, y, 14, 14)
+        icon.BackgroundTransparency, icon.Visible = 1, true
+        icon.ZIndex = parent.ZIndex + 1
+        local white = Color3.fromRGB(255, 255, 255)
+        local left = round(frame(icon, "Left", 1, 6, 8, 3, white), 2)
+        local right = round(frame(icon, "Right", 6, 6, 8, 3, white), 2)
+        left.Rotation, right.Rotation = 45, -45
+        left.ZIndex, right.ZIndex = icon.ZIndex + 1, icon.ZIndex + 1
+        left.BackgroundTransparency, right.BackgroundTransparency = 0, 0
+        themeBindings[left].BackgroundColor3, themeBindings[right].BackgroundColor3 = nil, nil
+        return icon
     end
 
     local Gui = create("ScreenGui", {
@@ -8264,7 +9042,7 @@ do
     header.Active = true
     text(header, "Dmc", 13, {
         Name = "PageTitle", Size = UDim2.fromScale(1, 1),
-        Font = Enum.Font.GothamBold,
+        Font = Enum.Font.FredokaOne,
     })
     local minimize = button(panel, {
         Name = "Minimize", Text = "-", TextSize = 18,
@@ -8277,7 +9055,7 @@ do
     local tabBar = frame(panel, "Tabs", 12, 44, 292, 26)
     tabBar.BackgroundTransparency = 1
     -- STR is independent of the goalkeeper automation toggle.
-    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 458)
+    local strikerContent = frame(panel, "STRContent", 12, 76, 292, 403)
     strikerContent.BackgroundTransparency = 1
     strikerContent.Visible = false
     local live = round(frame(panel, "LiveStatus", 12, 76, 292, 28, C.surface), 5)
@@ -8301,12 +9079,31 @@ do
     local refreshers = {}
     local animations = {}
     local animationEnds = {}
+    local animationGoals = {}
     local dropdowns = {}
     local expanded = nil
     local dragging = false
     local rangeInput = nil
     local minimized = false
     local activeTab = "GK"
+    local settingsBusy = false
+    local editingField = nil
+    local colorPickerOpen = false
+    local closeColorPicker: (() -> ())? = nil
+    -- Hit-test the current visible panel rather than hover state: the global
+    -- InputBegan observer may run before a control's own callback.
+    S.isUIInput = function(input)
+        if not S.alive or not Gui.Parent or not Gui.Enabled or not panel.Visible then return false end
+        local kind = input.UserInputType
+        if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.MouseButton2
+            and kind ~= Enum.UserInputType.MouseButton3 and kind ~= Enum.UserInputType.Touch then return false end
+        local point, position, size = input.Position, panel.AbsolutePosition, panel.AbsoluteSize
+        return point.X >= position.X and point.X < position.X + size.X
+            and point.Y >= position.Y and point.Y < position.Y + size.Y
+    end
+    local function updateUIBusy()
+        S.uiBusy = dragging or rangeInput ~= nil or expanded ~= nil or settingsBusy or editingField ~= nil or colorPickerOpen
+    end
     local activeBody = nil
     local order = 0
 
@@ -8315,10 +9112,12 @@ do
         animationEnds[object] = nil
         if animations[object] then animations[object]:Cancel() end
         animations[object] = nil
+        animationGoals[object] = nil
     end
 
     local function animate(object, goals, immediate, duration, onComplete)
         cancelAnimation(object)
+        trackTheme(object, goals)
         if immediate then
             for k, v in pairs(goals) do object[k] = v end
             if onComplete then onComplete() end
@@ -8327,6 +9126,7 @@ do
         local tween = TweenService:Create(object,
             TweenInfo.new(duration or 0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goals)
         animations[object] = tween
+        animationGoals[object] = goals
         animationEnds[object] = tween.Completed:Connect(function(playbackState)
             -- Cancellation also fires Completed; only the current finished tween owns this callback.
             if animations[object] ~= tween then return end
@@ -8334,6 +9134,12 @@ do
             if connection then connection:Disconnect() end
             animationEnds[object] = nil
             animations[object] = nil
+            animationGoals[object] = nil
+            if playbackState == Enum.PlaybackState.Completed and S.alive then
+                for property, key in pairs(themeBindings[object] or {}) do
+                    if goals[property] ~= nil then object[property] = C[key] end
+                end
+            end
             if playbackState == Enum.PlaybackState.Completed and S.alive and onComplete then
                 onComplete()
             end
@@ -8398,7 +9204,14 @@ do
         elseif previous then
             previous.setOpen(false, false)
         end
-        S.uiBusy = dragging
+        if editingField then
+            local field = editingField
+            editingField = nil
+            field:ReleaseFocus()
+        end
+        local closePicker = closeColorPicker
+        if closePicker then closePicker() end
+        updateUIBusy()
     end
     S.closeDropdown = function() closeDropdown(true) end
 
@@ -8416,7 +9229,7 @@ do
         card.LayoutOrder = name == "AUTOMATION" and 1 or 2
         text(card, name, 9, {
             Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, 0, 0, 16),
-            Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+            Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
         })
         activeBody = frame(card, "Options", 0, 22, 0, 0)
         activeBody.Size = UDim2.new(1, 0, 0, 0)
@@ -8471,6 +9284,7 @@ do
         end)
         refresh(true)
         table.insert(refreshers, function() refresh(false) end)
+        return refresh
     end
 
     local function dropdown(label, choices, getter, setter)
@@ -8494,11 +9308,8 @@ do
             Name = "SelectedValue", Position = UDim2.fromOffset(12, 0),
             Size = UDim2.new(1, -45, 1, 0),
         })
-        local arrow = frame(selectButton, "Arrow", 0, 9, 12, 12)
-        arrow.Position = UDim2.new(1, -27, 0, 9)
-        arrow.BackgroundTransparency = 1
-        frame(arrow, "Left", 1, 5, 6, 2, C.accent).Rotation = 45
-        frame(arrow, "Right", 5, 5, 6, 2, C.accent).Rotation = -45
+        local arrow = chevron(selectButton, "Arrow", 0, 8)
+        arrow.Position = UDim2.new(1, -28, 0, 8)
         local menuHeight = #choices * 32 - 4
         local menu = frame(row, "Choices", 0, 38, 0, menuHeight)
         menu.Size = UDim2.new(1, 0, 0, menuHeight)
@@ -8514,6 +9325,7 @@ do
             if open then menu.Visible = true end
             for _, item in ipairs(items) do
                 item.button.Interactable = open
+                item.marker.Visible = getter() == item.value
                 if not open then item.reset() end
             end
             animate(arrow, { Rotation = open and 180 or 0 }, immediate, 0.18)
@@ -8526,16 +9338,17 @@ do
                 end)
         end
         table.insert(dropdowns, entry)
-        local previousValue = nil
+        local previousValue, selectionInitialized = nil, false
         local function refresh(immediate)
             local value = getter()
-            if value == previousValue then return end
-            previousValue = value
+            if selectionInitialized and value == previousValue then return end
+            previousValue, selectionInitialized = value, true
             for _, item in ipairs(items) do
                 local active = value == item.value
                 if active then selected.Text = item.label end
-                item.button.Text = (active and "  >  " or "      ") .. item.label
-                item.button.TextColor3 = active and C.accent or C.text
+                item.text.Text = item.label
+                item.marker.Visible = active
+                setThemed(item.text, "TextColor3", active and C.accent or C.text)
                 item.repaint(immediate)
             end
         end
@@ -8545,11 +9358,17 @@ do
                 Size = UDim2.new(1, 0, 0, 28), LayoutOrder = index,
                 Interactable = false,
             })
+            local optionText = text(option, choice.label, 11, {
+                Name = "Label", Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -44, 1, 0),
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            })
+            local marker = chevron(option, "SelectedChevron", 10, 7)
+            marker.Rotation = -90
             local repaint, reset = hover(option, function()
                 return getter() == choice.value and C.active or C.control
             end)
             table.insert(items, {
-                button = option, value = choice.value, label = choice.label,
+                button = option, text = optionText, marker = marker, value = choice.value, label = choice.label,
                 repaint = repaint, reset = reset,
             })
             connect(option.Activated, function()
@@ -8726,7 +9545,7 @@ do
     shootingSection.BackgroundTransparency = 1
     text(shootingSection, "SHOOTING", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
     activeBody = frame(shootingSection, "Options", 0, 22, 292, 157)
     activeBody.BackgroundTransparency = 1
@@ -8794,69 +9613,561 @@ do
             if rangeInput and (input == rangeInput or (rangeInput.UserInputType == Enum.UserInputType.MouseButton1
                 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
                 rangeInput = nil
-                S.uiBusy = dragging or expanded ~= nil
+                updateUIBusy()
             end
         end)
         drawRange()
         table.insert(refreshers, drawRange)
     end
-    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 89)
+    local miscellaneousSection = frame(strikerContent, "Miscellaneous", 0, 193, 292, 124)
     miscellaneousSection.BackgroundTransparency = 1
     text(miscellaneousSection, "MISCELLANEOUS", 9, {
         Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(292, 16),
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accentDim,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
     })
-    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 67)
+    activeBody = frame(miscellaneousSection, "Options", 0, 22, 292, 102)
     activeBody.BackgroundTransparency = 1
     create("UIListLayout", {
         Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder,
     }, activeBody)
     order = 0
     toggle("Auto dribble", function() return MISC.AutoDribble end, MISC.SetAutoDribble)
+    toggle("Auto sprint", function() return MISC.AutoSprint end, MISC.SetAutoSprint)
     toggle("Infinite stamina", function() return MISC.InfiniteStamina end, MISC.SetInfiniteStamina)
     local strikerStatus = text(strikerContent, "OFF", 11, {
-        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 292),
+        Name = "StrikerStatus", Position = UDim2.fromOffset(8, 327),
         Size = UDim2.fromOffset(276, 30), TextWrapped = true,
-        Font = Enum.Font.GothamMedium, TextColor3 = C.accent,
-    })
-    local strikerDetail = text(strikerContent, "", 10, {
-        Name = "StrikerDetail", Position = UDim2.fromOffset(8, 326),
-        Size = UDim2.fromOffset(276, 54), TextWrapped = true,
-        TextColor3 = C.muted,
+        Font = Enum.Font.FredokaOne, TextColor3 = C.accent,
     })
     local miscellaneousStatus = text(strikerContent, "", 9, {
-        Name = "MiscStatus", Position = UDim2.fromOffset(8, 383), Size = UDim2.fromOffset(276, 28),
-        TextWrapped = true, TextColor3 = C.accentDim,
-    })
-    text(strikerContent, "Shots: use range above. Hold for smart release.\nDribble: nearby opponents within 9 studs.", 10, {
-        Position = UDim2.fromOffset(8, 416), Size = UDim2.fromOffset(276, 32),
+        Name = "MiscStatus", Position = UDim2.fromOffset(8, 361), Size = UDim2.fromOffset(276, 28),
         TextWrapped = true, TextColor3 = C.muted,
     })
+
+    local fit
+    local settingsContent
+    do
+    settingsContent = create("ScrollingFrame", {
+        Name = "SettingsContent", Position = UDim2.fromOffset(12, 76),
+        Size = UDim2.fromOffset(292, 296), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ClipsDescendants = true, Visible = false,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        ScrollBarThickness = 2, ScrollBarImageColor3 = C.accentDim,
+        CanvasSize = UDim2.fromOffset(0, 335),
+    }, panel)
+    -- The saved accent stays static; only the displayed palette cycles.
+    local currentAccent = SettingsStore.Accent
+    local rainbowUI = SettingsStore.RainbowUI == true
+    local rainbowHue, rainbowElapsed = 0, 0
+    local refreshColorUI, refreshRainbowToggle
+    local cyclingKeys = { accent = true, accentDim = true, active = true,
+        hover = true, pressed = true, stroke = true }
+    local function rainbowAccent()
+        local color = Color3.fromHSV(rainbowHue, 0.68, 1)
+        return string.format("%02X%02X%02X", math.floor(color.R * 255 + 0.5),
+            math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+    end
+    local function repaintPalette(hex, settleColors)
+        setPalette(hex)
+        if settleColors then
+            -- Color-only hover tweens may end at an older hue. Size and arrow
+            -- animations keep running when the rainbow switch changes.
+            for object, goals in pairs(animationGoals) do
+                local bindings, colorOnly = themeBindings[object] or {}, true
+                for property in pairs(goals) do
+                    if not bindings[property] then colorOnly = false; break end
+                end
+                if colorOnly then cancelAnimation(object) end
+            end
+        end
+        for object, properties in pairs(themeBindings) do
+            if object.Parent then
+                local goals = animationGoals[object]
+                for property, key in pairs(properties) do
+                    if cyclingKeys[key] and not (goals and goals[property] ~= nil)
+                        and object[property] ~= C[key] then object[property] = C[key] end
+                end
+            end
+        end
+    end
+    local function setRainbowUI(value)
+        rainbowUI = value == true
+        rainbowElapsed = 0
+        repaintPalette(rainbowUI and not colorPickerOpen and rainbowAccent() or currentAccent, true)
+        if refreshRainbowToggle then refreshRainbowToggle(false) end
+    end
+    local function applyTheme(hex)
+        currentAccent = hex
+        for object, goals in pairs(animationGoals) do
+            for property, value in pairs(goals) do object[property] = value end
+        end
+        S.cancelUITweens()
+        repaintPalette(rainbowUI and not colorPickerOpen and rainbowAccent() or hex, false)
+        if refreshColorUI then refreshColorUI() end
+    end
+    applyTheme(currentAccent)
+    connect(RunService.Heartbeat, function(dt)
+        if not S.alive or not rainbowUI or not Gui.Parent or not Gui.Enabled
+            or minimized or S.focused == false or colorPickerOpen then return end
+        rainbowHue = (rainbowHue + dt / 12) % 1
+        rainbowElapsed += dt
+        if rainbowElapsed < 1 / 30 then return end
+        rainbowElapsed %= 1 / 30
+        repaintPalette(rainbowAccent(), false)
+    end)
+    local settingsController = createDmcSettingsController({
+        config = Config, striker = STR, misc = MISC,
+        gkEnabled = function() return ENV.AUTO_GK_ENABLED == true end,
+        setGK = toggleEnabled, validate = SettingsStore.Validate,
+        accent = function() return currentAccent end, theme = applyTheme,
+        rainbow = function() return rainbowUI end, setRainbow = setRainbowUI,
+        resetGoalkeeper = function() Rush.candidate = nil; invalidateFrame(true); S.nextPlanAt = 0 end,
+    })
+    local configCard = frame(settingsContent, "Configs", 0, 0, 288, 196)
+    configCard.BackgroundTransparency = 1
+    text(configCard, "CONFIGS", 9, {
+        Size = UDim2.fromOffset(288, 16), Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
+    })
+    local function field(parent, name, value, placeholder, x, y, w)
+        local box = round(create("TextBox", {
+            Name = name, Text = value, PlaceholderText = placeholder,
+            Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, 32),
+            TextSize = 14, Font = Enum.Font.Nunito, TextColor3 = C.text,
+            PlaceholderColor3 = C.muted, BackgroundColor3 = C.control,
+            BorderSizePixel = 0, ClearTextOnFocus = false, TextEditable = true,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, parent), 5)
+        create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }, box)
+        stroke(box)
+        connect(box.Focused, function()
+            if not S.alive then return end
+            editingField = box
+            updateUIBusy()
+        end)
+        connect(box.FocusLost, function()
+            if editingField == box then editingField = nil end
+            updateUIBusy()
+        end)
+        return box
+    end
+    local configName = field(configCard, "ConfigName", "", "New config name", 0, 22, 288)
+    text(configCard, "SAVED CONFIGS", 9, {
+        Name = "SavedConfigsHeading", Position = UDim2.fromOffset(0, 106), Size = UDim2.fromOffset(288, 16), TextColor3 = C.muted,
+    })
+    local function action(name, x)
+        local control = button(configCard, {
+            Name = name, Text = name, Position = UDim2.fromOffset(x, 64), Size = UDim2.fromOffset(92, 32),
+        })
+        hover(control)
+        return control
+    end
+    local createConfig, saveConfig, loadConfig = action("Create", 0), action("Save", 98), action("Load", 196)
+    local configMessage = text(configCard, SettingsStore.Notice, 10, {
+        Name = "ConfigMessage", Position = UDim2.fromOffset(0, 168), Size = UDim2.fromOffset(288, 28),
+        TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextColor3 = C.muted,
+    })
+    local colorCard = frame(settingsContent, "Appearance", 0, 212, 288, 93)
+    colorCard.BackgroundTransparency = 1
+    text(colorCard, "UI COLOR", 9, {
+        Size = UDim2.fromOffset(288, 16), Font = Enum.Font.FredokaOne, TextColor3 = C.muted,
+    })
+    local rainbowOptions = frame(colorCard, "Options", 0, 22, 288, 32)
+    rainbowOptions.BackgroundTransparency = 1
+    local previousBody, previousOrder = activeBody, order
+    activeBody, order = rainbowOptions, 0
+    refreshRainbowToggle = toggle("Rainbow UI", function() return rainbowUI end, function(value)
+        if settingsBusy then return end
+        local ok, detail = SettingsStore.SetRainbowUI(value)
+        if ok then setRainbowUI(value)
+        else configMessage.Text = detail; setThemed(configMessage, "TextColor3", C.accent) end
+    end)
+    activeBody, order = previousBody, previousOrder
+    local openColor = button(colorCard, {
+        Name = "ChangeColor", Text = "Change UI color", TextXAlignment = Enum.TextXAlignment.Left,
+        Position = UDim2.fromOffset(0, 57), Size = UDim2.fromOffset(288, 36),
+    })
+    create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, openColor)
+    local swatch = round(frame(openColor, "Swatch", 0, 7, 22, 22, C.accent), 4)
+    swatch.Position = UDim2.new(1, -34, 0, 7)
+    hover(openColor)
+    local configExtra, colorExtra = 0, 0
+    local function layoutSettings(immediate, duration, scrollToColor)
+        if fit then fit() end
+        animate(configCard, { Size = UDim2.fromOffset(288, 196 + configExtra) }, immediate, duration)
+        animate(configMessage, { Position = UDim2.fromOffset(0, 168 + configExtra) }, immediate, duration)
+        animate(colorCard, { Position = UDim2.fromOffset(0, 212 + configExtra),
+            Size = UDim2.fromOffset(288, 93 + colorExtra) }, immediate, duration)
+        local canvas = { CanvasSize = UDim2.fromOffset(0, 335 + configExtra + colorExtra) }
+        if scrollToColor then canvas.CanvasPosition = Vector2.new(0, 212 + configExtra)
+        elseif configExtra == 0 and colorExtra == 0 then canvas.CanvasPosition = Vector2.zero end
+        animate(settingsContent, canvas, immediate, duration)
+    end
+    local updateSettingsList
+    local function buildConfigDropdown()
+        local row = frame(configCard, "SavedConfigs", 0, 128, 288, 30)
+        row.BackgroundTransparency, row.ClipsDescendants = 1, true
+        local selectButton = button(row, { Name = "Select", Size = UDim2.fromOffset(288, 30) })
+        stroke(selectButton)
+        local selected = text(selectButton, "No saved configs", 11, {
+            Name = "SelectedValue", Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -48, 1, 0),
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+        local arrow = chevron(selectButton, "Arrow", 0, 8)
+        arrow.Position = UDim2.new(1, -28, 0, 8)
+        local menu = create("ScrollingFrame", {
+            Name = "Choices", Position = UDim2.fromOffset(0, 36), Size = UDim2.fromOffset(288, 0),
+            BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ClipsDescendants = true,
+            ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 2,
+            ScrollBarImageColor3 = C.accentDim, CanvasSize = UDim2.fromOffset(0, 0),
+        }, row)
+        create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, menu)
+        local entry = { row = row, menu = menu, arrow = arrow, open = false }
+        local options, menuHeight, count = {}, 0, 0
+        entry.setOpen = function(open, immediate)
+            entry.open = open and count > 0
+            configExtra = entry.open and menuHeight + 8 or 0
+            if entry.open then menu.Visible = true end
+            for _, option in pairs(options) do
+                option.button.Interactable = entry.open
+                option.marker.Visible = SettingsStore.Selected == option.button.Name
+                if not entry.open then option.reset() end
+            end
+            animate(arrow, { Rotation = entry.open and 180 or 0 }, immediate, 0.18)
+            local duration = entry.open and 0.18 or 0.14
+            animate(row, { Size = UDim2.fromOffset(288, 30 + configExtra) }, immediate, duration, function()
+                if not entry.open then menu.Visible = false end
+            end)
+            layoutSettings(immediate, duration)
+        end
+        table.insert(dropdowns, entry)
+        entry.Refresh = function(names)
+            count = #names
+            selected.Text = count > 0 and SettingsStore.Selected or "No saved configs"
+            selectButton.Interactable = count > 0 and not settingsBusy
+            menuHeight = math.min(156, math.max(0, count * 32 - 4))
+            menu.Size, menu.CanvasSize = UDim2.fromOffset(288, menuHeight), UDim2.fromOffset(0, math.max(0, count * 32 - 4))
+            for index, name in ipairs(names) do
+                local option = options[name]
+                if not option then
+                    local control = button(menu, {
+                        Name = name, Text = "", TextXAlignment = Enum.TextXAlignment.Left,
+                        TextTruncate = Enum.TextTruncate.AtEnd, Size = UDim2.new(1, -4, 0, 28), Interactable = false,
+                    })
+                    local label = text(control, name, 11, {
+                        Name = "Label", Position = UDim2.fromOffset(34, 0), Size = UDim2.new(1, -44, 1, 0),
+                        TextTruncate = Enum.TextTruncate.AtEnd,
+                    })
+                    local marker = chevron(control, "SelectedChevron", 10, 7)
+                    marker.Rotation = -90
+                    local repaint, reset = hover(control, function()
+                        return SettingsStore.Selected == name and C.active or C.control
+                    end)
+                    option = { button = control, text = label, marker = marker, repaint = repaint, reset = reset }
+                    options[name] = option
+                    connect(control.Activated, function()
+                        if not S.alive or settingsBusy or expanded ~= entry or not entry.open then return end
+                        SettingsStore.Select(name)
+                        updateSettingsList()
+                        closeDropdown()
+                    end)
+                end
+                option.button.LayoutOrder, option.button.Interactable = index, entry.open
+                option.marker.Visible = SettingsStore.Selected == name
+                setThemed(option.text, "TextColor3", SettingsStore.Selected == name and C.accent or C.text)
+                option.repaint(true)
+            end
+        end
+        hover(selectButton)
+        connect(selectButton.Activated, function()
+            if not S.alive or settingsBusy or count == 0 then return end
+            local wasOpen = expanded == entry
+            closeDropdown(not wasOpen)
+            if not wasOpen then
+                expanded = entry
+                entry.setOpen(true, false)
+                updateUIBusy()
+            end
+        end)
+        return entry
+    end
+    local configDropdown = buildConfigDropdown()
+    updateSettingsList = function()
+        local names = SettingsStore.List()
+        local selected = table.find(names, SettingsStore.Selected)
+        if not selected and #names > 0 then SettingsStore.Select(names[1]); selected = 1 end
+        configDropdown.Refresh(names)
+        saveConfig.Interactable, loadConfig.Interactable = selected ~= nil and not settingsBusy, selected ~= nil and not settingsBusy
+        createConfig.Interactable = not settingsBusy
+    end
+    local function settingsAction(callback)
+        if not S.alive or settingsBusy then return end
+        closeDropdown(true)
+        settingsBusy = true
+        updateUIBusy()
+        updateSettingsList()
+        local called, ok, detail = pcall(callback)
+        settingsBusy = false
+        updateUIBusy()
+        if not S.alive then return end
+        configMessage.Text = called and tostring(detail) or ("Settings error: " .. tostring(ok))
+        setThemed(configMessage, "TextColor3", called and ok and C.muted or C.accent)
+        updateSettingsList()
+    end
+    connect(createConfig.Activated, function()
+        settingsAction(function()
+            local ok, detail = SettingsStore.Save(configName.Text, settingsController.Snapshot(), true)
+            if ok then configName.Text = "" end
+            return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Created." or "Created for this session.") or detail
+        end)
+    end)
+    connect(saveConfig.Activated, function()
+        settingsAction(function()
+            local ok, detail = SettingsStore.Save(SettingsStore.Selected, settingsController.Snapshot(), false)
+            return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Saved." or "Saved for this session.") or detail
+        end)
+    end)
+    connect(loadConfig.Activated, function()
+        settingsAction(function()
+            local profile = SettingsStore.Get(SettingsStore.Selected)
+            if not profile then return false, "Select a saved config first." end
+            local ok, detail = settingsController.Load(profile)
+            if not ok then return false, detail end
+            SettingsStore.SetAppearance(profile.accent, profile.rainbowUI == true)
+            return true, "Loaded."
+        end)
+    end)
+    -- The spectrum expands inside Settings and previews without writing storage.
+    local function buildColorPicker()
+        local body = round(frame(colorCard, "ColorPicker", 0, 103, 288, 0, C.surface), 5)
+        body.Visible, body.ClipsDescendants = false, true
+        local spectrum = button(body, {
+            Name = "Spectrum", Position = UDim2.fromOffset(12, 12), Size = UDim2.fromOffset(224, 174),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        })
+        themeBindings[spectrum].BackgroundColor3 = nil
+        local hueGradient = create("UIGradient", { Rotation = 0 }, spectrum)
+        local saturation = frame(spectrum, "SaturationFade", 0, 0, 224, 174, Color3.fromRGB(255, 255, 255))
+        themeBindings[saturation].BackgroundColor3 = nil
+        create("UIGradient", {
+            Rotation = 90, Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0),
+            }),
+        }, saturation)
+        local cursor = frame(spectrum, "Cursor", 0, 0, 16, 16)
+        cursor.BackgroundTransparency, cursor.AnchorPoint = 1, Vector2.new(0.5, 0.5)
+        local cursorH = frame(cursor, "Horizontal", 0, 7, 16, 2, Color3.fromRGB(0, 0, 0))
+        local cursorV = frame(cursor, "Vertical", 7, 0, 2, 16, Color3.fromRGB(0, 0, 0))
+        themeBindings[cursorH].BackgroundColor3, themeBindings[cursorV].BackgroundColor3 = nil, nil
+        local brightness = button(body, {
+            Name = "Brightness", Position = UDim2.fromOffset(250, 12), Size = UDim2.fromOffset(14, 174),
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        })
+        themeBindings[brightness].BackgroundColor3 = nil
+        local brightnessGradient = create("UIGradient", { Rotation = 90 }, brightness)
+        local valueMarker = frame(brightness, "Marker", 0, 0, 22, 3, Color3.fromRGB(255, 255, 255))
+        themeBindings[valueMarker].BackgroundColor3 = nil
+        valueMarker.AnchorPoint = Vector2.new(0.5, 0.5)
+        local patch = round(frame(body, "Preview", 12, 198, 62, 86, C.accent), 3)
+        themeBindings[patch].BackgroundColor3 = nil
+        local values: { [string]: TextBox } = {}
+        local h, s, v, updatingHSV = 0, 0, 0, false
+        local colorOriginal, colorDrag, dragSurface = nil, nil, nil
+        local function rgb(hex)
+            return { tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16) }
+        end
+        local function readHSV(hex)
+            local channels = rgb(hex)
+            h, s, v = Color3.fromRGB(channels[1], channels[2], channels[3]):ToHSV()
+        end
+        local function draw()
+            local channels = rgb(currentAccent)
+            patch.BackgroundColor3 = Color3.fromRGB(channels[1], channels[2], channels[3])
+            cursor.Position = UDim2.fromScale(1 - h, 1 - s)
+            valueMarker.Position = UDim2.fromScale(0.5, 1 - v)
+            local points = {}
+            for index = 0, 6 do
+                points[#points + 1] = ColorSequenceKeypoint.new(index / 6, Color3.fromHSV(1 - index / 6, 1, v))
+            end
+            hueGradient.Color = ColorSequence.new(points)
+            saturation.BackgroundColor3 = Color3.fromHSV(0, 0, v)
+            brightnessGradient.Color = ColorSequence.new(Color3.fromHSV(h, s, 1), Color3.fromRGB(0, 0, 0))
+            local luminance = channels[1] * 0.299 + channels[2] * 0.587 + channels[3] * 0.114
+            local cursorColor = luminance > 145 and Color3.fromRGB(0, 0, 0) or Color3.fromRGB(255, 255, 255)
+            cursorH.BackgroundColor3, cursorV.BackgroundColor3 = cursorColor, cursorColor
+            local numbers = { Hue = math.floor(h * 360 + 0.5), Saturation = math.floor(s * 100 + 0.5),
+                Value = math.floor(v * 100 + 0.5), Red = channels[1], Green = channels[2], Blue = channels[3] }
+            for key, number in pairs(numbers) do
+                if values[key] then values[key].Text = tostring(number) end
+            end
+            if values.Hex then values.Hex.Text = "#" .. currentAccent end
+        end
+        refreshColorUI = function()
+            if not updatingHSV then readHSV(currentAccent) end
+            draw()
+        end
+        local function setHSV(hue, sat, value)
+            h, s, v = math.clamp(hue, 0, 1), math.clamp(sat, 0, 1), math.clamp(value, 0, 1)
+            local color = Color3.fromHSV(h, s, v)
+            local hex = string.format("%02X%02X%02X", math.floor(color.R * 255 + 0.5),
+                math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+            -- Preserve the chosen hue through grey/black and RGB rounding.
+            updatingHSV = true
+            if hex ~= currentAccent then applyTheme(hex) else draw() end
+            updatingHSV = false
+        end
+        for index, key in ipairs({ "Hue", "Saturation", "Value", "Red", "Green", "Blue" }) do
+            local hsv = index <= 3
+            local row = (index - 1) % 3
+            text(body, ({ "Hue", "Sat %", "Val %", "R", "G", "B" })[index], 10, {
+                Position = UDim2.fromOffset(hsv and 82 or 180, 194 + row * 30),
+                Size = UDim2.fromOffset(hsv and 36 or 24, 26), TextColor3 = C.muted,
+            })
+            local input = field(body, key, "", "0", hsv and 120 or 212, 194 + row * 30, hsv and 44 or 64)
+            input.Size = UDim2.fromOffset(hsv and 44 or 64, 26)
+            values[key] = input
+            connect(input.FocusLost, function()
+                if not colorPickerOpen or not S.alive then return end
+                local number = tonumber(input.Text)
+                if not number or number ~= number or math.abs(number) == math.huge then draw(); return end
+                if hsv then
+                    if key == "Hue" then setHSV(math.clamp(number, 0, 360) / 360, s, v)
+                    elseif key == "Saturation" then setHSV(h, math.clamp(number, 0, 100) / 100, v)
+                    else setHSV(h, s, math.clamp(number, 0, 100) / 100) end
+                else
+                    local channels = rgb(currentAccent)
+                    channels[index - 3] = math.clamp(math.floor(number + 0.5), 0, 255)
+                    local hex = string.format("%02X%02X%02X", channels[1], channels[2], channels[3])
+                    if hex ~= currentAccent then applyTheme(hex) else draw() end
+                end
+            end)
+        end
+        text(body, "HTML", 10, {
+            Position = UDim2.fromOffset(12, 294), Size = UDim2.fromOffset(62, 28), TextColor3 = C.muted,
+        })
+        values.Hex = field(body, "Hex", "", "#DEC173", 80, 294, 196)
+        values.Hex.Size, values.Hex.Font = UDim2.fromOffset(196, 28), Enum.Font.Code
+        connect(values.Hex.FocusLost, function()
+            if not colorPickerOpen or not S.alive then return end
+            local hex = SettingsStore.Color(values.Hex.Text)
+            if hex and hex ~= currentAccent then applyTheme(hex) else draw() end
+        end)
+        local function fromColorPoint(point)
+            if dragSurface == spectrum then
+                local size, position = spectrum.AbsoluteSize, spectrum.AbsolutePosition
+                if size.X > 0 and size.Y > 0 then
+                    setHSV(1 - (point.X - position.X) / size.X, 1 - (point.Y - position.Y) / size.Y, v)
+                end
+            elseif dragSurface == brightness then
+                local size, position = brightness.AbsoluteSize, brightness.AbsolutePosition
+                if size.Y > 0 then setHSV(h, s, 1 - (point.Y - position.Y) / size.Y) end
+            end
+        end
+        for _, surface in ipairs({ spectrum, brightness }) do
+            connect(surface.InputBegan, function(input)
+                if not S.alive or not colorPickerOpen or colorDrag then return end
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                    if editingField then editingField:ReleaseFocus() end
+                    colorDrag, dragSurface = input, surface
+                    settingsContent.ScrollingEnabled = false
+                    fromColorPoint(input.Position)
+                end
+            end)
+        end
+        local function expandPicker(open, immediate)
+            colorExtra = open and 384 or 0
+            if open then body.Visible = true end
+            local duration = open and 0.18 or 0.14
+            animate(body, { Size = UDim2.fromOffset(288, open and 374 or 0) }, immediate, duration, function()
+                if not colorPickerOpen then body.Visible = false end
+            end)
+            layoutSettings(immediate, duration, open)
+        end
+        local function dismissColorPicker(keepPreview, immediate)
+            if not colorPickerOpen then return end
+            if editingField then editingField:ReleaseFocus() end
+            colorPickerOpen, colorDrag, dragSurface = false, nil, nil
+            settingsContent.ScrollingEnabled = true
+            if not keepPreview and colorOriginal then applyTheme(colorOriginal) end
+            colorOriginal = nil
+            repaintPalette(rainbowUI and rainbowAccent() or currentAccent, true)
+            expandPicker(false, immediate)
+            updateUIBusy()
+        end
+        closeColorPicker = function() dismissColorPicker(false, true) end
+        connect(openColor.Activated, function()
+            if not S.alive or settingsBusy then return end
+            if colorPickerOpen then dismissColorPicker(false, false); return end
+            closeDropdown(true)
+            colorOriginal, colorPickerOpen = currentAccent, true
+            repaintPalette(currentAccent, true)
+            refreshColorUI()
+            expandPicker(true, false)
+            updateUIBusy()
+        end)
+        local cancelColor = button(body, {
+            Name = "Cancel", Text = "Cancel", Position = UDim2.fromOffset(12, 334), Size = UDim2.fromOffset(126, 30),
+        })
+        local applyColor = button(body, {
+            Name = "Apply", Text = "Apply", Position = UDim2.fromOffset(150, 334), Size = UDim2.fromOffset(126, 30),
+        })
+        hover(cancelColor); hover(applyColor)
+        connect(cancelColor.Activated, function() dismissColorPicker(false, false) end)
+        connect(applyColor.Activated, function()
+            if not S.alive or not colorPickerOpen then return end
+            dismissColorPicker(true, false)
+            settingsAction(function()
+                local ok, detail = SettingsStore.SetAccent(currentAccent)
+                return ok, ok and (SettingsStore.Storage:sub(1, 10) == "Local file" and "Color applied." or "Color applied for this session.") or detail
+            end)
+        end)
+        connect(UserInputService.InputChanged, function(input)
+            if not S.alive or not colorPickerOpen or not colorDrag then return end
+            if input == colorDrag or (colorDrag.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseMovement) then fromColorPoint(input.Position) end
+        end)
+        connect(UserInputService.InputEnded, function(input)
+            if colorDrag and (input == colorDrag or (colorDrag.UserInputType == Enum.UserInputType.MouseButton1
+                and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+                colorDrag, dragSurface = nil, nil
+                settingsContent.ScrollingEnabled = true
+            end
+        end)
+        refreshColorUI()
+    end
+    buildColorPicker()
+
+    updateSettingsList()
+
+
+    end
 
     local dragInput, dragStart, hostStart
     local lastViewport = nil
     local lastMinimized = nil
     local lastTab = nil
+    local lastHeight = nil
     local refresh
     local function viewportSize()
         local camera = workspace.CurrentCamera
         return camera and camera.ViewportSize or Vector2.new(1280, 720)
     end
 
-    local function fit(requestedX, requestedY)
+    fit = function(requestedX, requestedY)
         local viewport = viewportSize()
         local top = math.min(48, viewport.Y * 0.1)
-        local width, height = 316, minimized and 40 or (activeTab == "STR" and 546 or 494)
+        local width, height = 316, minimized and 40 or (activeTab == "GK" and 494 or (activeTab == "STR" and 491 or (colorPickerOpen and 581 or 419)))
         local scale = math.min(1, math.max(1, viewport.X - 32) / width,
             math.max(1, viewport.Y - top - 16) / height)
-        if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab then
+        if viewport ~= lastViewport or minimized ~= lastMinimized or activeTab ~= lastTab or height ~= lastHeight then
             uiScale.Scale = scale
             panel.Size = UDim2.fromOffset(width, height)
             tabBar.Visible = not minimized
             content.Visible = not minimized and activeTab == "GK"
             live.Visible = not minimized and activeTab == "GK"
             strikerContent.Visible = not minimized and activeTab == "STR"
-            lastViewport, lastMinimized, lastTab = viewport, minimized, activeTab
+            settingsContent.Visible = not minimized and activeTab == "Settings"
+            lastViewport, lastMinimized, lastTab, lastHeight = viewport, minimized, activeTab, height
+            settingsContent.Size = UDim2.fromOffset(292, height - 88)
         end
         local x = math.clamp(requestedX or host.Position.X.Offset, 16,
             math.max(16, viewport.X - width * scale - 16))
@@ -8896,7 +10207,7 @@ do
             and input.UserInputType == Enum.UserInputType.MouseButton1) then
             dragging = false
             dragInput = nil
-            S.uiBusy = expanded ~= nil
+            updateUIBusy()
         end
     end)
     connect(UserInputService.InputChanged, function(input)
@@ -8931,16 +10242,16 @@ do
     end)
 
     local function writeChanged(object, property, value)
-        if object[property] ~= value then object[property] = value end
+        if object[property] ~= value then setThemed(object, property, value) end
     end
     refresh = function()
         if not Gui.Enabled or not Gui.Parent then return end
         if viewportSize() ~= lastViewport then fit() end
         if minimized then return end
+        if activeTab == "Settings" then return end
         if activeTab == "STR" then
             for i = gkRefresherCount + 1, #refreshers do refreshers[i]() end
             writeChanged(strikerStatus, "Text", STR.Status)
-            writeChanged(strikerDetail, "Text", STR.Detail)
             writeChanged(miscellaneousStatus, "Text", "Dribble: " .. MISC.DribbleStatus .. " | Stamina: " .. MISC.StaminaStatus)
             return
         end
@@ -8952,14 +10263,14 @@ do
     end
 
     local tabRefreshers = {}
-    local function addTab(name, x)
+    local function addTab(name, labelText, x, width)
         local control = button(tabBar, {
             Name = name, Position = UDim2.fromOffset(x, 0),
-            Size = UDim2.fromOffset(142, 26),
+            Size = UDim2.fromOffset(width, 26),
         })
-        local label = text(control, name, 11, {
+        local label = text(control, labelText, 11, {
             Name = "Label", Size = UDim2.fromScale(1, 1),
-            Font = Enum.Font.GothamMedium,
+            Font = Enum.Font.FredokaOne,
             TextXAlignment = Enum.TextXAlignment.Center,
         })
         local border = stroke(control)
@@ -8983,8 +10294,9 @@ do
         end)
         draw(true)
     end
-    addTab("GK", 0)
-    addTab("STR", 150)
+    addTab("GK", "Goalkeeper", 0, 108)
+    addTab("STR", "Striker", 114, 82)
+    addTab("Settings", "Settings", 202, 90)
 
     connect(RunService.Heartbeat, function()
         if not S.alive or not Gui.Enabled or not Gui.Parent then return end
@@ -9060,6 +10372,11 @@ ENV.AutoGKDebug = function()
         "| delayed candidates:", S.delayedPlansChecked,
         "| milliseconds:", S.plannerMilliseconds
     )
+    print("[Auto GK] contact timing waits:", S.keeperWaits or 0,
+        "| deadline:", S.keeperWait and math.max(0, S.keeperWait.deadline - os.clock()) or 0,
+        "| intervening contact:", S.keeperContact and S.keeperContact.time or "none",
+        "| timing errors:", S.keeperTimingErrors or 0,
+        "| last timing error:", S.keeperTimingError or "none")
 
     print(
         "[Auto GK] close-range rush:", Config.CloseRangeRush,
@@ -9188,7 +10505,8 @@ ENV.AutoGKDebug = function()
     end
 end
 
-print("[Auto GK] Loaded | RightShift: show / hide")
+SettingsStore.Acknowledge()
+print("[Dmc] Loaded | " .. RELEASE_VERSION .. " | RightShift: show / hide")
 
 -- DMC MAIN END
 end)
