@@ -918,6 +918,14 @@ local function buildSelector(ctx)
 
     function selector:Step(_dt)
         if not alive then return end
+        if not Settings.Enabled then
+            clearSelection("Disabled")
+            resetReaction()
+            diagnostics.scanMs, diagnostics.raycasts = 0, 0
+            fovVisuals.enabled = false
+            table.clear(fovVisuals.boxes)
+            return
+        end
         epoch = epoch + 1
         originalAimCache = {}
         diagnostics.raycasts = 0
@@ -928,7 +936,7 @@ local function buildSelector(ctx)
             self:Invalidate(true)
         end
         local profile = getFOVProfile(Settings, tool)
-        if (Settings.Enabled or (Settings.ShowFOV and profile.shape == "Box")) and now - rosterAt >= 0.2 then
+        if now - rosterAt >= 0.2 then
             refreshFilters(now)
         end
         local boxes = {}
@@ -942,7 +950,6 @@ local function buildSelector(ctx)
             end
         end
         fovVisuals = { shape = profile.shape, enabled = profile.enabled, radius = profile.radius, boxes = boxes }
-        if not Settings.Enabled then clearSelection("Disabled"); resetReaction(); return end
         if not tool then clearSelection("Waiting for a weapon"); resetReaction(); return end
         if manualMode() then
             if manualRequested and (not manualRequestUntil or now >= manualRequestUntil) then
@@ -1116,6 +1123,11 @@ local function buildSelector(ctx)
     end
 
     function selector:GetFOVVisuals()
+        if not alive or not Settings.Enabled then
+            fovVisuals.enabled = false
+            table.clear(fovVisuals.boxes)
+            return fovVisuals
+        end
         local profile = getFOVProfile(Settings, currentTool)
         return { shape = profile.shape, enabled = profile.enabled, radius = profile.radius, boxes = fovVisuals.boxes }
     end
@@ -1147,6 +1159,7 @@ local function buildShotRouter(ctx)
     local Settings = ctx.Settings
     local LocalPlayer = ctx.LocalPlayer
     local Visual = ctx.Visual
+    local Hitbox = ctx.Hitbox
     local originalGetAim = GunHandler.getAim
     local originalShoot = GunHandler.shoot
     local originalSpread = GunHandler.shotgunSpread
@@ -1173,7 +1186,7 @@ local function buildShotRouter(ctx)
         local thread = coroutine.running() or mainThread
         local record = contexts[thread]
         if not record then
-            record = { pending = nil, active = nil, insideAim = false }
+            record = { pending = nil, active = nil, insideAim = false, hitboxAimAllowed = true }
             contexts[thread] = record
         end
         return record
@@ -1310,6 +1323,32 @@ local function buildShotRouter(ctx)
         return snapshotAim(action, origin, requestedRange, false)
     end
 
+    local function nativeAim(origin, ...)
+        if not alive or not Hitbox or type(Hitbox.BeginAim) ~= "function" then
+            return originalGetAim(origin, ...)
+        end
+        local record = threadRecord()
+        local requestedRange = select(1, ...)
+        local ok, token = pcall(Hitbox.BeginAim, Hitbox, origin, requestedRange, record.hitboxAimAllowed ~= false)
+        if not ok then
+            report("hitbox aim", token)
+            error(token, 0)
+        end
+        local result = table.pack(pcall(originalGetAim, origin, ...))
+        local cleanupFailure
+        if token ~= nil then
+            local ended, restored = pcall(Hitbox.EndAim, Hitbox, token)
+            if not ended or restored == false then
+                report("hitbox aim cleanup", ended and "Could not disable aim queries" or restored)
+                local retried, released = pcall(Hitbox.Invalidate, Hitbox)
+                if not retried or released == false then cleanupFailure = "Hitbox aim queries could not be disabled" end
+            end
+        end
+        if not result[1] then error(result[2], 0) end
+        if cleanupFailure then error(cleanupFailure, 0) end
+        return table.unpack(result, 2, result.n)
+    end
+
     redirectedGetAim = function(origin, ...)
         if alive and Settings.Enabled then
             local record = threadRecord()
@@ -1322,7 +1361,7 @@ local function buildShotRouter(ctx)
             end
         end
 
-        return originalGetAim(origin, ...)
+        return nativeAim(origin, ...)
     end
 
     local function primaryShot(data, character, tool, previousActive)
@@ -1336,12 +1375,30 @@ local function buildShotRouter(ctx)
         if not alive then return originalShoot(data, ...) end
         local record = threadRecord()
         local previousActive = record.active
+        local previousAimAllowed = record.hitboxAimAllowed
         local character, tool = identity()
         local primary = primaryShot(data, character, tool, previousActive)
         local action = primary and record.pending or nil
         if not matches(action, character, tool) then action = nil end
 
         record.active = action or BYPASS
+
+        local hitboxShot = type(data) == "table" and character ~= nil and data.Shooter == character
+            and data.Handle ~= nil and data.Handle.Parent == tool
+            and not (data.ReplicatedShot or data.isReflecting or data.TrailOnly)
+        record.hitboxAimAllowed = hitboxShot and data.Hit == nil
+        local hitboxToken
+        if Hitbox and type(Hitbox.BeginShot) == "function" then
+            local ok, token = pcall(Hitbox.BeginShot, Hitbox, data)
+            if not ok then
+                record.active = previousActive
+                record.hitboxAimAllowed = previousAimAllowed
+                if action and record.pending == action then record.pending = nil end
+                report("hitbox shot", token)
+                error(token, 0)
+            end
+            hitboxToken = token
+        end
 
         local visualToken
         if primary and Visual and type(Visual.Begin) == "function" then
@@ -1351,6 +1408,18 @@ local function buildShotRouter(ctx)
 
         local result = table.pack(pcall(originalShoot, data, ...))
         record.active = previousActive
+        record.hitboxAimAllowed = previousAimAllowed
+        local hitboxCleanupFailure
+        if hitboxToken ~= nil and Hitbox and type(Hitbox.EndShot) == "function" then
+            local ok, restored = pcall(Hitbox.EndShot, Hitbox, hitboxToken)
+            if not ok or restored == false then
+                report("hitbox shot cleanup", ok and "Could not disable hitbox queries" or restored)
+                local retried, released = pcall(Hitbox.Invalidate, Hitbox)
+                if not retried or released == false then
+                    hitboxCleanupFailure = "Hitbox queries could not be disabled"
+                end
+            end
+        end
         if action and record.pending == action then
             if not result[1] then
                 record.pending = nil
@@ -1367,6 +1436,16 @@ local function buildShotRouter(ctx)
             if not ok then report("tracer finish", problem) end
         end
         if not result[1] then error(result[2], 0) end
+        if hitboxCleanupFailure then error(hitboxCleanupFailure, 0) end
+        if hitboxShot and result.n >= 3 and Hitbox and type(Hitbox.ResolveHit) == "function" then
+            local ok, owned, nativePart = pcall(Hitbox.ResolveHit, Hitbox, result[3], result[2], data)
+            if ok then
+                if owned then result[3] = nativePart end
+            else
+                result[3] = nil
+                report("hitbox hit mapping", owned)
+            end
+        end
         return table.unpack(result, 2, result.n)
     end
 
@@ -1378,7 +1457,7 @@ local function buildShotRouter(ctx)
         local character, tool = identity()
         local offsets = result[1]
         if character and tool.Name == weaponName and type(offsets) == "table" then
-            if record.active == nil then
+            if Settings.Enabled and record.active == nil then
                 local pelletCount = 0
                 for _ in pairs(offsets) do pelletCount = pelletCount + 1 end
                 if pelletCount > 0 then
@@ -1705,6 +1784,822 @@ local function buildVisualRedirect(ctx)
     end
 
     return adapter
+end
+
+local function buildHitboxController(ctx)
+    local Settings, Players, Player = ctx.Settings, ctx.Players, ctx.LocalPlayer
+    local World, Clock = ctx.Workspace, ctx.Clock or os.clock
+    local records, active, tokens = {}, {}, {}
+    local bindings = setmetatable({}, { __mode = "k" })
+    local alive, routing, tokenCount, nextScan = true, false, 0, -math.huge
+    local diagnostics = { mode = "Waiting for routing", activeParts = 0, expandedParts = 0, errors = 0 }
+    local controller = {}
+    local bodyNames = { "Head", "UpperTorso", "LowerTorso", "Torso", "LeftUpperArm", "RightUpperArm",
+        "LeftLowerArm", "RightLowerArm", "LeftHand", "RightHand", "LeftUpperLeg", "RightUpperLeg",
+        "LeftLowerLeg", "RightLowerLeg", "LeftFoot", "RightFoot", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+    local function vector(value)
+        return typeof(value) == "Vector3" and finite(value.X) and finite(value.Y) and finite(value.Z)
+    end
+    local function validSize(value)
+        return vector(value) and value.X > 0 and value.Y > 0 and value.Z > 0
+    end
+    local function dimensions()
+        local function axis(name)
+            local value = Settings[name]
+            return finite(value) and math.clamp(value, 0, 20) or 5
+        end
+        return axis("HitboxX"), axis("HitboxY"), axis("HitboxZ")
+    end
+    local function report(problem)
+        diagnostics.errors = diagnostics.errors + 1
+        diagnostics.lastError = tostring(problem)
+        if type(ctx.OnError) == "function" then pcall(ctx.OnError, "hitbox", tostring(problem)) end
+    end
+    local function attempt(label, callback)
+        local ok, result = pcall(callback)
+        if not ok then report(label .. ": " .. tostring(result)) end
+        return ok, result
+    end
+    local function validBinding(binding)
+        return not binding.invalid and binding.player.Parent == Players and binding.player.Character == binding.character
+            and binding.character:IsDescendantOf(World) and binding.native.Parent == binding.character
+            and binding.native:IsA("BasePart")
+    end
+    local function query(record, value)
+        if record.destroyed then return not value end
+        local ok, matches = attempt("query state", function()
+            if record.proxy.CanQuery ~= value then record.proxy.CanQuery = value end
+            return record.proxy.CanQuery == value
+        end)
+        if ok and not matches then report("Query state was overwritten") end
+        return ok and matches
+    end
+    local function hide(record)
+        if not record.adornment then return true end
+        local ok = attempt("outline cleanup", function() record.adornment:Destroy() end)
+        if ok then record.adornment = nil end
+        return ok
+    end
+    local function evacuate(record)
+        local ok, result = attempt("effect cleanup", function()
+            local children = record.proxy:GetChildren()
+            if #children > 64 then error("Proxy has too many foreign children to relocate safely", 0) end
+            local destination = validBinding(record.binding) and record.binding.native or nil
+            local complete = true
+            for _, child in ipairs(children) do
+                local moved = attempt("effect relocation", function()
+                    if child.Parent == record.proxy then child.Parent = destination end
+                    return child.Parent ~= record.proxy
+                end)
+                if not moved or child.Parent == record.proxy then complete = false end
+            end
+            return complete
+        end)
+        return ok and result
+    end
+    local function disconnect(record)
+        local pending = {}
+        for _, connection in ipairs(record.connections) do
+            if not attempt("lifecycle cleanup", function() connection:Disconnect() end) then
+                pending[#pending + 1] = connection
+            end
+        end
+        record.connections = pending
+    end
+    local function retire(record)
+        record.retired, record.queries = true, 0
+        if active[record.binding.player] == record then active[record.binding.player] = nil end
+        record.queryUnsafe = not query(record, false)
+        hide(record)
+        if not record.destroyed and evacuate(record) then
+            local ok = attempt("proxy cleanup", function() record.proxy:Destroy() end)
+            if ok then record.destroyed = true end
+        end
+        if record.destroyed then record.queryUnsafe = false; disconnect(record) end
+        if record.destroyed and not record.adornment and #record.connections == 0 then
+            records[record.proxy] = nil
+            return true
+        end
+        return false
+    end
+    local function retryUnsafeQueries()
+        local safe = true
+        for _, record in pairs(records) do
+            if record.retired and record.queryUnsafe then
+                retire(record)
+                if record.queryUnsafe then safe = false end
+            end
+        end
+        return safe
+    end
+    local function releaseAll()
+        for token in pairs(tokens) do token.parts = {} end
+        tokens, tokenCount = {}, 0
+        for _, record in pairs(records) do retire(record) end
+        diagnostics.activeParts, diagnostics.expandedParts = 0, 0
+        return next(records) == nil
+    end
+    local function display(record)
+        if Settings.HitboxShow == false or not ctx.GuiParent then hide(record); return end
+        local ok = attempt("outline", function()
+            if record.adornment then
+                if record.adornment.Size ~= record.proxy.Size then record.adornment.Size = record.proxy.Size end
+                return
+            end
+            local outline = Instance.new("BoxHandleAdornment")
+            record.adornment = outline
+            outline.Name = "HitboxOutline"
+            outline.Adornee = record.proxy
+            outline.CFrame = CFrame.new()
+            outline.Size = record.proxy.Size
+            outline.Color3 = Color3.fromRGB(235, 235, 235)
+            outline.Transparency = 0.91
+            outline.AlwaysOnTop = false
+            outline.ZIndex = 0
+            outline.Visible = true
+            outline.Parent = ctx.GuiParent
+        end)
+        if not ok then hide(record) end
+    end
+    local function create(binding, size)
+        local record
+        local ok = attempt("proxy creation", function()
+            local proxy = Instance.new("Part")
+            record = { proxy = proxy, binding = binding, size = size, queries = 0,
+                retired = false, destroyed = false, queryUnsafe = false, connections = {} }
+            records[proxy], bindings[proxy] = record, binding
+            record.connections[#record.connections + 1] = binding.native.Destroying:Connect(function() binding.invalid = true end)
+            record.connections[#record.connections + 1] = binding.character.Destroying:Connect(function() binding.invalid = true end)
+            proxy.Name = "DH_HitboxProxy"
+            proxy.Shape = Enum.PartType.Block
+            proxy.Anchored = true
+            proxy.Transparency = 1
+            proxy.CanCollide = false
+            proxy.CanTouch = false
+            proxy.CanQuery = false
+            proxy.CastShadow = false
+            proxy.Size = size
+            proxy.CFrame = binding.native.CFrame
+            proxy.Parent = binding.character
+            record.size = proxy.Size
+            active[binding.player] = record
+        end)
+        if not ok then
+            if record then retire(record) end
+            return nil, record ~= nil and records[record.proxy] ~= nil
+        end
+        display(record)
+        return record, true
+    end
+    local function root(character)
+        local part = character and character:FindFirstChild("HumanoidRootPart")
+        return part and part:IsA("BasePart") and part or nil
+    end
+    local function eligible(player, origin)
+        if player == Player or player.Parent ~= Players then return nil end
+        local character = player.Character
+        if not character or not character:IsDescendantOf(World) then return nil end
+        if Settings.TeamCheck and Player.Team ~= nil and not Player.Neutral
+            and not player.Neutral and player.Team == Player.Team then return nil end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or not finite(humanoid.Health) or humanoid.Health <= 0 then return nil end
+        local effects = character:FindFirstChild("BodyEffects")
+        local dead = effects and effects:FindFirstChild("Dead")
+        if dead and dead.Value == true then return nil end
+        local knocked = effects and effects:FindFirstChild("K.O")
+        if Settings.SkipKnocked and knocked and knocked.Value == true then return nil end
+        local part = root(character)
+        if not part then return nil end
+        local delta = part.Position - origin
+        local distance = delta:Dot(delta)
+        if not finite(distance) or distance > 220 * 220 then return nil end
+        return character, distance
+    end
+    local function scan()
+        for _, record in pairs(records) do if record.retired then retire(record) end end
+        local origin = root(Player.Character)
+        if not origin then releaseAll(); diagnostics.mode = "Waiting for character"; return end
+        local candidates = {}
+        for index, player in ipairs(Players:GetPlayers()) do
+            local character, distance = eligible(player, origin.Position)
+            if character then candidates[#candidates + 1] = { player = player, character = character,
+                distance = distance, order = index } end
+        end
+        table.sort(candidates, function(a, b)
+            if a.distance ~= b.distance then return a.distance < b.distance end
+            local ai, bi = a.player.UserId or 0, b.player.UserId or 0
+            return ai < bi or (ai == bi and a.order < b.order)
+        end)
+        local selected, order = {}, {}
+        local x, y, z = dimensions()
+        for _, candidate in ipairs(candidates) do
+            local part = root(candidate.character)
+            local size = part and part.Size
+            if validSize(size) and size.X <= 20 and size.Y <= 20 and size.Z <= 20 then
+                selected[candidate.player] = { player = candidate.player, character = candidate.character, native = part,
+                    size = Vector3.new(math.max(size.X, x), math.max(size.Y, y), math.max(size.Z, z)) }
+                order[#order + 1] = candidate.player
+                if #order >= 128 then break end
+            end
+        end
+        for player, record in pairs(active) do
+            local choice = selected[player]
+            if not choice or choice.native ~= record.binding.native or choice.character ~= record.binding.character then retire(record) end
+        end
+        local count = 0
+        for _ in pairs(records) do count = count + 1 end
+        for _, player in ipairs(order) do
+            local choice, record = selected[player], active[player]
+            if not record and count < 128 then
+                local binding = { player = player, character = choice.character, native = choice.native, invalid = false }
+                local tracked
+                record, tracked = create(binding, choice.size)
+                if tracked then count = count + 1 end
+            elseif record then
+                if record.proxy.Size ~= choice.size then record.proxy.Size = choice.size end
+                record.size = record.proxy.Size
+                display(record)
+            end
+        end
+        diagnostics.mode = "Enabled"
+    end
+    local function follow(record)
+        if not validBinding(record.binding) or record.proxy.Parent ~= record.binding.character then retire(record); return end
+        local frame = record.binding.native.CFrame
+        if record.proxy.CFrame ~= frame then record.proxy.CFrame = frame end
+        if record.queries == 0 and not query(record, false) then retire(record) end
+    end
+    function controller:Step()
+        if not alive then return true end
+        local ok, problem = pcall(function()
+            local now, x, y, z = Clock(), dimensions()
+            if not Settings.HitboxEnabled or not routing or x <= 0 or y <= 0 or z <= 0 then
+                if next(active) ~= nil or tokenCount > 0 or now >= nextScan then
+                    releaseAll(); nextScan = now + 0.2
+                end
+                diagnostics.mode = not routing and "Waiting for routing" or not Settings.HitboxEnabled and "Disabled" or "Zero size"
+                return
+            end
+            if now >= nextScan or nextScan - now >= 1 then scan(); nextScan = now + 0.2 end
+            for _, record in pairs(active) do follow(record) end
+            local count = 0
+            for _ in pairs(active) do count = count + 1 end
+            diagnostics.activeParts, diagnostics.expandedParts = count, count
+        end)
+        if not ok then report(problem); releaseAll(); diagnostics.mode = "Error" end
+        return ok
+    end
+    function controller:Refresh()
+        nextScan = -math.huge
+        return self:Step()
+    end
+    function controller:Invalidate()
+        local clean = releaseAll()
+        nextScan = -math.huge
+        diagnostics.mode = "Reset"
+        return clean
+    end
+    function controller:SetRoutingReady(value)
+        routing = value == true and alive
+        if not routing then return self:Invalidate() end
+        return self:Refresh()
+    end
+    local function shotRay(data)
+        if type(data) ~= "table" or not vector(data.AimPosition) then return nil end
+        local origin = data.ForcedOrigin
+        if not vector(origin) then
+            local handle = data.Handle
+            if not handle then return nil end
+            local muzzle = handle:FindFirstChild("Muzzle")
+            origin = muzzle and muzzle:IsA("Attachment") and muzzle.WorldPosition or handle.Position
+        end
+        if not vector(origin) then return nil end
+        local delta, range = data.AimPosition - origin, data.Range == nil and 200 or data.Range
+        if not vector(delta) or not finite(delta.Magnitude) or delta.Magnitude <= 0.0001
+            or not finite(range) or range <= 0 then return nil end
+        return { Origin = origin, Direction = delta.Unit, Range = range }
+    end
+    local function intersect(ray, frame, size)
+        local o, d, h = frame:PointToObjectSpace(ray.Origin), frame:VectorToObjectSpace(ray.Direction), size * 0.5
+        local origins, directions, halves = { o.X, o.Y, o.Z }, { d.X, d.Y, d.Z }, { h.X, h.Y, h.Z }
+        local enter, leave = 0, ray.Range
+        for axis = 1, 3 do
+            local position, direction, half = origins[axis], directions[axis], halves[axis]
+            if math.abs(direction) < 0.000000001 then
+                if position < -half or position > half then return nil end
+            else
+                local first, last = (-half - position) / direction, (half - position) / direction
+                if first > last then first, last = last, first end
+                enter, leave = math.max(enter, first), math.min(leave, last)
+                if leave < enter then return nil end
+            end
+        end
+        return enter
+    end
+    local function beginScope(makeRay, existingOnly)
+        if not retryUnsafeQueries() then error("Hitbox query cleanup failed; shot cancelled", 0) end
+        if not alive or not routing or not Settings.HitboxEnabled then return nil end
+        local token
+        local ok, result = pcall(function()
+            local x, y, z = dimensions()
+            if x <= 0 or y <= 0 or z <= 0 then return nil end
+            local ray = makeRay()
+            if not ray or tokenCount >= 32 then return nil end
+            if existingOnly then
+                for _, record in pairs(active) do follow(record) end
+            elseif controller:Step() == false then return nil end
+            local matches = {}
+            for _, record in pairs(active) do
+                if not record.retired and validBinding(record.binding)
+                    and (ray == true or intersect(ray, record.proxy.CFrame, record.proxy.Size) ~= nil) then
+                    matches[#matches + 1] = record
+                end
+            end
+            if #matches == 0 then return nil end
+            token = { parts = {}, ray = ray }
+            tokens[token], tokenCount = true, tokenCount + 1
+            for _, record in ipairs(matches) do
+                token.parts[#token.parts + 1] = record
+                record.queries = record.queries + 1
+                if not query(record, true) then error("Could not enable a scoped hitbox query", 0) end
+            end
+            return token
+        end)
+        if not ok then
+            local clean = not token or controller:EndShot(token)
+            report(result)
+            if not clean or not retryUnsafeQueries() then error("Hitbox query cleanup failed; shot cancelled", 0) end
+            return nil
+        end
+        if not retryUnsafeQueries() then
+            if token then controller:EndShot(token) end
+            error("Hitbox query cleanup failed; shot cancelled", 0)
+        end
+        return result
+    end
+    function controller:BeginShot(data)
+        return beginScope(function()
+            if type(data) ~= "table" or data.Shooter ~= Player.Character or data.Hit ~= nil
+                or data.ReplicatedShot or data.isReflecting or data.TrailOnly then return nil end
+            local handle = data.Handle
+            if not handle or not handle.Parent or handle.Parent.Parent ~= Player.Character then return nil end
+            return shotRay(data)
+        end, false)
+    end
+    function controller:BeginAim(origin, requestedRange, allowQueries)
+        return beginScope(function()
+            if allowQueries == false or not vector(origin) then return nil end
+            local range = requestedRange == nil and 200 or requestedRange
+            if not finite(range) or range <= 0 then return nil end
+            return true
+        end, true)
+    end
+    function controller:EndShot(token)
+        if not tokens[token] then return true end
+        tokens[token], tokenCount = nil, math.max(0, tokenCount - 1)
+        local clean = true
+        for _, record in ipairs(token.parts) do
+            if not record.retired then
+                record.queries = math.max(0, record.queries - 1)
+                if record.queries == 0 and not query(record, false) then
+                    if not retire(record) then clean = false end
+                end
+            end
+        end
+        token.parts = {}
+        return clean
+    end
+    function controller:EndAim(token)
+        return self:EndShot(token)
+    end
+    local function clampPoint(frame, size, point)
+        local localPoint, half = frame:PointToObjectSpace(point), size * 0.5
+        return frame:PointToWorldSpace(Vector3.new(math.clamp(localPoint.X, -half.X, half.X),
+            math.clamp(localPoint.Y, -half.Y, half.Y), math.clamp(localPoint.Z, -half.Z, half.Z)))
+    end
+    function controller:ResolveHit(hit, position, data)
+        local binding = bindings[hit]
+        if not binding then return false, hit end
+        local ok, result = pcall(function()
+            if not validBinding(binding) then return nil end
+            local ray = shotRay(data)
+            local first, firstDistance, closest, closestDistance
+            for _, name in ipairs(bodyNames) do
+                local part = binding.character:FindFirstChild(name)
+                if part and part:IsA("BasePart") and validSize(part.Size) then
+                    local frame, size = part.CFrame, part.Size
+                    local entry = ray and intersect(ray, frame, size)
+                    if entry ~= nil and (firstDistance == nil or entry < firstDistance) then
+                        first, firstDistance = part, entry
+                    end
+                    if Settings.HitboxTarget == "NearestPart" then
+                        local point, reference
+                        if ray and type(ctx.ClosestRayBoxPoint) == "function" then
+                            point = frame:PointToWorldSpace(ctx.ClosestRayBoxPoint(frame, size, ray))
+                            local t = math.clamp((point - ray.Origin):Dot(ray.Direction), 0, ray.Range)
+                            reference = ray.Origin + ray.Direction * t
+                            if t <= 0 or t >= ray.Range then point = clampPoint(frame, size, reference) end
+                        else
+                            reference = vector(position) and position or ray and ray.Origin + ray.Direction * ray.Range or binding.native.Position
+                            point = clampPoint(frame, size, reference)
+                        end
+                        local delta = point - reference
+                        local distance = delta:Dot(delta)
+                        if finite(distance) and (closestDistance == nil or distance < closestDistance) then
+                            closest, closestDistance = part, distance
+                        end
+                    end
+                end
+            end
+            return first or closest or binding.native
+        end)
+        if not ok then report("hit mapping: " .. tostring(result)); return true, nil end
+        return true, result
+    end
+    function controller:GetNativeSize(proxy)
+        if not alive or not routing or not Settings.HitboxEnabled then return nil end
+        local x, y, z = dimensions()
+        if x <= 0 or y <= 0 or z <= 0 then return nil end
+        local record = records[proxy]
+        if not record or record.retired or record.destroyed then return nil end
+        local ok, size = pcall(function()
+            if not validBinding(record.binding) or proxy.Parent ~= record.binding.character then return nil end
+            return record.binding.native.Size
+        end)
+        if ok and validSize(size) then return size end
+        return nil
+    end
+    function controller:GetOriginalPart(proxy)
+        local binding = bindings[proxy]
+        if not binding then return nil end
+        local ok, part = pcall(function() return validBinding(binding) and binding.native or nil end)
+        return ok and part or nil
+    end
+    function controller:GetExpandedParts()
+        local parts = {}
+        for _, record in pairs(active) do
+            if self:GetNativeSize(record.proxy) then parts[#parts + 1] = record.proxy end
+            if #parts >= 128 then break end
+        end
+        return parts
+    end
+    function controller:GetDiagnostics()
+        local result, pending, unsafe = {}, 0, 0
+        for key, value in pairs(diagnostics) do result[key] = value end
+        for _, record in pairs(records) do
+            if record.retired then pending = pending + 1 end
+            if record.queryUnsafe then unsafe = unsafe + 1 end
+        end
+        result.pendingRestore, result.activeShots, result.routingReady = pending, tokenCount, routing
+        result.unsafeQueries = unsafe
+        return result
+    end
+    function controller:Destroy()
+        alive, routing = false, false
+        local clean = releaseAll()
+        if not clean then clean = releaseAll() end
+        if not clean then report("One or more owned hitbox artifacts could not be removed") end
+        diagnostics.mode = "Destroyed"
+        return clean
+    end
+    return controller
+end
+
+local function buildParticleSpoofer(ctx)
+    local Settings, Hitbox, World = ctx.Settings, ctx.Hitbox, ctx.Workspace
+    local Clock = ctx.Clock or os.clock
+    local roots, emitters = {}, {}
+    local externallyMoved = setmetatable({}, {__mode = "k"})
+    local rootCount, emitterCount, alive, nextUpdate = 0, 0, true, -math.huge
+    local folder = nil
+    local ROOT_LIMIT, EMITTER_LIMIT = 64, 256
+    local diagnostics = {mode = "Disabled", errors = 0, lastError = "", activeCarriers = 0, movedEmitters = 0, pendingRestore = 0}
+    local controller = {}
+
+    local function report(problem)
+        diagnostics.errors = diagnostics.errors + 1
+        diagnostics.lastError = tostring(problem)
+        if type(ctx.OnError) == "function" then pcall(ctx.OnError, "particle_spoofer", tostring(problem)) end
+    end
+    local function read(object, property)
+        local ok, value = pcall(function() return object[property] end)
+        return ok, value
+    end
+    local function children(object)
+        local ok, value = pcall(function() return object:GetChildren() end)
+        if not ok then report("children: " .. tostring(value)); return false, {} end
+        return true, value
+    end
+    local function isA(object, class)
+        local ok, value = pcall(function() return object:IsA(class) end)
+        return ok and value == true
+    end
+    local function validSize(value)
+        if typeof(value) ~= "Vector3" then return false end
+        for _, axis in ipairs({value.X, value.Y, value.Z}) do
+            if type(axis) ~= "number" or axis ~= axis or axis <= 0 or axis == math.huge then return false end
+        end
+        return true
+    end
+    local function enabled()
+        return alive and Settings.HitboxEnabled == true
+    end
+    local function nativeSize(root)
+        if not enabled() or not isA(root, "BasePart") then return nil end
+        local ok, value = pcall(Hitbox.GetNativeSize, Hitbox, root)
+        if ok and validSize(value) then return value end
+        return nil
+    end
+    local function disconnect(list)
+        local remaining = {}
+        for _, connection in ipairs(list) do
+            local ok, problem = pcall(function() connection:Disconnect() end)
+            if not ok then remaining[#remaining + 1] = connection; report("disconnect: " .. tostring(problem)) end
+        end
+        return remaining
+    end
+    local function rootUsable(record)
+        if record.rootDestroyed then return false end
+        local ok, value = pcall(function() return record.root.Parent ~= nil and record.root:IsDescendantOf(World) end)
+        return ok and value == true
+    end
+    local function restoreDestination(record)
+        if rootUsable(record.owner) then
+            local ok, size = pcall(Hitbox.GetNativeSize, Hitbox, record.originalParent)
+            if ok and validSize(size) then return record.originalParent end
+        end
+        if type(Hitbox.GetOriginalPart) == "function" then
+            local ok, original = pcall(Hitbox.GetOriginalPart, Hitbox, record.originalParent)
+            if ok and isA(original, "BasePart") then
+                local valid, inWorld = pcall(function() return original.Parent ~= nil and original:IsDescendantOf(World) end)
+                if valid and inWorld then return original end
+            end
+        end
+        return nil
+    end
+    local function setParent(record, parent)
+        record.moving = true
+        local ok, problem = pcall(function() record.emitter.Parent = parent end)
+        record.moving = false
+        if not ok then report("emitter parent: " .. tostring(problem)) end
+        local readOK, actual = read(record.emitter, "Parent")
+        if not readOK then report("emitter parent read: " .. tostring(actual)) end
+        return readOK, actual
+    end
+    local function releaseEmitter(record)
+        record.releasing = true
+        record.connections = disconnect(record.connections)
+        local ok, current = read(record.emitter, "Parent")
+        if not ok then report("emitter restore read: " .. tostring(current)); return false end
+        if current == record.carrier then
+            local destination = restoreDestination(record)
+            ok, current = setParent(record, destination)
+            if not ok or current == record.carrier then return false end
+        end
+        if #record.connections > 0 then return false end
+        if emitters[record.emitter] == record then
+            emitters[record.emitter] = nil
+            record.owner.emitters[record.emitter] = nil
+            emitterCount = emitterCount - 1
+        end
+        return true
+    end
+    local function cleanupFolder()
+        if not folder or next(roots) ~= nil then return folder == nil end
+        local ok, contents = children(folder)
+        if not ok or #contents > 0 then return false end
+        local success, problem = pcall(function() folder:Destroy() end)
+        if success then folder = nil else report("folder cleanup: " .. tostring(problem)) end
+        return folder == nil
+    end
+    local function releaseRoot(record)
+        record.releasing = true
+        record.connections = disconnect(record.connections)
+        for _, emitter in pairs(record.emitters) do releaseEmitter(emitter) end
+        if next(record.emitters) ~= nil or #record.connections > 0 then return false end
+        if record.carrier then
+            local ok, contents = children(record.carrier)
+            if not ok or #contents > 0 then return false end
+            local success, problem = pcall(function() record.carrier:Destroy() end)
+            if not success then report("carrier cleanup: " .. tostring(problem)); return false end
+            record.carrier = nil
+        end
+        if roots[record.root] == record then roots[record.root] = nil; rootCount = rootCount - 1 end
+        return true
+    end
+    local function releaseAll()
+        for _, record in pairs(roots) do releaseRoot(record) end
+        cleanupFolder()
+        return next(roots) == nil and next(emitters) == nil and folder == nil
+    end
+    local function ensureFolder()
+        if folder then
+            local ok, parent = read(folder, "Parent")
+            return ok and parent == World
+        end
+        local ok, result = pcall(function()
+            local created = Instance.new("Folder")
+            folder = created
+            created.Name = "DH_ParticleBounds"
+            created.Parent = World
+            return created
+        end)
+        if not ok then report("folder creation: " .. tostring(result)); cleanupFolder(); return false end
+        return result ~= nil
+    end
+    local function syncCarrier(record, size)
+        local carrier = record.carrier
+        if not carrier then return true end
+        local ok, problem = pcall(function()
+            if carrier.Parent ~= folder or folder.Parent ~= World then error("Particle carrier was moved") end
+            if carrier.Size ~= size then carrier.Size = size end
+            local frame = record.root.CFrame
+            if carrier.CFrame ~= frame then carrier.CFrame = frame end
+        end)
+        if not ok then report("carrier update: " .. tostring(problem)) end
+        return ok
+    end
+    local function ensureCarrier(record, size)
+        if record.carrier then return syncCarrier(record, size) end
+        if not ensureFolder() then releaseRoot(record); cleanupFolder(); return false end
+        local ok, problem = pcall(function()
+            local carrier = Instance.new("Part")
+            record.carrier = carrier
+            carrier.Name = "NativeParticleBounds"
+            carrier.Anchored = true
+            carrier.Transparency = 1
+            carrier.CastShadow = false
+            carrier.CanCollide = false
+            carrier.CanQuery = false
+            carrier.CanTouch = false
+            carrier.Size = size
+            carrier.CFrame = record.root.CFrame
+            carrier.Parent = folder
+        end)
+        if not ok then report("carrier creation: " .. tostring(problem)); releaseRoot(record); return false end
+        return true
+    end
+    local function eligible(record)
+        return enabled() and roots[record.root] == record and not record.releasing and not record.rootDestroyed
+    end
+    local function attachEmitter(record, emitter)
+        if not eligible(record) or record.ignored[emitter] or externallyMoved[emitter] or emitters[emitter] or emitterCount >= EMITTER_LIMIT
+            or not isA(emitter, "ParticleEmitter") then return end
+        local parentOK, parent = read(emitter, "Parent")
+        if not parentOK or parent ~= record.root then return end
+        local size = nativeSize(record.root)
+        if not size or not ensureCarrier(record, size) or not eligible(record) then return end
+        local entry = {
+            emitter = emitter, owner = record, originalParent = record.root, carrier = record.carrier,
+            moving = false, releasing = false, connections = {},
+        }
+        emitters[emitter], record.emitters[emitter] = entry, entry
+        emitterCount = emitterCount + 1
+        local connected, connection = pcall(function()
+            return emitter:GetPropertyChangedSignal("Parent"):Connect(function()
+                if not alive or entry.releasing or entry.moving or emitters[emitter] ~= entry then return end
+                local ok, current = read(emitter, "Parent")
+                if ok and current ~= entry.carrier then
+                    record.ignored[emitter] = true
+                    externallyMoved[emitter] = true
+                    releaseEmitter(entry)
+                end
+            end)
+        end)
+        if not connected then
+            report("emitter observer: " .. tostring(connection))
+            record.ignored[emitter] = true
+            releaseEmitter(entry)
+            return
+        end
+        entry.connections[#entry.connections + 1] = connection
+        local ok, current = setParent(entry, entry.carrier)
+        if not ok or current ~= entry.carrier then
+            record.ignored[emitter] = true
+            if ok then externallyMoved[emitter] = true end
+            releaseEmitter(entry)
+        end
+    end
+    local function newRoot(root)
+        if rootCount >= ROOT_LIMIT then return nil end
+        local record = {
+            root = root, rootDestroyed = false, releasing = false, carrier = nil,
+            connections = {}, emitters = {}, ignored = setmetatable({}, {__mode = "k"}),
+        }
+        roots[root], rootCount = record, rootCount + 1
+        local ok, problem = pcall(function()
+            record.connections[#record.connections + 1] = root.ChildAdded:Connect(function(child)
+                if eligible(record) then attachEmitter(record, child) end
+            end)
+            record.connections[#record.connections + 1] = root.Destroying:Connect(function()
+                if roots[root] ~= record then return end
+                record.rootDestroyed = true
+                releaseRoot(record)
+            end)
+        end)
+        if not ok then report("root observer: " .. tostring(problem)); releaseRoot(record); return nil end
+        return record
+    end
+    local function refreshRoots()
+        local ok, parts = pcall(Hitbox.GetExpandedParts, Hitbox)
+        if not ok or type(parts) ~= "table" then
+            report("Expanded roots were unavailable")
+            releaseAll()
+            return
+        end
+        local selected, order = {}, {}
+        for index, root in ipairs(parts) do
+            if index > ROOT_LIMIT then break end
+            local size = nativeSize(root)
+            if size and not selected[root] then selected[root] = size; order[#order + 1] = root end
+        end
+        for root, record in pairs(roots) do
+            if record.releasing or not selected[root] then releaseRoot(record) end
+        end
+        for _, root in ipairs(order) do
+            local record = roots[root]
+            if not record then record = newRoot(root) end
+            if record and not record.releasing then
+                for emitter, entry in pairs(record.emitters) do
+                    local readOK, parent = read(emitter, "Parent")
+                    if entry.releasing or (readOK and parent ~= entry.carrier) then
+                        record.ignored[emitter] = true
+                        if readOK and parent ~= entry.carrier then externallyMoved[emitter] = true end
+                        releaseEmitter(entry)
+                    end
+                end
+                local readOK, contents = children(root)
+                if readOK then
+                    for index, child in ipairs(contents) do
+                        if index > 128 then break end
+                        attachEmitter(record, child)
+                    end
+                end
+            end
+        end
+    end
+    function controller:Step()
+        if not alive then return end
+        local now = Clock()
+        local refresh = not (now < nextUpdate and nextUpdate - now < 1)
+        if not enabled() then
+            for _, record in pairs(roots) do
+                if not record.releasing or refresh then releaseRoot(record) end
+            end
+            if refresh then
+                cleanupFolder()
+                if next(roots) == nil and next(emitters) == nil then externallyMoved = setmetatable({}, {__mode = "k"}) end
+                nextUpdate = now + 0.2
+            end
+            diagnostics.mode = (next(roots) ~= nil or folder ~= nil) and "Restoring" or "Disabled"
+            return
+        end
+        for _, record in pairs(roots) do
+            if not record.releasing and record.carrier and next(record.emitters) ~= nil then
+                local size = nativeSize(record.root)
+                if not size or not syncCarrier(record, size) then releaseRoot(record) end
+            end
+        end
+        if refresh then nextUpdate = now + 0.2; refreshRoots() end
+        diagnostics.mode = "Enabled"
+    end
+    function controller:Refresh()
+        nextUpdate = -math.huge
+        self:Step()
+    end
+    function controller:Invalidate()
+        if releaseAll() then externallyMoved = setmetatable({}, {__mode = "k"}) end
+        nextUpdate = -math.huge
+        diagnostics.mode = "Reset"
+    end
+    function controller:GetDiagnostics()
+        local result = {}
+        for key, value in pairs(diagnostics) do result[key] = value end
+        result.activeCarriers, result.movedEmitters, result.pendingRestore = 0, 0, 0
+        for _, record in pairs(roots) do
+            if record.releasing then result.pendingRestore = result.pendingRestore + 1
+            elseif record.carrier then result.activeCarriers = result.activeCarriers + 1 end
+        end
+        for _, entry in pairs(emitters) do
+            if entry.releasing then result.pendingRestore = result.pendingRestore + 1
+            else result.movedEmitters = result.movedEmitters + 1 end
+        end
+        if folder and next(roots) == nil then result.pendingRestore = result.pendingRestore + 1 end
+        result.trackedRoots = rootCount
+        result.rootLimit, result.emitterLimit = ROOT_LIMIT, EMITTER_LIMIT
+        return result
+    end
+    function controller:Destroy()
+        alive = false
+        local restored = releaseAll()
+        diagnostics.mode = restored and "Destroyed" or "Restoring"
+        return restored
+    end
+    return controller
 end
 
 local function buildMovementController(ctx)
@@ -2056,6 +2951,7 @@ local function buildUI(ctx)
     local savedMouseIcon, lastCamera, activeDropdown
     local activeTab = "Assistance"
     local rowTab = "Assistance"
+    local rowParent
     local dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty
     local panelDragStarted = false
     local resizeEdges, resizeStart
@@ -2401,6 +3297,11 @@ local function buildUI(ctx)
     end
 
     local function newRow(name, height, showWhen, gap)
+        local parentWhen = rowParent
+        if parentWhen then
+            local childWhen = showWhen
+            showWhen = function() return parentWhen() and (not childWhen or childWhen()) end
+        end
         local container = tabContents[rowTab]
         local frame = make("Frame", container, {
             Name = name .. "Row", Position = UDim2.fromOffset(1, 0),
@@ -2655,6 +3556,7 @@ local function buildUI(ctx)
     end
 
     toggleRow("Enabled", "Enabled")
+    rowParent = function() return Settings.Enabled == true end
     dropdownRow("Mode", "Mode", {
         { Value = "FOV", Label = "FOV" }, { Value = "CurrentTarget", Label = "Current target" },
     })
@@ -2722,6 +3624,7 @@ local function buildUI(ctx)
     }, visualOn, true)
     sliderRow("Visual lead (ms)", "VisualPredictionMs", "VisualPredictionMs", 0, 250, 1, 0, visualOn)
 
+    rowParent = nil
     rowTab = "Movement"
     local function movementOn() return Settings.MovementEnabled == true end
     toggleRow("Movement", "MovementEnabled")
@@ -2739,6 +3642,22 @@ local function buildUI(ctx)
     make("TextLabel", spreadHelp.Frame, {
         Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
         Font = Enum.Font.Code, Text = "100% normal / 0% none", TextSize = 10,
+        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+    })
+    section()
+    local function hitboxOn() return Settings.HitboxEnabled == true end
+    toggleRow("Hitbox expander", "HitboxEnabled")
+    dropdownRow("Hit part", "HitboxTarget", {
+        { Value = "Root", Label = "Root part" }, { Value = "NearestPart", Label = "Nearest part" },
+    }, hitboxOn)
+    sliderRow("X (width)", "HitboxX", "HitboxX", 0, 20, 0.1, 5, hitboxOn, 1)
+    sliderRow("Y (height)", "HitboxY", "HitboxY", 0, 20, 0.1, 5, hitboxOn, 1)
+    sliderRow("Z (depth)", "HitboxZ", "HitboxZ", 0, 20, 0.1, 5, hitboxOn, 1)
+    toggleRow("Show hitboxes", "HitboxShow", hitboxOn)
+    local hitboxHelp = newRow("HitboxHelp", 17, hitboxOn)
+    make("TextLabel", hitboxHelp.Frame, {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "Studs / 0 disables / box stays at root", TextSize = 10,
         TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
     })
 
@@ -2766,9 +3685,14 @@ local function buildUI(ctx)
         if dragSlider and not canInteractRow(dragSlider.Row) then endDrag() end
         local focused = Input:GetFocusedTextBox()
         for _, slider in ipairs(sliders) do
-            if focused == slider.NumberBox and (not canInteractRow(slider.Row)
-                or (slider.EditingProperty and slider.EditingProperty ~= resolveProperty(slider))) then
-                slider.NumberBox:ReleaseFocus()
+            if focused == slider.NumberBox then
+                if not canInteractRow(slider.Row) then
+                    slider.EditingProperty = nil
+                    slider.NumberBox.Text = formatNumber(slider, numericValue(slider))
+                    slider.NumberBox:ReleaseFocus()
+                elseif slider.EditingProperty and slider.EditingProperty ~= resolveProperty(slider) then
+                    slider.NumberBox:ReleaseFocus()
+                end
             end
         end
         layoutDepth = layoutDepth - 1
@@ -2967,7 +3891,8 @@ local function buildUI(ctx)
             refreshFeedback(false)
         end
         lastCamera = camera
-        local display = camera ~= nil and Settings.ShowFOV == true and Settings.FOVEnabled == true
+        local display = camera ~= nil and Settings.Enabled == true
+            and Settings.ShowFOV == true and Settings.FOVEnabled == true
         if not display then circle.Visible = false; clearBoxes(); return end
         local visuals
         if type(ctx.GetFOVVisuals) == "function" then visuals = ctx.GetFOVVisuals() end
@@ -3125,6 +4050,12 @@ local Settings = {
     VisualPredictionMs = 0,
     SpreadEnabled = false,
     SpreadPercent = 100,
+    HitboxEnabled = false,
+    HitboxTarget = "Root",
+    HitboxX = 5,
+    HitboxY = 5,
+    HitboxZ = 5,
+    HitboxShow = true,
     MovementEnabled = false,
     WalkMultiplier = 1,
     ReloadMultiplier = 1,
@@ -3154,10 +4085,12 @@ local choices = {
     TargetKey = {Q = true, T = true, Y = true},
     FOVShape = {Circle = true, Box = true},
     FOVWeaponGroup = {Shotguns = true, Pistols = true, Other = true},
+    HitboxTarget = {Root = true, NearestPart = true},
 }
 
 local numericLimits = {
     FOV = {0, 300, 1}, HitChance = {0, 100, 1}, SpreadPercent = {0, 100, 1},
+    HitboxX = {0, 20, 0.1}, HitboxY = {0, 20, 0.1}, HitboxZ = {0, 20, 0.1},
     FOVX = {0, 20, 0.1}, FOVY = {0, 20, 0.1}, FOVZ = {0, 20, 0.1},
     PointScale = {0.05, 1, 0.05}, AimPredictionMs = {0, 250, 1},
     VisualPredictionMs = {0, 250, 1}, ReactionMs = {0, 400, 1},
@@ -3215,8 +4148,8 @@ local running = true
 local closed = false
 local closing = false
 local connections = {}
-local selector, ui, router, visual, movement, uiRoot
-local state = {Settings = Settings, Version = 19, Errors = {}, UIIsolated = false}
+local selector, ui, router, visual, movement, hitbox, particles, uiRoot
+local state = {Settings = Settings, Version = 24, Errors = {}, UIIsolated = false}
 local function isCurrent()
     return running and not closed and env.__DH_GunHandlerAimUI == state
 end
@@ -3239,9 +4172,24 @@ local function cleanup()
         if not ok then failures[#failures + 1] = tostring(problem) end
     end
 
+    if hitbox then
+        local ok, result = pcall(hitbox.SetRoutingReady, hitbox, false)
+        if not ok or result == false then
+            local problem = ok and "Hitbox queries could not be disabled" or tostring(result)
+            closing = false
+            reportOnce("unload", problem)
+            return false, problem
+        end
+    end
     if router then attempt(function() router:Destroy() end) end
     if visual then attempt(function() visual:Destroy() end) end
     if movement then attempt(function() movement:Destroy() end) end
+    if hitbox then attempt(function()
+        if hitbox:Destroy() == false then error("Some hitbox properties could not be restored", 0) end
+    end) end
+    if particles then attempt(function()
+        if particles:Destroy() == false then error("Some particle origins could not be restored", 0) end
+    end) end
     for _, connection in ipairs(connections) do
         attempt(function() connection:Disconnect() end)
     end
@@ -3291,20 +4239,38 @@ local function setSetting(key, value)
         local visualOnly = key == "ClientBulletRedirection" or key == "VisualPredictionMs"
             or key == "RedirectShotguns" or key == "RedirectPistols" or key == "RedirectOther"
         local presentationOnly = key == "ShowFOV" or key == "FOVWeaponGroup" or key == "TargetKey"
+            or key == "HitboxShow"
+        local hitboxSetting = key == "HitboxEnabled" or key == "HitboxTarget"
+            or key == "HitboxX" or key == "HitboxY" or key == "HitboxZ" or key == "HitboxShow"
         local movementOnly = key == "MovementEnabled" or key == "WalkMultiplier"
             or key == "ReloadMultiplier" or key == "ShootMultiplier"
             or key == "LowHealthMultiplier" or key == "LowHealthThreshold"
         if selector and not presentationOnly and key ~= "HitChance"
             and key ~= "SpreadPercent" and key ~= "SpreadEnabled"
             and not visualOnly and not movementOnly then
-            selector:Invalidate(key ~= "Mode")
+            selector:Invalidate(key ~= "Mode" and key ~= "Enabled")
         end
+        if router and key == "Enabled" then router:Invalidate() end
         if visual and (visualOnly or key == "Enabled") then visual:Invalidate() end
         if movement and movementOnly then
             local ok, failure = pcall(movement.Refresh, movement)
             if not ok then
                 pcall(movement.Invalidate, movement)
                 reportOnce("movement", failure)
+            end
+        end
+        if hitbox and (hitboxSetting or key == "TeamCheck" or key == "SkipKnocked") then
+            local ok, failure = pcall(hitbox.Refresh, hitbox)
+            if not ok then
+                pcall(hitbox.Invalidate, hitbox)
+                reportOnce("hitbox", failure)
+            end
+        end
+        if particles and (hitboxSetting or key == "TeamCheck" or key == "SkipKnocked") then
+            local ok, failure = pcall(particles.Refresh, particles)
+            if not ok then
+                pcall(particles.Invalidate, particles)
+                reportOnce("particle spoofer", failure)
             end
         end
 
@@ -3318,6 +4284,11 @@ state.GetDiagnostics = function()
 end
 state.GetMovementDiagnostics = function()
     return movement and movement:GetDiagnostics() or {enabled = false, mode = running and "Starting" or "Unloaded"}
+end
+state.GetHitboxDiagnostics = function()
+    local result = hitbox and hitbox:GetDiagnostics() or {enabled = false, mode = running and "Starting" or "Unloaded"}
+    result.particles = particles and particles:GetDiagnostics() or {enabled = false, mode = running and "Starting" or "Unloaded"}
+    return result
 end
 state.ToggleTarget = function()
     if not running or not selector or Settings.Mode ~= "CurrentTarget" then return false end
@@ -3340,6 +4311,27 @@ local initialized, problem = pcall(function()
         OnUnload = cleanup, ReferencePoint = referencePoint,
         GetFOVVisuals = function() return selector and selector:GetFOVVisuals() or nil end,
     })
+    hitbox = buildHitboxController({
+        Settings = Settings, Players = Players, LocalPlayer = LocalPlayer,
+        Workspace = workspace, GuiParent = uiRoot, Clock = os.clock, OnError = reportOnce,
+        ReferencePoint = referencePoint, ClosestRayBoxPoint = closestRayBoxPoint,
+    })
+    particles = buildParticleSpoofer({
+        Settings = Settings, Hitbox = hitbox, Workspace = workspace, Clock = os.clock, OnError = reportOnce,
+    })
+    track(RunService.Heartbeat, function()
+        if not running then return end
+        local ok, failure = pcall(hitbox.Step, hitbox)
+        if not ok then
+            pcall(hitbox.Invalidate, hitbox)
+            reportOnce("hitbox", failure)
+        end
+        local particleOK, particleFailure = pcall(particles.Step, particles)
+        if not particleOK then
+            pcall(particles.Invalidate, particles)
+            reportOnce("particle spoofer", particleFailure)
+        end
+    end)
     track(UserInputService.InputBegan, function(input, gameProcessed)
         if not running or UserInputService:GetFocusedTextBox() then return end
         if input.KeyCode == Enum.KeyCode.RightShift then
@@ -3380,7 +4372,7 @@ local initialized, problem = pcall(function()
     })
     router = buildShotRouter({
         GunHandler = GunHandler, Selector = selector, Settings = Settings,
-        LocalPlayer = LocalPlayer, Clock = os.clock, Visual = visual, OnError = reportOnce,
+        LocalPlayer = LocalPlayer, Clock = os.clock, Visual = visual, Hitbox = hitbox, OnError = reportOnce,
     })
     movement = buildMovementController({
         Settings = Settings, LocalPlayer = LocalPlayer, Clock = os.clock, OnError = reportOnce,
@@ -3413,6 +4405,8 @@ local initialized, problem = pcall(function()
         router:Invalidate()
         visual:Invalidate()
         movement:Invalidate()
+        hitbox:Invalidate()
+        particles:Invalidate()
     end
     track(LocalPlayer.CharacterAdded, invalidateCharacter)
     if LocalPlayer.CharacterRemoving then
@@ -3424,6 +4418,9 @@ local initialized, problem = pcall(function()
     ui:Sync()
 
     router:Install()
+    if hitbox:SetRoutingReady(true) == false then error("Hitbox shot routing was not ready", 0) end
+    hitbox:Refresh()
+    particles:Refresh()
 end)
 if not initialized and isCurrent() then
     cleanup()
