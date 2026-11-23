@@ -4172,7 +4172,9 @@ local function buildUI(ctx)
     local loadButton = configButton(actionsRow, "ConfigLoad", "Load", UDim2.new(0.5, 48, 0, 0), UDim2.new(0.5, -48, 1, 0))
     Track(saveButton.Activated, function()
         if not configInteractive(actionsRow) then return end
-        if configOperation("Save", configNameBox.Text) then configNameBox.Text = "" end
+        local name = configNameBox.Text
+        if string.match(name, "^%s*$") then name = configUI.State.Selected end
+        if configOperation("Save", name) then configNameBox.Text = "" end
     end)
     Track(loadButton.Activated, function()
         if not configInteractive(actionsRow) then return end
