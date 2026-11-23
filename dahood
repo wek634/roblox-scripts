@@ -3282,7 +3282,7 @@ local function buildUI(ctx)
     local rowTab = "Assistance"
     local rowParent
     local tabNames = { "Assistance", "Movement", "Exploits", "Settings" }
-    local configUI = { Pending = false, Notice = "", NameSelection = "", State = {Names = {}, Selected = "", Loaded = "", AutoLoad = false, Available = false, Busy = false, Status = "Config storage unavailable"} }
+    local configUI = { Pending = false, Notice = "", State = {Names = {}, Selected = "", Loaded = "", AutoLoad = false, Available = false, Busy = false, Status = "Config storage unavailable"} }
     local dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty
     local panelDragStarted = false
     local resizeEdges, resizeStart
@@ -4172,11 +4172,11 @@ local function buildUI(ctx)
     local loadButton = configButton(actionsRow, "ConfigLoad", "Load", UDim2.new(0.5, 48, 0, 0), UDim2.new(0.5, -48, 1, 0))
     Track(saveButton.Activated, function()
         if not configInteractive(actionsRow) then return end
-        if configOperation("Save", configNameBox.Text) then configNameBox.Text = configUI.State.Selected end
+        if configOperation("Save", configNameBox.Text) then configNameBox.Text = "" end
     end)
     Track(loadButton.Activated, function()
         if not configInteractive(actionsRow) then return end
-        if configOperation("Load", configUI.State.Selected) then configNameBox.Text = configUI.State.Selected end
+        if configOperation("Load", configUI.State.Selected) then configNameBox.Text = "" end
     end)
 
     local autoRow = newRow("ConfigAutoLoad", 19, nil, 2)
@@ -4258,10 +4258,6 @@ local function buildUI(ctx)
         configsLabel.Text = state.Selected ~= "" and state.Selected or "None"
         for _, option in ipairs(configsDropdown.Options) do
             option.Button.BackgroundTransparency = option.Name == state.Selected and 0 or 1
-        end
-        if configUI.NameSelection ~= state.Selected then
-            if Input:GetFocusedTextBox() ~= configNameBox then configNameBox.Text = state.Selected end
-            configUI.NameSelection = state.Selected
         end
         configNameBox.TextEditable = configReady()
         autoMark.Visible = state.AutoLoad
