@@ -1868,12 +1868,14 @@ local function buildUI(ctx)
     local activeTab = "Assistance"
     local rowTab = "Assistance"
     local dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty
+    local panelDragStarted = false
     local resizeEdges, resizeStart
     local layoutRows
     local geometryDepth, layoutDepth = 0, 0
     local rows, toggles, dropdowns, sliders, tabs, boxAdornments = {}, {}, {}, {}, {}, {}
     local PANEL_WIDTH, PANEL_HEIGHT = 360, 520
     local MIN_WIDTH, MIN_HEIGHT = 244, 300
+    local PANEL_DRAG_THRESHOLD = 4
     local colors = {
         Background = Color3.fromRGB(15, 15, 15), Input = Color3.fromRGB(25, 25, 25),
         Border = Color3.fromRGB(8, 8, 8), Text = Color3.fromRGB(224, 224, 224),
@@ -1918,19 +1920,23 @@ local function buildUI(ctx)
         Active = true, ZIndex = 2,
     })
     make("UIStroke", panel, { Color = Color3.fromRGB(48, 48, 48), Thickness = 1 })
-    local header = make("TextButton", panel, {
+    local header = make("Frame", panel, {
         Name = "DragHandle", Position = UDim2.fromOffset(10, 6),
         Size = UDim2.new(1, -35, 0, 19), BackgroundTransparency = 1,
-        AutoButtonColor = false, Active = true, Selectable = false,
+        BorderSizePixel = 0, Active = true, Selectable = false, ZIndex = 3,
+    })
+    local title = make("TextLabel", header, {
+        Name = "Title", Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, BorderSizePixel = 0, Active = false, Selectable = false,
         Font = Enum.Font.Code, Text = "Dmc | Da Hood", TextSize = 11,
-        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left,
-        Modal = false, ZIndex = 3,
+        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 3,
     })
     local closeButton = make("TextButton", panel, {
         Name = "Unload", Position = UDim2.new(1, -25, 0, 6),
         Size = UDim2.fromOffset(17, 19), BackgroundTransparency = 1,
         BorderSizePixel = 0, AutoButtonColor = false, Active = true,
-        Font = Enum.Font.Code, Text = "x", TextSize = 14, TextColor3 = colors.Muted, ZIndex = 3,
+        Font = Enum.Font.Code, Text = "x", TextSize = 14, TextColor3 = colors.Muted,
+        Modal = false, ZIndex = 3,
     })
     for _, y in ipairs({ 29, 391 }) do
         make("Frame", panel, {
@@ -1992,6 +1998,21 @@ local function buildUI(ctx)
     local function endDrag()
         dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty = nil, nil, nil, nil, nil, nil
         resizeEdges, resizeStart = nil, nil
+        panelDragStarted = false
+    end
+    local function dragHeld()
+        if not dragInput then return false end
+        if dragInput.UserInputState == Enum.UserInputState.Cancel
+            or dragInput.UserInputState == Enum.UserInputState.End then
+            endDrag()
+            return false
+        end
+        if dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+            endDrag()
+            return false
+        end
+        return true
     end
     local function closeDropdown()
         if activeDropdown then
@@ -2407,7 +2428,9 @@ local function buildUI(ctx)
             local height = positions[name] + 1
             content.CanvasSize = UDim2.fromOffset(0, height)
             local scrollY = math.clamp(content.CanvasPosition.Y, 0, math.max(0, height - content.AbsoluteSize.Y))
-            if scrollY ~= content.CanvasPosition.Y then content.CanvasPosition = Vector2.new(0, scrollY) end
+            if content.CanvasPosition.X ~= 0 or scrollY ~= content.CanvasPosition.Y then
+                content.CanvasPosition = Vector2.new(0, scrollY)
+            end
         end
         if activeDropdown and not canInteractRow(activeDropdown.Row) then closeDropdown() end
         if dragSlider and not canInteractRow(dragSlider.Row) then endDrag() end
@@ -2421,7 +2444,7 @@ local function buildUI(ctx)
         layoutDepth = layoutDepth - 1
     end
     local function moveSlider(slider, property, position)
-        if not canInteractRow(slider.Row) then return end
+        if not dragHeld() or not canInteractRow(slider.Row) then return end
         local fraction = math.clamp((position.X - slider.Button.AbsolutePosition.X)
             / math.max(1, slider.Button.AbsoluteSize.X), 0, 1)
         changeSetting(property, quantize(slider, slider.Minimum + fraction * (slider.Maximum - slider.Minimum)))
@@ -2434,6 +2457,7 @@ local function buildUI(ctx)
         closeDropdown()
         dragInput, dragKind, dragSlider = input, kind, slider
         dragStart, panelStart = input.Position, panel.Position
+        panelDragStarted = false
         if slider then
             dragProperty = resolveProperty(slider)
             moveSlider(slider, dragProperty, input.Position)
@@ -2474,6 +2498,7 @@ local function buildUI(ctx)
         applyRectangle(left, top, right - left, bottom - top)
     end
     Track(header.InputBegan, function(input) beginDrag(input, "panel") end)
+    Track(title.InputBegan, function(input) beginDrag(input, "panel") end)
     for _, region in ipairs(resizeHandles) do
         local edges = region.Edges
         Track(region.Button.InputBegan, function(input) beginResize(input, edges) end)
@@ -2485,8 +2510,7 @@ local function buildUI(ctx)
     Track(Input.InputChanged, function(input)
         if destroyed or not dragInput then return end
         if not canInteractWindow() then endDrag(); return end
-        if dragInput.UserInputState == Enum.UserInputState.Cancel
-            or dragInput.UserInputState == Enum.UserInputState.End then endDrag(); return end
+        if not dragHeld() then return end
         local mouseMove = dragInput.UserInputType == Enum.UserInputType.MouseButton1
             and input.UserInputType == Enum.UserInputType.MouseMovement
         if input ~= dragInput and not mouseMove then return end
@@ -2494,6 +2518,10 @@ local function buildUI(ctx)
         elseif dragKind == "resize" then moveResize(input.Position)
         else
             local delta = input.Position - dragStart
+            if not panelDragStarted then
+                if delta.X * delta.X + delta.Y * delta.Y < PANEL_DRAG_THRESHOLD * PANEL_DRAG_THRESHOLD then return end
+                panelDragStarted = true
+            end
             panel.Position = UDim2.fromOffset(panelStart.X.Offset + delta.X, panelStart.Y.Offset + delta.Y)
             clampPanel()
         end
@@ -2516,6 +2544,9 @@ local function buildUI(ctx)
     for name, content in pairs(tabContents) do
         local tabName, tabContent = name, content
         Track(tabContent:GetPropertyChangedSignal("CanvasPosition"), function()
+            if tabContent.CanvasPosition.X ~= 0 then
+                tabContent.CanvasPosition = Vector2.new(0, tabContent.CanvasPosition.Y)
+            end
             if activeDropdown and activeDropdown.Row.Container == tabContent then closeDropdown() end
 
             if activeTab == tabName and dragKind ~= "resize"
@@ -2577,7 +2608,7 @@ local function buildUI(ctx)
         closeDropdown()
 
         if value then savedMouseIcon = Input.MouseIconEnabled end
-        visible, header.Modal, gui.Enabled = value, value, value
+        visible, closeButton.Modal, gui.Enabled = value, value, value
         if value then
             Input.MouseIconEnabled = true
             clampPanel()
@@ -2593,6 +2624,7 @@ local function buildUI(ctx)
     function ui:IsVisible() return not destroyed and visible end
     function ui:Render(camera)
         if destroyed then return end
+        if dragInput then dragHeld() end
         lastCamera = camera
         local display = camera ~= nil and Settings.ShowFOV == true and Settings.FOVEnabled == true
         if not display then circle.Visible = false; clearBoxes(); return end
@@ -2647,7 +2679,7 @@ local function buildUI(ctx)
         endDrag()
         closeDropdown()
         clearBoxes()
-        circle.Visible, header.Modal = false, false
+        circle.Visible, closeButton.Modal = false, false
         if not insideGuiDestroy and gui.Parent then gui:Destroy() end
         if overlay.Parent then overlay:Destroy() end
     end
@@ -2821,7 +2853,7 @@ local closed = false
 local closing = false
 local connections = {}
 local selector, ui, router, visual, movement
-local state = {Settings = Settings, Version = 12, Errors = {}}
+local state = {Settings = Settings, Version = 13, Errors = {}}
 local function reportOnce(area, problem)
     if state.Errors[area] == nil then state.Errors[area] = tostring(problem) end
 end
