@@ -2939,6 +2939,333 @@ local function buildMovementController(ctx)
     return controller
 end
 
+local function buildConfigController(ctx)
+    local files = ctx.FileOps or {}
+    local defaults, entries, names = {}, {}, {}
+    for key, value in pairs(ctx.Defaults or {}) do defaults[key] = value end
+    local folder, metaPath = "DmcDaHood/Configs", "DmcDaHood/autoload.json"
+    local alive, busy, initialized, available = true, false, false, false
+    local selected, loaded, autoLoad, status = "", "", false, ""
+    local MAX_BYTES, MAX_CONFIGS = 131072, 128
+    local controller = {}
+
+    local function current()
+        if not alive then return false end
+        if type(ctx.IsCurrent) ~= "function" then return true end
+        local ok, value = pcall(ctx.IsCurrent)
+        return ok and value == true
+    end
+    local function normalizeName(value)
+        if type(value) ~= "string" then return nil end
+        value = string.match(value, "^%s*(.-)%s*$")
+        if #value < 1 or #value > 48 or not string.match(value, "^[%w _%-]+$") then return nil end
+        return value, string.lower(value)
+    end
+    local function configPath(key)
+        return folder .. "/cfg_" .. key .. ".json"
+    end
+    local function decode(text)
+        if type(text) ~= "string" or #text > MAX_BYTES then return nil end
+        local ok, value = pcall(ctx.JSONDecode, text)
+        return ok and type(value) == "table" and value or nil
+    end
+    local function encode(value)
+        local ok, text = pcall(ctx.JSONEncode, value)
+        if not ok or type(text) ~= "string" or #text > MAX_BYTES then return nil end
+        return text
+    end
+    local function validate(values)
+        if type(values) ~= "table" then return nil end
+        local result, known, count = {}, 0, 0
+        for key in pairs(values) do
+            count = count + 1
+            if count > 256 then return nil end
+            if defaults[key] ~= nil then known = known + 1 end
+        end
+        if known == 0 then return nil end
+        for key, default in pairs(defaults) do
+            local value = values[key]
+            if value == nil then value = default end
+            local ok, normalized, problem = pcall(ctx.Normalize, key, value)
+            if not ok or problem or normalized == nil then return nil end
+            local kind = type(normalized)
+            if kind ~= "boolean" and kind ~= "string" and kind ~= "number" then return nil end
+            if kind == "number" and (normalized ~= normalized or math.abs(normalized) == math.huge) then return nil end
+            result[key] = normalized
+        end
+        return result
+    end
+    local function capabilities()
+        for _, name in ipairs({"readfile", "writefile", "listfiles", "isfile", "isfolder", "makefolder"}) do
+            if type(files[name]) ~= "function" then return false end
+        end
+        return type(ctx.JSONEncode) == "function" and type(ctx.JSONDecode) == "function"
+            and type(ctx.Normalize) == "function" and type(ctx.Snapshot) == "function"
+            and type(ctx.Apply) == "function" and next(defaults) ~= nil
+    end
+    local function ensureStore()
+        if not capabilities() then return false, "File access unavailable" end
+        for _, path in ipairs({"DmcDaHood", folder}) do
+            if not current() then return false, "Script reloaded" end
+            local ok, exists = pcall(files.isfolder, path)
+            if not ok then return false, "Folder unavailable" end
+            if not exists then
+                if not current() then return false, "Script reloaded" end
+                local made, result = pcall(files.makefolder, path)
+                if not made or result == false then return false, "Folder unavailable" end
+                local checked, found = pcall(files.isfolder, path)
+                if not checked or not found then return false, "Folder unavailable" end
+            end
+        end
+        if not current() then return false, "Script reloaded" end
+        return true
+    end
+    local function readFile(path)
+        if not current() then return nil, "Script reloaded" end
+        local ok, exists = pcall(files.isfile, path)
+        if not ok then return nil, "Couldn't read config" end
+        if not exists then return nil, "Config missing" end
+        local readOK, text = pcall(files.readfile, path)
+        if not current() then return nil, "Script reloaded" end
+        if not readOK or type(text) ~= "string" then return nil, "Couldn't read config" end
+        if #text > MAX_BYTES then return nil, "Config too large" end
+        return text
+    end
+    local function writeFile(path, text)
+        if not current() then return false, "Script reloaded" end
+        local existsOK, exists = pcall(files.isfile, path)
+        if not existsOK then return false, "Couldn't save config" end
+        local previous
+        if exists then
+            local ok, value = pcall(files.readfile, path)
+            if not ok or type(value) ~= "string" or #value > MAX_BYTES then return false, "Couldn't read existing file" end
+            previous = value
+            if previous == text then
+                if not current() then return false, "Script reloaded" end
+                return true
+            end
+        end
+        if not current() then return false, "Script reloaded" end
+        local wrote, result = pcall(files.writefile, path, text)
+        if not current() then return false, "Script reloaded" end
+        local readOK, actual = pcall(files.readfile, path)
+        if not current() then return false, "Script reloaded" end
+        if wrote and result ~= false and readOK and actual == text then return true end
+        if previous ~= nil and current() then
+            local restored, restoreResult = pcall(files.writefile, path, previous)
+            if not current() then return false, "Script reloaded" end
+            local verified, restoredText = pcall(files.readfile, path)
+            if not restored or restoreResult == false or not verified or restoredText ~= previous then
+                return false, "Save failed; restore failed"
+            end
+        elseif current() and type(files.delfile) == "function" then
+            pcall(files.delfile, path)
+        end
+        return false, "Couldn't save config"
+    end
+    local function writeMetadata(name, enabled)
+        local text = encode({Version = 1, AutoLoad = enabled, Name = name})
+        if not text then return false, "Couldn't save auto load" end
+        return writeFile(metaPath, text)
+    end
+    local function sortedNames()
+        names = {}
+        for _, entry in pairs(entries) do names[#names + 1] = entry.Name end
+        table.sort(names, function(a, b)
+            local x, y = string.lower(a), string.lower(b)
+            return x == y and a < b or x < y
+        end)
+    end
+    local function refreshList()
+        if not current() then return false, "Script reloaded" end
+        local ok, paths = pcall(files.listfiles, folder)
+        if not current() then return false, "Script reloaded" end
+        if not ok or type(paths) ~= "table" then return false, "Couldn't list configs" end
+        local found, count, visited = {}, 0, 0
+        for _, path in pairs(paths) do
+            visited = visited + 1
+            if visited > 1024 then return false, "Too many files" end
+            if type(path) == "string" then
+                local basename = string.match(string.gsub(path, "\\", "/"), "([^/]+)$")
+                local candidate = basename and string.match(basename, "^cfg_(.+)%.json$")
+                local name, key = normalizeName(candidate)
+                if name and not found[key] then
+                    count = count + 1
+                    if count > MAX_CONFIGS then return false, "Too many configs" end
+                    local canonical = configPath(key)
+                    local text = readFile(canonical)
+                    if not current() then return false, "Script reloaded" end
+                    local record = text and decode(text)
+                    local title, recordKey = normalizeName(record and record.Name)
+                    if title and recordKey == key then name = title end
+                    found[key] = {Name = name, Path = canonical}
+                end
+            end
+        end
+        entries = found
+        sortedNames()
+        local _, key = normalizeName(selected)
+        if key and entries[key] then selected = entries[key].Name
+        elseif selected ~= "" then selected = "" end
+        return true
+    end
+    local function profile(name)
+        local clean, key = normalizeName(name)
+        if not clean then return nil, nil, "Choose a config" end
+        local text, problem = readFile(configPath(key))
+        if not text then return nil, nil, problem end
+        local record = decode(text)
+        if not record or record.Version ~= 1 then return nil, nil, "Invalid config" end
+        local title, recordKey = normalizeName(record.Name)
+        if not title or recordKey ~= key then return nil, nil, "Invalid config" end
+        local values = validate(record.Settings)
+        if not values then return nil, nil, "Invalid config" end
+        return values, title
+    end
+    local function snapshot()
+        local ok, values = pcall(ctx.Snapshot)
+        return ok and validate(values) or nil
+    end
+    local function apply(values)
+        if not current() then return false, "Script reloaded" end
+        local ok, result = pcall(ctx.Apply, values)
+        if not current() then return false, "Script reloaded" end
+        return ok and result == true, "Couldn't apply config"
+    end
+    local function loadProfile(name, persist)
+        local values, title, problem = profile(name)
+        if not values then return false, problem end
+        local previous = persist and snapshot() or nil
+        if persist and not previous then return false, "Couldn't read settings" end
+        local applied, applyProblem = apply(values)
+        if not applied then return false, applyProblem end
+        if persist then
+            local saved, saveProblem = writeMetadata(title, autoLoad)
+            if not saved then
+                if not current() then return false, "Script reloaded" end
+                local restored = apply(previous)
+                return false, restored and saveProblem or "Load failed; restore failed"
+            end
+        end
+        loaded, selected = title, title
+        local _, key = normalizeName(title)
+        entries[key] = {Name = title, Path = configPath(key)}
+        sortedNames()
+        return true, "Loaded " .. title
+    end
+    local function run(callback)
+        if not current() then return false, "Script reloaded" end
+        if busy then return false, "Working..." end
+        busy = true
+        local ok, success, message = pcall(callback)
+        busy = false
+        if not ok then success, message = false, "Config operation failed" end
+        if current() then status = message or "" end
+        return success == true, message
+    end
+    local function ready()
+        return initialized and available and current()
+    end
+    local function initialize()
+            if initialized then return available, status end
+            local ok, problem = ensureStore()
+            if not ok then available = false; return false, problem end
+            local listed, listProblem = refreshList()
+            if not listed then available = false; return false, listProblem end
+            available, initialized = true, true
+            local existsOK, exists = pcall(files.isfile, metaPath)
+            if not current() then return false, "Script reloaded" end
+            if not existsOK then return false, "Couldn't read auto load" end
+            if not exists then return true, "" end
+            local text = readFile(metaPath)
+            local metadata = text and decode(text)
+            if not metadata or metadata.Version ~= 1 or type(metadata.AutoLoad) ~= "boolean"
+                or type(metadata.Name) ~= "string" then return false, "Invalid auto load settings" end
+            local name, key = normalizeName(metadata.Name)
+            if metadata.Name ~= "" and not name then return false, "Invalid auto load settings" end
+            if metadata.AutoLoad and not name then return false, "Invalid auto load settings" end
+            loaded, autoLoad = name or "", metadata.AutoLoad
+            selected = key and entries[key] and entries[key].Name or ""
+            if autoLoad then return loadProfile(loaded, false) end
+            return true, ""
+    end
+    function controller:Initialize()
+        return run(initialize)
+    end
+    function controller:Refresh()
+        return run(function()
+            if not initialized then return initialize() end
+            local ok, problem = ensureStore()
+            if not ok then available = false; return false, problem end
+            local refreshed, refreshProblem = refreshList()
+            if not refreshed then return false, refreshProblem end
+            available = true
+            return true, status
+        end)
+    end
+    function controller:Select(name)
+        return run(function()
+            if not ready() then return false, "File access unavailable" end
+            local _, key = normalizeName(name)
+            if not key or not entries[key] then return false, "Choose a config" end
+            selected = entries[key].Name
+            return true, autoLoad and loaded ~= "" and ("Auto load: " .. loaded) or status
+        end)
+    end
+    function controller:Save(name)
+        return run(function()
+            if not ready() then return false, "File access unavailable" end
+            local title, key = normalizeName(name)
+            if not title then return false, "Use 1-48 letters, numbers, spaces, - or _" end
+            local count = 0
+            for _ in pairs(entries) do count = count + 1 end
+            if not entries[key] and count >= MAX_CONFIGS then return false, "Too many configs" end
+            local values = snapshot()
+            if not values then return false, "Couldn't read settings" end
+            local text = encode({Version = 1, Name = title, Settings = values})
+            if not text then return false, "Couldn't save config" end
+            local saved, problem = writeFile(configPath(key), text)
+            if not saved then return false, problem end
+            entries[key] = {Name = title, Path = configPath(key)}
+            selected = title
+            sortedNames()
+            return true, "Saved " .. title
+        end)
+    end
+    function controller:Load(name)
+        return run(function()
+            if not ready() then return false, "File access unavailable" end
+            return loadProfile(name, true)
+        end)
+    end
+    function controller:SetAutoLoad(value)
+        return run(function()
+            if not ready() then return false, "File access unavailable" end
+            if type(value) ~= "boolean" then return false, "Invalid auto load option" end
+            if value and loaded == "" then return false, "Load a config first" end
+            if value then
+                local values = profile(loaded)
+                if not values then return false, "Load a config first" end
+            end
+            local saved, problem = writeMetadata(loaded, value)
+            if not saved then return false, problem end
+            autoLoad = value
+            return true, value and ("Auto load: " .. loaded) or "Auto load off"
+        end)
+    end
+    function controller:GetState()
+        local listed = {}
+        for index, name in ipairs(names) do listed[index] = name end
+        return {Names = listed, Selected = selected, Loaded = loaded, AutoLoad = autoLoad,
+            Available = available and alive, Busy = busy, Status = status}
+    end
+    function controller:Destroy()
+        alive, available = false, false
+        status = ""
+    end
+    return controller
+end
+
 local function buildUI(ctx)
     local Settings, Input, Track = ctx.Settings, ctx.UserInputService, ctx.Track
     local TweenService = ctx.TweenService or game:GetService("TweenService")
@@ -2947,19 +3274,23 @@ local function buildUI(ctx)
     local refreshFeedback
     local feedbackPending = false
     local ui = {}
+    local configNameBox, syncConfigUI
+    local configStatusRevision = 0
     local destroyed, insideGuiDestroy, visible = false, false, false
     local savedMouseIcon, lastCamera, activeDropdown
     local activeTab = "Assistance"
     local rowTab = "Assistance"
     local rowParent
+    local tabNames = { "Assistance", "Movement", "Exploits", "Settings" }
+    local configUI = { Pending = false, Notice = "", NameSelection = "", State = {Names = {}, Selected = "", Loaded = "", AutoLoad = false, Available = false, Busy = false, Status = "Config storage unavailable"} }
     local dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty
     local panelDragStarted = false
     local resizeEdges, resizeStart
-    local layoutRows
+    local layoutRows, layoutTabs
     local geometryDepth, layoutDepth = 0, 0
     local rows, toggles, dropdowns, sliders, tabs, boxAdornments = {}, {}, {}, {}, {}, {}
     local PANEL_WIDTH, PANEL_HEIGHT = 360, 520
-    local MIN_WIDTH, MIN_HEIGHT = 244, 300
+    local MIN_WIDTH, MIN_HEIGHT = 340, 300
     local PANEL_DRAG_THRESHOLD = 4
     local colors = {
         Background = Color3.fromRGB(15, 15, 15), Input = Color3.fromRGB(25, 25, 25),
@@ -3063,7 +3394,15 @@ local function buildUI(ctx)
         ScrollBarImageColor3 = colors.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
         TopImage = "", BottomImage = "", ZIndex = 3,
     })
-    local tabContents = { Assistance = main, Movement = misc, Exploits = exploits }
+    local configsContent = make("ScrollingFrame", panel, {
+        Name = "SettingsContent", Position = main.Position, Size = main.Size,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+        Active = true, ClipsDescendants = true, CanvasSize = UDim2.fromOffset(0, 0),
+        CanvasPosition = Vector2.new(0, 0), ScrollBarThickness = 2,
+        ScrollBarImageColor3 = colors.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
+        TopImage = "", BottomImage = "", ZIndex = 3,
+    })
+    local tabContents = { Assistance = main, Movement = misc, Exploits = exploits, Settings = configsContent }
     make("TextLabel", panel, {
         Name = "Footer", Position = UDim2.new(0, 11, 1, -22), Size = UDim2.new(1, -22, 0, 14),
         BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "Right Shift: menu",
@@ -3116,11 +3455,12 @@ local function buildUI(ctx)
             if refreshFeedback then refreshFeedback(true) end
         end
     end
-    local function releaseNumberFocus()
+    local function releaseInputFocus()
         local focused = Input:GetFocusedTextBox()
         for _, slider in ipairs(sliders) do
             if focused == slider.NumberBox then slider.NumberBox:ReleaseFocus() end
         end
+        if configNameBox and focused == configNameBox then configNameBox:ReleaseFocus() end
     end
     local function changeSetting(property, value)
         if not destroyed then ctx.SetSetting(property, value) end
@@ -3201,10 +3541,11 @@ local function buildUI(ctx)
     local function bindFeedback(control, style, available)
         local entry = { Control = control, Style = style, Available = available or canInteractWindow }
         feedbackEntries[#feedbackEntries + 1] = entry
-        Track(control:GetPropertyChangedSignal("GuiState"), function()
+        entry.Connection = Track(control:GetPropertyChangedSignal("GuiState"), function()
             refreshFeedbackEntry(entry, false)
         end)
         refreshFeedbackEntry(entry, true)
+        return entry
     end
     bindFeedback(closeButton, function(state)
         return {{ Object = closeButton, Goals = {
@@ -3237,6 +3578,7 @@ local function buildUI(ctx)
         for _, content in pairs(tabContents) do
             content.Size = UDim2.new(1, -math.min(20, width), 0, math.max(0, height - 97))
         end
+        if layoutTabs then layoutTabs() end
         if layoutRows then layoutRows() end
         geometryDepth = geometryDepth - 1
     end
@@ -3258,7 +3600,7 @@ local function buildUI(ctx)
         if destroyed or not tabContents[name] then return end
         endDrag()
         closeDropdown()
-        releaseNumberFocus()
+        releaseInputFocus()
         activeTab = name
         for tabName, content in pairs(tabContents) do
             content.Visible = tabName == name
@@ -3271,13 +3613,13 @@ local function buildUI(ctx)
         feedbackPending = true
         refreshFeedback(true)
     end
-    for index, name in ipairs({ "Assistance", "Movement", "Exploits" }) do
+    for index, name in ipairs(tabNames) do
         local tabName = name
         local button = make("TextButton", panel, {
             Name = tabName .. "Tab", Position = UDim2.fromOffset(11 + (index - 1) * 77, 35),
             Size = UDim2.fromOffset(70, 22), BackgroundColor3 = colors.Input, BorderSizePixel = 0,
             AutoButtonColor = false, Active = true, Font = Enum.Font.Code, Text = tabName,
-            TextSize = 11, TextColor3 = colors.Muted, ZIndex = 3,
+            TextSize = 11, TextColor3 = colors.Muted, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
         })
         local line = make("Frame", button, {
             Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1),
@@ -3295,6 +3637,16 @@ local function buildUI(ctx)
             if canInteractWindow() then setTab(tabName) end
         end)
     end
+
+    layoutTabs = function()
+        local gap = 7
+        local width = math.min(70, math.max(1, (panel.Size.X.Offset - 22 - gap * (#tabNames - 1)) / #tabNames))
+        for index, name in ipairs(tabNames) do
+            tabs[name].Button.Position = UDim2.fromOffset(11 + (index - 1) * (width + gap), 35)
+            tabs[name].Button.Size = UDim2.fromOffset(width, 22)
+        end
+    end
+    layoutTabs()
 
     local function newRow(name, height, showWhen, gap)
         local parentWhen = rowParent
@@ -3638,12 +3990,6 @@ local function buildUI(ctx)
     local function spreadOn() return Settings.SpreadEnabled == true end
     toggleRow("Spread modifier", "SpreadEnabled")
     sliderRow("Spread (%)", "SpreadPercent", "SpreadPercent", 0, 100, 1, 100, spreadOn)
-    local spreadHelp = newRow("SpreadHelp", 17, spreadOn)
-    make("TextLabel", spreadHelp.Frame, {
-        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-        Font = Enum.Font.Code, Text = "100% normal / 0% none", TextSize = 10,
-        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
-    })
     section()
     local function hitboxOn() return Settings.HitboxEnabled == true end
     toggleRow("Hitbox expander", "HitboxEnabled")
@@ -3654,17 +4000,285 @@ local function buildUI(ctx)
     sliderRow("Y (height)", "HitboxY", "HitboxY", 0, 20, 0.1, 5, hitboxOn, 1)
     sliderRow("Z (depth)", "HitboxZ", "HitboxZ", 0, 20, 0.1, 5, hitboxOn, 1)
     toggleRow("Show hitboxes", "HitboxShow", hitboxOn)
-    local hitboxHelp = newRow("HitboxHelp", 17, hitboxOn)
-    make("TextLabel", hitboxHelp.Frame, {
-        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
-        Font = Enum.Font.Code, Text = "Studs / 0 disables / box stays at root", TextSize = 10,
-        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+    rowTab = "Settings"
+    local function configReady()
+        local state = configUI.State
+        return not configUI.Pending and state.Available == true and state.Busy ~= true
+    end
+    local function configInteractive(row)
+        return canInteractRow(row) and configReady()
+    end
+    local function configLabel(row, text)
+        return make("TextLabel", row.Frame, {
+            Size = UDim2.fromOffset(89, 22), BackgroundTransparency = 1,
+            Font = Enum.Font.Code, Text = text, TextSize = 11,
+            TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+        })
+    end
+    local function configButton(row, name, text, position, size)
+        local button = make("TextButton", row.Frame, {
+            Name = name, Position = position, Size = size,
+            BackgroundColor3 = colors.Input, BorderColor3 = colors.Border, BorderSizePixel = 1,
+            AutoButtonColor = false, Active = true, Font = Enum.Font.Code,
+            Text = text, TextSize = 10, TextColor3 = colors.Text, ZIndex = 5,
+        })
+        bindFeedback(button, function(state)
+            return {{ Object = button, Goals = {
+                BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+                BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+                TextColor3 = configReady() and colors.Text or colors.Muted,
+            }}}
+        end, function() return configInteractive(row) end)
+        return button
+    end
+    local function configOperation(method, ...)
+        if destroyed or configUI.Pending then return false end
+        local backend = ctx.Configs
+        if type(backend) ~= "table" or type(backend[method]) ~= "function" then
+            configUI.Notice = "Config storage unavailable"
+            configStatusRevision = configStatusRevision + 1
+            if syncConfigUI then syncConfigUI() end
+            return false
+        end
+        releaseInputFocus()
+        configUI.Pending, configUI.Notice = true, ""
+        if syncConfigUI then syncConfigUI() end
+        local ok, success, message = pcall(backend[method], backend, ...)
+        configUI.Pending = false
+        if not ok then configUI.Notice = "Config operation failed"
+        elseif success ~= true then configUI.Notice = tostring(message or "Config operation failed") end
+        if (method ~= "Refresh" and method ~= "Select") or not ok or success ~= true then
+            configStatusRevision = configStatusRevision + 1
+        end
+        if not destroyed and syncConfigUI then syncConfigUI() end
+        return not destroyed and ok and success == true
+    end
+
+    local nameRow = newRow("ConfigName", 22)
+    configLabel(nameRow, "Name")
+    configNameBox = make("TextBox", nameRow.Frame, {
+        Name = "ConfigNameValue", Position = UDim2.fromOffset(90, 0), Size = UDim2.new(1, -90, 1, 0),
+        BackgroundColor3 = colors.Input, BorderColor3 = colors.Border, BorderSizePixel = 1,
+        Font = Enum.Font.Code, Text = "", TextSize = 10, TextColor3 = colors.Text,
+        TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 5,
     })
+    bindFeedback(configNameBox, function(state)
+        return {{ Object = configNameBox, Goals = {
+            BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+            BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+        }}}
+    end, function() return configInteractive(nameRow) end)
+    Track(configNameBox.Focused, function()
+        if not configInteractive(nameRow) and Input:GetFocusedTextBox() == configNameBox then
+            configNameBox:ReleaseFocus()
+        end
+    end)
+
+    local configsRow = newRow("Configs", 22)
+    configLabel(configsRow, "Configs")
+    local configsButton = configButton(configsRow, "ConfigsDropdown", "", UDim2.fromOffset(90, 0), UDim2.new(1, -90, 1, 0))
+    local configsLabel = make("TextLabel", configsButton, {
+        Position = UDim2.fromOffset(6, 0), Size = UDim2.new(1, -12, 1, 0),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "None", TextSize = 10,
+        TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+    })
+    local configsMenu = make("ScrollingFrame", canvas, {
+        Name = "ConfigsOptions", Size = UDim2.fromOffset(156, 28),
+        BackgroundColor3 = Color3.fromRGB(20, 20, 20), BorderColor3 = Color3.fromRGB(75, 75, 75),
+        BorderSizePixel = 1, Active = true, Visible = false, ClipsDescendants = true,
+        CanvasSize = UDim2.fromOffset(0, 0), CanvasPosition = Vector2.new(0, 0),
+        ScrollBarThickness = 2, ScrollBarImageColor3 = colors.Muted,
+        ScrollingDirection = Enum.ScrollingDirection.Y, TopImage = "", BottomImage = "", ZIndex = 100,
+    })
+    local configsDropdown = {Row = configsRow, Button = configsButton, Menu = configsMenu, ContentHeight = 6, Options = {}, Names = {}}
+    configUI.ClearOptions = function()
+        for _, option in ipairs(configsDropdown.Options) do
+            if option.Connection then option.Connection:Disconnect() end
+            if option.Feedback.Connection then option.Feedback.Connection:Disconnect() end
+            for index = #feedbackEntries, 1, -1 do
+                if feedbackEntries[index] == option.Feedback then table.remove(feedbackEntries, index); break end
+            end
+            for _, object in ipairs({option.Button, option.Label}) do
+                stopFeedbackTween(object)
+                feedbackGoals[object] = nil
+            end
+            option.Button:Destroy()
+        end
+        configsDropdown.Options = {}
+    end
+    local function rebuildConfigOptions(names)
+        local sorted = {}
+        for _, name in ipairs(names) do if type(name) == "string" then sorted[#sorted + 1] = name end end
+        table.sort(sorted)
+        local same = #sorted == #configsDropdown.Names
+        if same then
+            for index, name in ipairs(sorted) do
+                if name ~= configsDropdown.Names[index] then same = false; break end
+            end
+        end
+        if same then return end
+        configUI.ClearOptions()
+        configsDropdown.Names = sorted
+        configsDropdown.ContentHeight = #sorted * 22 + 6
+        configsMenu.CanvasSize = UDim2.fromOffset(0, configsDropdown.ContentHeight)
+        configsMenu.CanvasPosition = Vector2.new(0, 0)
+        for index, name in ipairs(sorted) do
+            local choice = name
+            local option = make("TextButton", configsMenu, {
+                Name = "ConfigOption" .. tostring(index), Position = UDim2.fromOffset(3, 3 + (index - 1) * 22),
+                Size = UDim2.new(1, -6, 0, 21), BorderSizePixel = 0,
+                BackgroundColor3 = colors.Selected, BackgroundTransparency = 1,
+                Active = true, AutoButtonColor = false, Text = "", ZIndex = 101,
+            })
+            local label = make("TextLabel", option, {
+                Position = UDim2.fromOffset(6, 0), Size = UDim2.new(1, -12, 1, 0),
+                BackgroundTransparency = 1, Font = Enum.Font.Code, Text = choice, TextSize = 10,
+                TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 102,
+            })
+            local feedback = bindFeedback(option, function(state)
+                return {
+                    { Object = option, Goals = {BackgroundColor3 = feedbackColor(state, colors.Selected, colors.Hover, colors.Press)} },
+                    { Object = label, Goals = {TextColor3 = feedbackColor(state, colors.Text, colors.TextHover, colors.TextPress)} },
+                }
+            end, function() return configInteractive(configsRow) and activeDropdown == configsDropdown and configsMenu.Visible end)
+            local connection = option.Activated:Connect(function()
+                if not configInteractive(configsRow) or activeDropdown ~= configsDropdown or not configsMenu.Visible then return end
+                closeDropdown()
+                configOperation("Select", choice)
+            end)
+            configsDropdown.Options[#configsDropdown.Options + 1] = {Name = choice, Button = option, Label = label, Feedback = feedback, Connection = connection}
+        end
+        if activeDropdown == configsDropdown then positionDropdown(configsDropdown) end
+    end
+    Track(configsButton.Activated, function()
+        if not configInteractive(configsRow) then return end
+        local wasOpen = activeDropdown == configsDropdown
+        closeDropdown()
+        if wasOpen then return end
+        endDrag()
+        configOperation("Refresh")
+        if not configInteractive(configsRow) or #configsDropdown.Options == 0 then return end
+        positionDropdown(configsDropdown)
+        configsMenu.Visible = true
+        activeDropdown = configsDropdown
+        feedbackPending = true
+        refreshFeedback(true)
+    end)
+
+    local actionsRow = newRow("ConfigActions", 22)
+    local saveButton = configButton(actionsRow, "ConfigSave", "Save", UDim2.fromOffset(90, 0), UDim2.new(0.5, -48, 1, 0))
+    local loadButton = configButton(actionsRow, "ConfigLoad", "Load", UDim2.new(0.5, 48, 0, 0), UDim2.new(0.5, -48, 1, 0))
+    Track(saveButton.Activated, function()
+        if not configInteractive(actionsRow) then return end
+        if configOperation("Save", configNameBox.Text) then configNameBox.Text = configUI.State.Selected end
+    end)
+    Track(loadButton.Activated, function()
+        if not configInteractive(actionsRow) then return end
+        if configOperation("Load", configUI.State.Selected) then configNameBox.Text = configUI.State.Selected end
+    end)
+
+    local autoRow = newRow("ConfigAutoLoad", 19, nil, 2)
+    local autoButton = make("TextButton", autoRow.Frame, {
+        Name = "ConfigAutoLoad", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        AutoButtonColor = false, Active = true, Text = "", ZIndex = 5,
+    })
+    local autoBox = make("Frame", autoButton, {
+        Position = UDim2.new(0, 0, 0.5, -6), Size = UDim2.fromOffset(12, 12),
+        BackgroundColor3 = colors.Input, BorderColor3 = colors.Border, BorderSizePixel = 1, ZIndex = 6,
+    })
+    local autoMark = make("Frame", autoBox, {
+        Name = "ConfigAutoLoadMark", Position = UDim2.fromOffset(2, 2), Size = UDim2.fromOffset(8, 8),
+        BackgroundColor3 = colors.Text, BorderSizePixel = 0, ZIndex = 7,
+    })
+    make("TextLabel", autoButton, {
+        Position = UDim2.fromOffset(19, 0), Size = UDim2.new(1, -19, 1, 0),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "Auto load config", TextSize = 11,
+        TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 6,
+    })
+    bindFeedback(autoButton, function(state)
+        return {{ Object = autoBox, Goals = {
+            BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+            BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+        }}}
+    end, function() return configInteractive(autoRow) end)
+    Track(autoButton.Activated, function()
+        if configInteractive(autoRow) then configOperation("SetAutoLoad", configUI.State.AutoLoad ~= true) end
+    end)
+    local statusRow = newRow("ConfigStatus", 17)
+    local statusLabel = make("TextLabel", statusRow.Frame, {
+        Name = "ConfigStatus", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "", TextSize = 10, TextColor3 = colors.Muted, TextTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5,
+    })
+    local statusFadeInfo = TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 2.5)
+    local statusFadeTween
+    local statusMessage, statusRevision = "", -1
+    local function stopStatusFade()
+        local tween = statusFadeTween
+        statusFadeTween = nil
+        if tween then tween:Cancel(); tween:Destroy() end
+    end
+    local function updateConfigStatus(message)
+        if message == statusMessage and configStatusRevision == statusRevision then return end
+        stopStatusFade()
+        statusMessage, statusRevision = message, configStatusRevision
+        statusLabel.Text = message
+        statusLabel.TextTransparency = message == "" and 1 or 0
+        if message == "" or destroyed then return end
+        local ok, tween = pcall(TweenService.Create, TweenService, statusLabel, statusFadeInfo, {TextTransparency = 1})
+        if ok and tween then
+            statusFadeTween = tween
+            tween:Play()
+        else
+            statusLabel.TextTransparency = 1
+        end
+    end
+    configUI.Sync = function()
+        if destroyed then return end
+        local backend = ctx.Configs
+        if type(backend) == "table" and type(backend.GetState) == "function" then
+            local ok, state = pcall(backend.GetState, backend)
+            if ok and type(state) == "table" then
+                configUI.State = {
+                    Names = type(state.Names) == "table" and state.Names or {},
+                    Selected = type(state.Selected) == "string" and state.Selected or "",
+                    Loaded = type(state.Loaded) == "string" and state.Loaded or "",
+                    AutoLoad = state.AutoLoad == true, Available = state.Available == true,
+                    Busy = state.Busy == true, Status = type(state.Status) == "string" and state.Status or "",
+                }
+            else
+                configUI.State.Available = false
+                configUI.Notice = "Config state unavailable"
+            end
+        end
+        local state = configUI.State
+        rebuildConfigOptions(state.Names)
+        configsLabel.Text = state.Selected ~= "" and state.Selected or "None"
+        for _, option in ipairs(configsDropdown.Options) do
+            option.Button.BackgroundTransparency = option.Name == state.Selected and 0 or 1
+        end
+        if configUI.NameSelection ~= state.Selected then
+            if Input:GetFocusedTextBox() ~= configNameBox then configNameBox.Text = state.Selected end
+            configUI.NameSelection = state.Selected
+        end
+        configNameBox.TextEditable = configReady()
+        autoMark.Visible = state.AutoLoad
+        local message = configUI.Notice ~= "" and configUI.Notice or state.Status
+        if configUI.Notice == "" and state.AutoLoad and state.Loaded ~= ""
+            and not string.find(state.Status, "Auto load:", 1, true) then
+            message = (state.Status ~= "" and state.Status .. " | " or "") .. "Auto: " .. state.Loaded
+        end
+        updateConfigStatus(message)
+        if not configReady() and activeDropdown == configsDropdown then closeDropdown() end
+    end
 
     layoutRows = function()
         if layoutDepth > 0 then return end
         layoutDepth = layoutDepth + 1
-        local positions = { Assistance = 1, Movement = 1, Exploits = 1 }
+        local positions = {}
+        for name in pairs(tabContents) do positions[name] = 1 end
         for _, row in ipairs(rows) do
             local show = not row.ShowWhen or row.ShowWhen()
             row.Frame.Visible = show
@@ -3723,7 +4337,7 @@ local function buildUI(ctx)
         if input.UserInputType ~= Enum.UserInputType.MouseButton1
             and input.UserInputType ~= Enum.UserInputType.Touch then return end
         closeDropdown()
-        releaseNumberFocus()
+        releaseInputFocus()
         clampPanel()
         local area = canvas.AbsoluteSize
         if area.X <= 0 or area.Y <= 0 then return end
@@ -3850,12 +4464,14 @@ local function buildUI(ctx)
             slider.Fill.Size = UDim2.fromScale((value - slider.Minimum) / (slider.Maximum - slider.Minimum), 1)
             if Input:GetFocusedTextBox() ~= slider.NumberBox then slider.NumberBox.Text = formatNumber(slider, value) end
         end
+        if configUI.Sync then configUI.Sync() end
         layoutRows()
         refreshFeedback(true)
         local camera = lastCamera
         if workspace then camera = workspace.CurrentCamera end
         self:Render(camera)
     end
+    syncConfigUI = function() ui:Sync() end
     function ui:SetVisible(value)
         if destroyed then return end
         value = value == true
@@ -3871,7 +4487,7 @@ local function buildUI(ctx)
             feedbackPending = true
             refreshFeedback(false)
         else
-            releaseNumberFocus()
+            releaseInputFocus()
             feedbackPending = false
             cancelFeedbackTweens()
             refreshFeedback(true)
@@ -3942,7 +4558,9 @@ local function buildUI(ctx)
         if destroyed then return end
         self:SetVisible(false)
         cancelFeedbackTweens()
+        stopStatusFade()
         destroyed = true
+        if configUI.ClearOptions then configUI.ClearOptions() end
         feedbackEntries = {}
         endDrag()
         closeDropdown()
@@ -3963,6 +4581,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 assert(LocalPlayer, "This script must run on the local client.")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
@@ -4069,6 +4688,8 @@ for _, group in ipairs({"Shotguns", "Pistols", "Other"}) do
     Settings[group .. "FOVY"] = 5
     Settings[group .. "FOVZ"] = 5
 end
+local DefaultSettings = {}
+for key, value in pairs(Settings) do DefaultSettings[key] = value end
 local choices = {
     Target = {Head = true, UpperTorso = true, LowerTorso = true, Torso = true,
         HumanoidRootPart = true, ClosestPoint = true, ClosestPart = true,
@@ -4148,8 +4769,8 @@ local running = true
 local closed = false
 local closing = false
 local connections = {}
-local selector, ui, router, visual, movement, hitbox, particles, uiRoot
-local state = {Settings = Settings, Version = 24, Errors = {}, UIIsolated = false}
+local selector, ui, router, visual, movement, hitbox, particles, configs, uiRoot
+local state = {Settings = Settings, Version = 25, Errors = {}, UIIsolated = false}
 local function isCurrent()
     return running and not closed and env.__DH_GunHandlerAimUI == state
 end
@@ -4181,6 +4802,7 @@ local function cleanup()
             return false, problem
         end
     end
+    if configs then attempt(function() configs:Destroy() end) end
     if router then attempt(function() router:Destroy() end) end
     if visual then attempt(function() visual:Destroy() end) end
     if movement then attempt(function() movement:Destroy() end) end
@@ -4279,6 +4901,78 @@ local function setSetting(key, value)
     return true
 end
 state.SetSetting = setSetting
+local function snapshotConfiguration()
+    local values = {}
+    for key in pairs(DefaultSettings) do values[key] = Settings[key] end
+    return values
+end
+local function refreshConfiguration()
+    local failures = {}
+    local function invoke(area, object, method, ...)
+        if not object then return end
+        local ok, result = pcall(object[method], object, ...)
+        if not ok or result == false then
+            local problem = ok and (area .. " could not be updated") or tostring(result)
+            failures[#failures + 1] = problem
+            reportOnce("config " .. area, problem)
+        end
+    end
+    invoke("target selection", selector, "Invalidate", false)
+    invoke("shot routing", router, "Invalidate")
+    invoke("tracers", visual, "Invalidate")
+    invoke("movement", movement, "Refresh")
+    invoke("hitboxes", hitbox, "Refresh")
+    invoke("particles", particles, "Refresh")
+    for _, entry in ipairs({{hitbox, "hitboxes"}, {particles, "particles"}}) do
+        local object, area = entry[1], entry[2]
+        if object then
+            local ok, result = pcall(object.GetDiagnostics, object)
+            if not ok or type(result) ~= "table"
+                or (tonumber(result.pendingRestore) or 0) > 0
+                or (tonumber(result.unsafeQueries) or 0) > 0 then
+                failures[#failures + 1] = area .. " cleanup is incomplete"
+                reportOnce("config " .. area, failures[#failures])
+            end
+        end
+    end
+    return #failures == 0, table.concat(failures, " | ")
+end
+local function applyConfiguration(values)
+    if not isCurrent() then return false, "Script unloaded" end
+    if type(values) ~= "table" then return false, "Invalid config" end
+    local validated = {}
+    for key in pairs(DefaultSettings) do
+        local value, problem = normalizeSetting(key, values[key])
+        if problem then return false, "Invalid config" end
+        validated[key] = value
+    end
+    local previousValues = snapshotConfiguration()
+    for key, value in pairs(validated) do Settings[key] = value end
+    local called, updated = pcall(refreshConfiguration)
+    local ok = called and updated == true
+    if not called then reportOnce("config apply", updated) end
+    if not isCurrent() then return false, "Script unloaded" end
+    if ok and ui then
+        local synced, failure = pcall(ui.Sync, ui)
+        if not synced then
+            reportOnce("config UI", failure)
+            ok = false
+        end
+    end
+    if not ok then
+        for key, value in pairs(previousValues) do Settings[key] = value end
+        local restored, restoreResult = pcall(refreshConfiguration)
+        if not restored or restoreResult ~= true then
+            reportOnce("config restore", restored and "Controller restore incomplete" or restoreResult)
+        end
+        if isCurrent() and ui then
+            local synced, failure = pcall(ui.Sync, ui)
+            if not synced then reportOnce("config UI restore", failure) end
+        end
+        return false, "Could not apply config"
+    end
+    return true
+end
 state.GetDiagnostics = function()
     return selector and selector:GetDiagnostics() or {status = running and "Starting" or "Unloaded"}
 end
@@ -4298,6 +4992,31 @@ end
 local initialMouseIcon = UserInputService.MouseIconEnabled
 env.__DH_GunHandlerAimUI = state
 local initialized, problem = pcall(function()
+    local function fileFunction(name, fallback)
+        local candidate = env[name]
+        if type(candidate) ~= "function" then candidate = _G[name] end
+        if type(candidate) ~= "function" then candidate = fallback end
+        return type(candidate) == "function" and candidate or nil
+    end
+    configs = buildConfigController({
+        Defaults = DefaultSettings, Normalize = normalizeSetting,
+        Snapshot = snapshotConfiguration, Apply = applyConfiguration, IsCurrent = isCurrent,
+        JSONEncode = function(value) return HttpService:JSONEncode(value) end,
+        JSONDecode = function(value) return HttpService:JSONDecode(value) end,
+        FileOps = {
+            readfile = fileFunction("readfile", readfile),
+            writefile = fileFunction("writefile", writefile),
+            listfiles = fileFunction("listfiles", listfiles),
+            isfile = fileFunction("isfile", isfile),
+            isfolder = fileFunction("isfolder", isfolder),
+            makefolder = fileFunction("makefolder", makefolder),
+            delfile = fileFunction("delfile", delfile),
+        },
+    })
+    state.Configs = configs
+    local configOK, configProblem = configs:Initialize()
+    if not isCurrent() then return end
+    if not configOK then reportOnce("configs", configProblem or "Config initialization failed") end
     local uiHost = chooseGuiHost(PlayerGui, env)
     if not isCurrent() then return end
     uiRoot = Instance.new("Folder")
@@ -4307,7 +5026,7 @@ local initialized, problem = pcall(function()
     ui = buildUI({
         PlayerGui = PlayerGui, UserInputService = UserInputService, RunService = RunService,
         GuiParent = uiRoot, TweenService = TweenService,
-        Settings = Settings, Track = track, SetSetting = setSetting,
+        Settings = Settings, Track = track, SetSetting = setSetting, Configs = configs,
         OnUnload = cleanup, ReferencePoint = referencePoint,
         GetFOVVisuals = function() return selector and selector:GetFOVVisuals() or nil end,
     })
