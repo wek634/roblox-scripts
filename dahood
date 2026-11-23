@@ -119,6 +119,9 @@ local function buildSelector(ctx)
     local SHOT_RAY_BUDGET = 24
     local RETAINED_RAY_BUDGET = 4
     local MAX_PROBE_ATTEMPTS = 96
+    local PING_INTERVAL = 0.25
+    local MAX_AUTO_LEAD = 0.15
+    local MAX_TRACKED_SPEED = 150
     local EPSILON = 0.0001
     local BODY_PARTS = {
         "Head", "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart",
@@ -157,10 +160,15 @@ local function buildSelector(ctx)
     local reactionPlayer, reactionCharacter, reactionSince
     local normalParts = {}
     local originalAimCache = {}
+    local motionHistory = {}
+    local networkPing, pingReady, pingAt, nextPingAt = 0, false, -math.huge, -math.huge
     local lastGatherEpoch, lastGatherAt = -1, -math.huge
     local recoveryStamp
     local fovVisuals = { shape = "Circle", enabled = true, radius = 100, boxes = {} }
-    local diagnostics = { targetName = "None", status = "Waiting for a weapon", scanMs = 0, raycasts = 0 }
+    local diagnostics = {
+        targetName = "None", status = "Waiting for a weapon", scanMs = 0, raycasts = 0,
+        pingMs = 0, predictionMs = 0, predictionMode = "Manual",
+    }
 
     local ignoredObjects
     local mainModule = ReplicatedStorage:FindFirstChild("MainModule")
@@ -188,6 +196,82 @@ local function buildSelector(ctx)
 
     local function finiteVector(value)
         return typeof(value) == "Vector3" and finite(value.X) and finite(value.Y) and finite(value.Z)
+    end
+
+    local function predictionWindow(now)
+        local manual = finite(Settings.AimPredictionMs) and math.clamp(Settings.AimPredictionMs, 0, 250) / 1000 or 0
+        if Settings.AutoPrediction ~= true then
+            diagnostics.predictionMode, diagnostics.predictionMs = "Manual", manual * 1000
+            return manual
+        end
+        if now >= nextPingAt then
+            nextPingAt = now + PING_INTERVAL
+            local ok, value = pcall(function() return LocalPlayer:GetNetworkPing() end)
+            if ok and finite(value) and value >= 0 and value <= 2 then
+                if pingReady and now - pingAt <= 1.5 then
+                    networkPing = networkPing + math.clamp(value - networkPing, -0.1, 0.1) * 0.35
+                else
+                    networkPing = value
+                end
+                pingReady, pingAt = true, now
+            end
+        end
+        local available = pingReady and now - pingAt <= 1.5
+        local lead = available and math.clamp(networkPing * 0.5, 0, MAX_AUTO_LEAD) or 0
+        diagnostics.pingMs = available and networkPing * 1000 or 0
+        diagnostics.predictionMs = lead * 1000
+        diagnostics.predictionMode = available and "Automatic" or "Automatic unavailable"
+        return lead
+    end
+
+    local function characterMotion(record, view)
+        local cached = view.motion[record.character]
+        if cached then return cached end
+        local zero = Vector3.new(0, 0, 0)
+        local root = getCharacterFOVRoot(record.character) or record.part
+        local position, velocity = root.Position, root.AssemblyLinearVelocity
+        local valid = finiteVector(position) and finiteVector(velocity) and velocity.Magnitude <= MAX_TRACKED_SPEED
+        local now = view.now
+        local previous = motionHistory[record.character]
+        if not valid then
+            motionHistory[record.character] = nil
+            view.motion[record.character] = zero
+            return zero
+        end
+        if not previous or previous.root ~= root or now < previous.at or now - previous.at > 0.5 then
+            previous = {
+                root = root, player = record.player, at = now, position = position,
+                movedAt = now, velocity = velocity, stability = 1, suppressUntil = 0,
+            }
+            motionHistory[record.character] = previous
+        else
+            local dt = now - previous.at
+            local displacement = position - previous.position
+            local distance = displacement.Magnitude
+            local limit = math.max(12, math.max(velocity.Magnitude, previous.velocity.Magnitude) * dt * 3 + 4)
+            if distance > limit then
+                previous.velocity, previous.stability, previous.suppressUntil = zero, 0, now + 0.12
+                previous.movedAt = now
+            else
+                if distance > 0.001 then previous.movedAt = now end
+                local speed, oldSpeed = velocity.Magnitude, previous.velocity.Magnitude
+                if speed < 0.5 then
+                    previous.velocity, previous.stability = zero, 1
+                elseif oldSpeed > 0.5 and velocity:Dot(previous.velocity) < speed * oldSpeed * 0.25 then
+                    previous.velocity, previous.stability = velocity, 0.35
+                elseif dt > 0 then
+                    local alpha = math.clamp(dt * 18, 0, 1)
+                    previous.velocity = previous.velocity + (velocity - previous.velocity) * alpha
+                    previous.stability = math.min(1, previous.stability + dt * 8)
+                end
+            end
+            previous.at, previous.position = now, position
+        end
+        local staleAfter = math.clamp(view.lead * 2 + 0.1, 0.18, 0.4)
+        local staleScale = math.clamp(1 - (now - previous.movedAt - staleAfter) / 0.15, 0, 1)
+        local result = now < previous.suppressUntil and zero or previous.velocity * previous.stability * staleScale
+        view.motion[record.character] = result
+        return result
     end
 
     local function isAllParts()
@@ -305,6 +389,9 @@ local function buildSelector(ctx)
         end
         rayParams.FilterDescendantsInstances = excluded
         wallParams.FilterDescendantsInstances = wallExcluded
+        for character, motion in pairs(motionHistory) do
+            if not character.Parent or motion.player.Character ~= character then motionHistory[character] = nil end
+        end
         rosterAt = now
     end
 
@@ -401,13 +488,22 @@ local function buildSelector(ctx)
         return Settings.PointMode == "Adaptive" and #UNIT_OFFSETS or 1
     end
 
-    local function pointsAt(record, index, aimRay)
-        local offset = offsetAt(record, index, aimRay)
+    local function pointsAt(record, index, view)
+        local offset = offsetAt(record, index, view.aimRay)
         local point = record.part.CFrame:PointToWorldSpace(offset)
-        local prediction = finite(Settings.AimPredictionMs) and math.clamp(Settings.AimPredictionMs, 0, 250) or 0
-        local velocity = record.part.AssemblyLinearVelocity
-        if prediction > 0 and finiteVector(velocity) then
-            return point, point + velocity * (prediction / 1000), offset
+        if view.lead > 0 then
+            local velocity = characterMotion(record, view)
+            if velocity:Dot(velocity) > EPSILON then
+                local localLead = record.part.CFrame:VectorToObjectSpace(velocity * view.lead)
+                local half = record.part.Size * 0.42
+                local destination = offset + localLead
+                local bounded = Vector3.new(
+                    math.clamp(destination.X, -half.X, half.X),
+                    math.clamp(destination.Y, -half.Y, half.Y),
+                    math.clamp(destination.Z, -half.Z, half.Z)
+                )
+                return point, record.part.CFrame:PointToWorldSpace(bounded), offset
+            end
         end
         return point, point, offset
     end
@@ -418,17 +514,23 @@ local function buildSelector(ctx)
             and record.part:IsDescendantOf(record.character)
     end
 
-    local function visible(record, point, aimPoint, origin, budget)
+    local function visible(candidate, origin, budget)
         if not Settings.VisibleOnly then return true end
-        local required = point == aimPoint and 1 or 2
-        if budget and diagnostics.raycasts + required > budget then return nil end
-        local hit = raycast(origin, point - origin, rayParams)
-        if not hit or not hit.Instance:IsDescendantOf(record.character) then return false end
-        if point ~= aimPoint then
-            local predictedHit = raycast(origin, aimPoint - origin, rayParams)
-            if predictedHit and not predictedHit.Instance:IsDescendantOf(record.character) then return false end
+        if budget and diagnostics.raycasts >= budget then return nil end
+        local character = candidate.record.character
+        local hit = raycast(origin, candidate.aimPoint - origin, rayParams)
+        if hit and hit.Instance:IsDescendantOf(character) then return true end
+        if candidate.point ~= candidate.aimPoint then
+            if budget and diagnostics.raycasts >= budget then return nil end
+            hit = raycast(origin, candidate.point - origin, rayParams)
+            if hit and hit.Instance:IsDescendantOf(character) then
+                candidate.aimPoint = candidate.point
+                candidate.delta = candidate.point - origin
+                candidate.distance = candidate.delta.Magnitude
+                return true
+            end
         end
-        return true
+        return false
     end
 
     local function clearSelection(status)
@@ -461,18 +563,29 @@ local function buildSelector(ctx)
         return best
     end
 
+    local function nearestPartInView(character, view)
+        local cache = view.nearestParts
+        if not cache then cache = {}; view.nearestParts = cache end
+        local part = cache[character]
+        if part == nil then
+            part = nearestPart(character, view.camera, view.pointer) or false
+            cache[character] = part
+        end
+        return part or nil
+    end
+
     local function updateRecord(player, character, part, view, now)
         if not part or not part:IsA("BasePart") then return nil end
         local record = records[part]
         if not record or record.character ~= character then
             record = { player = player, character = character, part = part, pointIndex = 1, probeAt = -math.huge }
         end
-        local _, primary = pointsAt(record, 1, view.aimRay)
+        local primary = pointsAt(record, 1, view)
         local first = pointScore(view.camera, view.pointer, primary, view.origin, view.range,
             character, view.profile, view.aimRay, view.boxCache)
         local second
         if sampleCount() > 1 then
-            local _, alternative = pointsAt(record, 2, view.aimRay)
+            local alternative = pointsAt(record, 2, view)
             second = pointScore(view.camera, view.pointer, alternative, view.origin, view.range,
                 character, view.profile, view.aimRay, view.boxCache)
         end
@@ -534,7 +647,7 @@ local function buildSelector(ctx)
             if spent + cost > PART_BUDGET then break end
             local part = item.part
             if normal then
-                part = nearestPart(item.character, view.camera, view.pointer)
+                part = nearestPartInView(item.character, view)
                 normalParts[item.character] = part
             end
             updateRecord(item.player, item.character, part, view, now)
@@ -569,7 +682,7 @@ local function buildSelector(ctx)
     local function seedPlayer(player, character, view, now)
         if not player or not character or not eligible(player, character) then return end
         if isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" then
-            local part = nearestPart(character, view.camera, view.pointer)
+            local part = nearestPartInView(character, view)
             normalParts[character] = part
             updateRecord(player, character, part, view, now)
         elseif isAllParts() then
@@ -587,10 +700,16 @@ local function buildSelector(ctx)
         if isClosestPoint() and Settings.ClosestPointMode ~= "Advanced"
             and normalParts[record.character] ~= record.part then return nil end
         index = math.clamp(index or 1, 1, sampleCount())
-        local point, aimPoint, offset = pointsAt(record, index, view.aimRay)
-        local score, delta, distance = pointScore(view.camera, view.pointer, aimPoint, view.origin,
+        local point, aimPoint, offset = pointsAt(record, index, view)
+        local score, delta, distance = pointScore(view.camera, view.pointer, point, view.origin,
             view.range, record.character, view.profile, view.aimRay, view.boxCache)
         if not score then return nil end
+        if aimPoint ~= point then
+            local allowed, predictedDelta, predictedDistance = pointScore(view.camera, view.pointer, aimPoint,
+                view.origin, view.range, record.character, view.profile, view.aimRay, view.boxCache)
+            if allowed then delta, distance = predictedDelta, predictedDistance
+            else aimPoint = point end
+        end
         return {
             record = record, pointIndex = index, point = point, aimPoint = aimPoint,
             offset = offset, score = score, delta = delta, distance = distance,
@@ -691,7 +810,8 @@ local function buildSelector(ctx)
                     if candidate then
                         local same = checked and checked.record.part == candidate.record.part
                             and checked.pointIndex == candidate.pointIndex
-                        result = same and true or visible(candidate.record, candidate.point, candidate.aimPoint, view.origin, budget)
+                        if same then candidate, result = checked, true
+                        else result = visible(candidate, view.origin, budget) end
                         if result == nil then return winner end
                     end
                     entry.record.probeAt = now
@@ -745,11 +865,14 @@ local function buildSelector(ctx)
         return probeGroups(groups, view, now, budget, checked, checked)
     end
 
-    local function makeView(origin, range, camera, pointer, profile)
-        return {
+    local function makeView(origin, range, camera, pointer, profile, now)
+        local view = {
             origin = origin, range = range, camera = camera, pointer = pointer, profile = profile,
             aimRay = camera:ViewportPointToRay(pointer.X, pointer.Y, 0), boxCache = {},
+            now = now, lead = predictionWindow(now), motion = {},
         }
+        if isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" then view.nearestParts = {} end
+        return view
     end
 
     local function sameRecovery(view, tool, now)
@@ -784,6 +907,7 @@ local function buildSelector(ctx)
         records = {}
         normalParts = {}
         originalAimCache = {}
+        motionHistory = {}
         resetReaction()
         if not preserveManualLock then manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil end
         nextScan = 0
@@ -808,7 +932,8 @@ local function buildSelector(ctx)
             refreshFilters(now)
         end
         local boxes = {}
-        if profile.enabled and profile.shape == "Box" and profile.x > 0 and profile.y > 0 and profile.z > 0 then
+        if Settings.ShowFOV and profile.enabled and profile.shape == "Box"
+            and profile.x > 0 and profile.y > 0 and profile.z > 0 then
             local size = Vector3.new(profile.z, profile.y, profile.x)
             for index = 1, math.min(#roster, 64) do
                 local character = eligible(roster[index])
@@ -842,7 +967,7 @@ local function buildSelector(ctx)
         local camera = World.CurrentCamera
         if not camera then clearSelection("Waiting for camera"); resetReaction(); return end
         local pointer = ctx.ReferencePoint(camera)
-        local view = makeView(origin, range, camera, pointer, profile)
+        local view = makeView(origin, range, camera, pointer, profile, now)
         if not wallClear(origin) then
             clearSelection("Muzzle is behind cover")
             resetReaction()
@@ -851,11 +976,11 @@ local function buildSelector(ctx)
         end
         local prior = selected
         if prior and isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" and recordValid(prior.record) then
-            normalParts[prior.record.character] = nearestPart(prior.record.character, camera, pointer)
+            normalParts[prior.record.character] = nearestPartInView(prior.record.character, view)
         end
         gather(view, now)
         local checked = prior and liveCandidate(prior.record, prior.pointIndex, view) or nil
-        if checked and not visible(checked.record, checked.point, checked.aimPoint, origin, RAY_BUDGET) then checked = nil end
+        if checked and not visible(checked, origin, RAY_BUDGET) then checked = nil end
         local winner = acquire(view, now, RAY_BUDGET, prior, checked)
         if winner then commit(winner, now) else clearSelection() end
         if manualMode() and manualRequested and selected then
@@ -927,7 +1052,7 @@ local function buildSelector(ctx)
         if now - rosterAt >= 0.2 then refreshFilters(now) end
         local pointer = ctx.ReferencePoint(camera)
         local profile = getFOVProfile(Settings, tool)
-        local view = makeView(origin, range, camera, pointer, profile)
+        local view = makeView(origin, range, camera, pointer, profile, now)
         local budget = diagnostics.raycasts + SHOT_RAY_BUDGET
         if not wallClear(origin) then
             resetReaction()
@@ -935,12 +1060,12 @@ local function buildSelector(ctx)
         end
         local prior = selected
         if prior and isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" and recordValid(prior.record) then
-            normalParts[prior.record.character] = nearestPart(prior.record.character, camera, pointer)
+            normalParts[prior.record.character] = nearestPartInView(prior.record.character, view)
         end
         local candidate = prior and liveCandidate(prior.record, prior.pointIndex, view) or nil
         if candidate and manualMode() and manualPlayer
             and (candidate.record.player ~= manualPlayer or candidate.record.character ~= manualCharacter) then candidate = nil end
-        if candidate and not visible(candidate.record, candidate.point, candidate.aimPoint, origin, budget) then candidate = nil end
+        if candidate and not visible(candidate, origin, budget) then candidate = nil end
         local needsRanking = not candidate or not (Settings.KeepTarget or manualMode())
         local previousRecoverySucceeded = recoveryStamp and recoveryStamp.succeeded == true
         if needsRanking and (not sameRecovery(view, tool, now) or (not candidate and previousRecoverySucceeded)) then
@@ -999,6 +1124,8 @@ local function buildSelector(ctx)
         return {
             targetName = diagnostics.targetName, status = diagnostics.status,
             scanMs = diagnostics.scanMs, raycasts = diagnostics.raycasts,
+            pingMs = diagnostics.pingMs, predictionMs = diagnostics.predictionMs,
+            predictionMode = diagnostics.predictionMode,
         }
     end
 
@@ -1008,7 +1135,7 @@ local function buildSelector(ctx)
         resetReaction()
         manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil
         fovVisuals.boxes = {}
-        records, roster = {}, {}
+        records, roster, motionHistory = {}, {}, {}
     end
 
     return selector
@@ -1588,7 +1715,9 @@ local function buildMovementController(ctx)
     local updating, releasing, refreshRequested = false, false, false
     local runUpdate, queueCorrection
     local controller = {}
-    local MAX_CORRECTIONS = 2
+    local MAX_CORRECTIONS = 8
+    local NATIVE_SETTLE_TIME = 0.12
+    local stepNumber = 0
     local diagnostic = {enabled = false, mode = "Disabled", multiplier = 1}
 
     local function finite(value)
@@ -1619,7 +1748,7 @@ local function buildMovementController(ctx)
                 local current = record.humanoid.WalkSpeed
                 local inFlight = record.inFlight ~= nil and sameStoredSpeed(current, record.inFlight)
                 if (record.applied ~= nil and current == record.applied) or inFlight then
-                    record.humanoid.WalkSpeed = record.native
+                    record.humanoid.WalkSpeed = record.restoreNative
                 end
             end
         end)
@@ -1637,6 +1766,19 @@ local function buildMovementController(ctx)
             and Player.Character == record.character and record.humanoid.Parent == record.character
     end
 
+    local function correct(record, force)
+        if not liveRecord(record) then return end
+        if not force and (record.factor == 1 or (record.applied ~= nil
+            and sameStoredSpeed(record.humanoid.WalkSpeed, record.applied))) then return end
+        if record.remaining <= 0 then record.conflicted = true; return end
+        record.remaining = record.remaining - 1
+        local ok, failure = pcall(runUpdate)
+        if not ok then
+            local released, cleanupFailure = pcall(controller.Invalidate, controller)
+            report(tostring(failure) .. (released and "" or " | " .. tostring(cleanupFailure)))
+        end
+    end
+
     queueCorrection = function(record, force)
         if not liveRecord(record) then return end
         if record.queued then
@@ -1650,15 +1792,7 @@ local function buildMovementController(ctx)
             if generation ~= record.generation or not liveRecord(record) then return end
             local forced = record.forceQueued
             record.queued, record.forceQueued = false, false
-            if not forced and (record.factor == 1 or (record.applied ~= nil
-                and record.humanoid.WalkSpeed == record.applied)) then return end
-            if record.remaining <= 0 then record.conflicted = true; return end
-            record.remaining = record.remaining - 1
-            local ok, failure = pcall(runUpdate)
-            if not ok then
-                local released, cleanupFailure = pcall(controller.Invalidate, controller)
-                report(tostring(failure) .. (released and "" or " | " .. tostring(cleanupFailure)))
-            end
+            correct(record, forced)
         end)
     end
 
@@ -1666,8 +1800,8 @@ local function buildMovementController(ctx)
         record.connection = record.humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
 
             if updating or not liveRecord(record) or record.factor == 1 then return end
-            if record.applied ~= nil and record.humanoid.WalkSpeed == record.applied then return end
-            queueCorrection(record, false)
+            if record.applied ~= nil and sameStoredSpeed(record.humanoid.WalkSpeed, record.applied) then return end
+            correct(record, false)
         end)
     end
 
@@ -1729,6 +1863,53 @@ local function buildMovementController(ctx)
         return "Walking", "WalkMultiplier"
     end
 
+    local function refreshNative(record, mode, current, multiplier, now)
+        local ours = record.applied ~= nil and sameStoredSpeed(current, record.applied)
+        if not ours then record.restoreNative = current end
+        if mode ~= record.mode then
+            local previousNative = record.native
+            local previousStable = record.nativeByMode[record.mode]
+            local incoming = record.nativeByMode[mode]
+            local fresh
+            if not ours and not sameStoredSpeed(current, previousNative) then fresh = current
+            elseif previousStable ~= nil and not sameStoredSpeed(previousNative, previousStable) then
+                fresh = previousNative
+            end
+            record.mode, record.modeSince = mode, now
+            record.transitionNative, record.transitionUntil = previousNative, now + NATIVE_SETTLE_TIME
+            if fresh ~= nil then
+                record.native, record.waitStep = fresh, 0
+                if incoming == nil then record.nativeByMode[mode] = fresh end
+            elseif incoming ~= nil then
+                record.native, record.waitStep = incoming, 0
+            else
+                record.waitNative, record.waitStep = previousNative, stepNumber + 1
+            end
+            if multiplier == 1 and not ours then record.native, record.waitStep = current, 0 end
+            if not ours then record.applied = nil end
+            record.candidateNative, record.candidateAt = record.native, now
+        elseif not ours then
+            local returning = record.nativeByMode[mode]
+            local staleTransition = multiplier ~= 1 and now < record.transitionUntil
+                and returning ~= nil and not sameStoredSpeed(current, returning)
+                and sameStoredSpeed(current, record.transitionNative)
+            if not staleTransition then
+                record.native, record.applied = current, nil
+                if record.waitStep > 0 and not sameStoredSpeed(current, record.waitNative) then
+                    record.waitStep = 0
+                end
+            end
+        end
+        if record.waitStep > 0 and stepNumber >= record.waitStep then record.waitStep = 0 end
+        if not sameStoredSpeed(record.native, record.candidateNative) then
+            record.candidateNative, record.candidateAt = record.native, now
+        end
+        if record.waitStep == 0 and (record.nativeByMode[mode] == nil
+            or (now - record.candidateAt >= NATIVE_SETTLE_TIME and now - record.modeSince >= NATIVE_SETTLE_TIME)) then
+            record.nativeByMode[mode] = record.native
+        end
+    end
+
     local function update()
         if not alive then return end
         if not Settings.MovementEnabled then
@@ -1752,25 +1933,26 @@ local function buildMovementController(ctx)
             diagnostic = {enabled = true, mode = "Invalid speed", multiplier = 1}
             return
         end
+        local now = Clock()
+        local mode, setting = chooseMode(character, humanoid, effects, now)
+        local multiplier = Settings[setting]
+        if not finite(multiplier) then multiplier = 1 end
+        multiplier = math.clamp(multiplier, 0.25, 3)
         if not owned then
             owned = {
-                humanoid = humanoid, character = character, native = current,
+                humanoid = humanoid, character = character, native = current, restoreNative = current,
                 active = true, generation = 1, remaining = MAX_CORRECTIONS,
                 factor = 1, queued = false, forceQueued = false, conflicted = false,
+                mode = mode, modeSince = now, nativeByMode = {[mode] = current},
+                candidateNative = current, candidateAt = now,
+                transitionNative = current, transitionUntil = 0, waitNative = current, waitStep = 0,
             }
             bindObserver(owned)
         end
         local record = owned
-        if owned.applied == nil or current ~= owned.applied then
-
-            owned.native, owned.applied = current, nil
-        end
-        local mode, setting = chooseMode(character, humanoid, effects, Clock())
-        local multiplier = Settings[setting]
-        if not finite(multiplier) then multiplier = 1 end
-        multiplier = math.clamp(multiplier, 0.25, 3)
+        refreshNative(record, mode, current, multiplier, now)
         record.factor = multiplier
-        local target = owned.native * multiplier
+        local target = owned.native * (record.waitStep > 0 and 1 or multiplier)
         if not finite(target) then
             release()
             diagnostic = {enabled = true, mode = "Invalid speed", multiplier = 1}
@@ -1800,7 +1982,7 @@ local function buildMovementController(ctx)
         else
 
             owned.applied = nil
-            if finite(current) and current >= 0 then owned.native = current end
+            if finite(current) and current >= 0 then owned.native, owned.restoreNative = current, current end
             record.conflicted = true
             queueCorrection(record, false)
         end
@@ -1826,7 +2008,9 @@ local function buildMovementController(ctx)
     function controller:Step()
         if not alive then return end
         if updating or releasing then refreshRequested = true; return end
+        if not Settings.MovementEnabled and not owned and diagnostic.mode == "Disabled" then return end
 
+        stepNumber = stepNumber + 1
         if owned then owned.remaining, owned.conflicted = MAX_CORRECTIONS, false end
         runUpdate()
     end
@@ -1862,6 +2046,11 @@ end
 
 local function buildUI(ctx)
     local Settings, Input, Track = ctx.Settings, ctx.UserInputService, ctx.Track
+    local TweenService = ctx.TweenService or game:GetService("TweenService")
+    local feedbackInfo = TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 0)
+    local feedbackEntries, feedbackTweens, feedbackGoals = {}, {}, {}
+    local refreshFeedback
+    local feedbackPending = false
     local ui = {}
     local destroyed, insideGuiDestroy, visible = false, false, false
     local savedMouseIcon, lastCamera, activeDropdown
@@ -1881,16 +2070,25 @@ local function buildUI(ctx)
         Border = Color3.fromRGB(8, 8, 8), Text = Color3.fromRGB(224, 224, 224),
         Muted = Color3.fromRGB(148, 148, 148), Selected = Color3.fromRGB(43, 43, 43),
         Accent = Color3.fromRGB(100, 100, 100),
+        Hover = Color3.fromRGB(38, 38, 38), Press = Color3.fromRGB(54, 54, 54),
+        TextHover = Color3.fromRGB(242, 242, 242), TextPress = Color3.fromRGB(255, 255, 255),
+        BorderHover = Color3.fromRGB(72, 72, 72), BorderPress = Color3.fromRGB(100, 100, 100),
+        AccentHover = Color3.fromRGB(152, 152, 152),
     }
 
     local function make(className, parent, properties)
         local object = Instance.new(className)
         for key, value in pairs(properties) do object[key] = value end
+        if object:IsA("GuiObject") then object.Selectable = false end
+        if object:IsA("GuiButton") then
+            object.AutoButtonColor = false
+            object.Style = Enum.ButtonStyle.Custom
+        end
         object.Parent = parent
         return object
     end
 
-    local overlay = make("ScreenGui", ctx.PlayerGui, {
+    local overlay = make("ScreenGui", ctx.GuiParent or ctx.PlayerGui, {
         Name = "DH_AimOverlay", DisplayOrder = 998, ResetOnSpawn = false,
         IgnoreGuiInset = true, ScreenInsets = Enum.ScreenInsets.None,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -1905,7 +2103,7 @@ local function buildUI(ctx)
         Color = Color3.fromRGB(240, 240, 240), Thickness = 1.4, Transparency = 0.12,
     })
     local boxRoot = make("Folder", overlay, { Name = "FOVBoxes" })
-    local gui = make("ScreenGui", ctx.PlayerGui, {
+    local gui = make("ScreenGui", ctx.GuiParent or ctx.PlayerGui, {
         Name = "DH_AimPanel", DisplayOrder = 999, ResetOnSpawn = false,
         Enabled = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     })
@@ -2018,6 +2216,8 @@ local function buildUI(ctx)
         if activeDropdown then
             activeDropdown.Menu.Visible = false
             activeDropdown = nil
+            feedbackPending = true
+            if refreshFeedback then refreshFeedback(true) end
         end
     end
     local function releaseNumberFocus()
@@ -2036,6 +2236,86 @@ local function buildUI(ctx)
         return canInteractWindow() and activeTab == row.Tab and row.Container.Visible
             and row.Frame.Visible and (not row.ShowWhen or row.ShowWhen())
     end
+    local function stopFeedbackTween(object)
+        local entry = feedbackTweens[object]
+        if not entry then return end
+        feedbackTweens[object] = nil
+        if entry.Connection then entry.Connection:Disconnect() end
+        entry.Tween:Cancel()
+        entry.Tween:Destroy()
+    end
+    local function cancelFeedbackTweens()
+        for object in pairs(feedbackTweens) do stopFeedbackTween(object) end
+        feedbackGoals = {}
+    end
+    local function setFeedbackGoal(object, goals, instant)
+        if destroyed or not object.Parent then return end
+        local previous = feedbackGoals[object]
+        local same = previous ~= nil
+        if same then
+            for property, value in pairs(goals) do
+                if previous[property] ~= value then same = false; break end
+            end
+            if same then
+                for property in pairs(previous) do
+                    if goals[property] == nil then same = false; break end
+                end
+            end
+        end
+        if same then return end
+        stopFeedbackTween(object)
+        feedbackGoals[object] = goals
+        if instant or not visible then
+            for property, value in pairs(goals) do object[property] = value end
+            return
+        end
+        local ok, tween = pcall(TweenService.Create, TweenService, object, feedbackInfo, goals)
+        if not ok or not tween then
+            for property, value in pairs(goals) do object[property] = value end
+            return
+        end
+        local entry = { Tween = tween }
+        feedbackTweens[object] = entry
+        entry.Connection = tween.Completed:Connect(function()
+            if feedbackTweens[object] == entry then feedbackTweens[object] = nil end
+            if entry.Connection then entry.Connection:Disconnect() end
+            tween:Destroy()
+        end)
+        tween:Play()
+    end
+    local function feedbackColor(state, idle, hover, press)
+        return state == "Press" and press or state == "Hover" and hover or idle
+    end
+    local function refreshFeedbackEntry(entry, instant)
+        if destroyed then return end
+        local state = "Idle"
+        if visible and gui.Enabled and entry.Control.Parent and entry.Available() then
+            local current = entry.Control.GuiState
+            if current == Enum.GuiState.Press then state = "Press"
+            elseif current == Enum.GuiState.Hover then state = "Hover" end
+        end
+        for _, target in ipairs(entry.Style(state)) do
+            setFeedbackGoal(target.Object, target.Goals, instant)
+        end
+    end
+    refreshFeedback = function(instant)
+        if destroyed then return end
+        for _, entry in ipairs(feedbackEntries) do refreshFeedbackEntry(entry, instant) end
+    end
+    local function bindFeedback(control, style, available)
+        local entry = { Control = control, Style = style, Available = available or canInteractWindow }
+        feedbackEntries[#feedbackEntries + 1] = entry
+        Track(control:GetPropertyChangedSignal("GuiState"), function()
+            refreshFeedbackEntry(entry, false)
+        end)
+        refreshFeedbackEntry(entry, true)
+    end
+    bindFeedback(closeButton, function(state)
+        return {{ Object = closeButton, Goals = {
+            TextColor3 = feedbackColor(state, colors.Muted, colors.TextHover, colors.TextPress),
+        }}}
+    end)
+
     local function contains(object, position)
         local origin, size = object.AbsolutePosition, object.AbsoluteSize
         return position.X >= origin.X and position.Y >= origin.Y
@@ -2090,9 +2370,10 @@ local function buildUI(ctx)
         for tabName, tab in pairs(tabs) do
             local selected = tabName == name
             tab.Button.BackgroundTransparency = selected and 0 or 1
-            tab.Button.TextColor3 = selected and colors.Text or colors.Muted
             tab.Line.Visible = selected
         end
+        feedbackPending = true
+        refreshFeedback(true)
     end
     for index, name in ipairs({ "Assistance", "Movement", "Exploits" }) do
         local tabName = name
@@ -2107,6 +2388,13 @@ local function buildUI(ctx)
             BackgroundColor3 = colors.Text, BorderSizePixel = 0, ZIndex = 4,
         })
         tabs[tabName] = { Button = button, Line = line }
+        bindFeedback(button, function(state)
+            return {{ Object = button, Goals = {
+                TextColor3 = feedbackColor(state, activeTab == tabName and colors.Text or colors.Muted,
+                    colors.TextHover, colors.TextPress),
+                BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+            }}}
+        end)
         Track(button.Activated, function()
             if canInteractWindow() then setTab(tabName) end
         end)
@@ -2153,6 +2441,12 @@ local function buildUI(ctx)
             TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 6,
         })
         toggles[property] = mark
+        bindFeedback(button, function(state)
+            return {{ Object = box, Goals = {
+                BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+                BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+            }}}
+        end, function() return canInteractRow(row) end)
         Track(button.Activated, function()
             if canInteractRow(row) then changeSetting(property, not Settings[property]) end
         end)
@@ -2195,7 +2489,7 @@ local function buildUI(ctx)
                 Name = choiceValue, Position = UDim2.fromOffset(3, 3 + (index - 1) * 22),
                 Size = UDim2.new(1, -6, 0, 21), BorderSizePixel = 0,
                 BackgroundColor3 = colors.Selected, BackgroundTransparency = 1,
-                Active = true, AutoButtonColor = true, Text = "", ZIndex = 101,
+                Active = true, AutoButtonColor = false, Text = "", ZIndex = 101,
             })
             local textLabel = make("TextLabel", option, {
                 Position = UDim2.fromOffset(multiSelection and 23 or 6, 0),
@@ -2219,6 +2513,16 @@ local function buildUI(ctx)
             dropdown.Options[index] = {
                 Value = choiceValue, Button = option, Label = textLabel, Mark = selectedMark,
             }
+            bindFeedback(option, function(state)
+                return {
+                    { Object = option, Goals = {
+                        BackgroundColor3 = feedbackColor(state, colors.Selected, colors.Hover, colors.Press),
+                    }},
+                    { Object = textLabel, Goals = {
+                        TextColor3 = feedbackColor(state, colors.Text, colors.TextHover, colors.TextPress),
+                    }},
+                }
+            end, function() return canInteractRow(row) and activeDropdown == dropdown and menu.Visible end)
             Track(option.Activated, function()
                 if not canInteractRow(row) or activeDropdown ~= dropdown or not menu.Visible then return end
                 if multiSelection then changeSetting(choiceValue, not Settings[choiceValue])
@@ -2226,6 +2530,12 @@ local function buildUI(ctx)
             end)
         end
         dropdowns[#dropdowns + 1] = dropdown
+        bindFeedback(button, function(state)
+            return {{ Object = button, Goals = {
+                BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+                BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+            }}}
+        end, function() return canInteractRow(row) end)
         Track(button.Activated, function()
             if not canInteractRow(row) then return end
             local wasOpen = activeDropdown == dropdown
@@ -2235,6 +2545,8 @@ local function buildUI(ctx)
                 positionDropdown(dropdown)
                 dropdown.Menu.Visible = true
                 activeDropdown = dropdown
+                feedbackPending = true
+                refreshFeedback(true)
             end
         end)
     end
@@ -2288,6 +2600,22 @@ local function buildUI(ctx)
             Button = button, Fill = fill, NumberBox = numberBox,
         }
         sliders[#sliders + 1] = slider
+        bindFeedback(button, function(state)
+            return {
+                { Object = fill, Goals = {
+                    BackgroundColor3 = feedbackColor(state, colors.Accent, colors.AccentHover, colors.Text),
+                }},
+                { Object = rail, Goals = {
+                    BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+                }},
+            }
+        end, function() return canInteractRow(row) end)
+        bindFeedback(numberBox, function(state)
+            return {{ Object = numberBox, Goals = {
+                BackgroundColor3 = feedbackColor(state, colors.Input, colors.Hover, colors.Press),
+                BorderColor3 = feedbackColor(state, colors.Border, colors.BorderHover, colors.BorderPress),
+            }}}
+        end, function() return canInteractRow(row) end)
         Track(numberBox.Focused, function()
             if not canInteractRow(row) then
                 slider.EditingProperty = nil
@@ -2360,7 +2688,9 @@ local function buildUI(ctx)
     dropdownRow("Part aim", "PointMode", {
         { Value = "Center", Label = "Center" }, { Value = "Adaptive", Label = "Adaptive" },
     }, isNamedPart)
-    sliderRow("Aim lead (ms)", "AimPredictionMs", "AimPredictionMs", 0, 250, 1, 0)
+    toggleRow("Auto prediction", "AutoPrediction")
+    sliderRow("Aim lead (ms)", "AimPredictionMs", "AimPredictionMs", 0, 250, 1, 0,
+        function() return not Settings.AutoPrediction end)
     sliderRow("Hit chance", "HitChance", "HitChance", 0, 100, 1, 100)
     toggleRow("Humanizer", "Humanizer")
     sliderRow("Reaction (ms)", "ReactionMs", "ReactionMs", 0, 400, 1, 100, humanizerOn)
@@ -2447,7 +2777,8 @@ local function buildUI(ctx)
         if not dragHeld() or not canInteractRow(slider.Row) then return end
         local fraction = math.clamp((position.X - slider.Button.AbsolutePosition.X)
             / math.max(1, slider.Button.AbsoluteSize.X), 0, 1)
-        changeSetting(property, quantize(slider, slider.Minimum + fraction * (slider.Maximum - slider.Minimum)))
+        local value = quantize(slider, slider.Minimum + fraction * (slider.Maximum - slider.Minimum))
+        if value ~= Settings[property] then changeSetting(property, value) end
     end
     local function beginDrag(input, kind, slider)
         if not canInteractWindow() or dragInput then return end
@@ -2596,6 +2927,7 @@ local function buildUI(ctx)
             if Input:GetFocusedTextBox() ~= slider.NumberBox then slider.NumberBox.Text = formatNumber(slider, value) end
         end
         layoutRows()
+        refreshFeedback(true)
         local camera = lastCamera
         if workspace then camera = workspace.CurrentCamera end
         self:Render(camera)
@@ -2612,8 +2944,13 @@ local function buildUI(ctx)
         if value then
             Input.MouseIconEnabled = true
             clampPanel()
+            feedbackPending = true
+            refreshFeedback(false)
         else
             releaseNumberFocus()
+            feedbackPending = false
+            cancelFeedbackTweens()
+            refreshFeedback(true)
 
             if savedMouseIcon ~= nil and Input.MouseIconEnabled == true then
                 Input.MouseIconEnabled = savedMouseIcon
@@ -2625,6 +2962,10 @@ local function buildUI(ctx)
     function ui:Render(camera)
         if destroyed then return end
         if dragInput then dragHeld() end
+        if feedbackPending and visible then
+            feedbackPending = false
+            refreshFeedback(false)
+        end
         lastCamera = camera
         local display = camera ~= nil and Settings.ShowFOV == true and Settings.FOVEnabled == true
         if not display then circle.Visible = false; clearBoxes(); return end
@@ -2675,7 +3016,9 @@ local function buildUI(ctx)
     function ui:Destroy()
         if destroyed then return end
         self:SetVisible(false)
+        cancelFeedbackTweens()
         destroyed = true
+        feedbackEntries = {}
         endDrag()
         closeDropdown()
         clearBoxes()
@@ -2694,6 +3037,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 assert(LocalPlayer, "This script must run on the local client.")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
@@ -2724,13 +3068,28 @@ for _, name in ipairs({"DH_AimPanel", "DH_AimOverlay"}) do
     if obsolete then obsolete:Destroy() end
 end
 
-local modules = ReplicatedStorage:WaitForChild("Modules", 10)
-assert(modules, "ReplicatedStorage.Modules was not available.")
-local gunModule = modules:WaitForChild("GunHandler", 10)
-assert(gunModule, "Modules.GunHandler was not available.")
-local GunHandler = require(gunModule)
-assert(type(GunHandler) == "table" and type(GunHandler.getAim) == "function",
-    "GunHandler.getAim was not found.")
+local function chooseGuiHost(playerGui, environment)
+    local function usable(host)
+        if typeof(host) ~= "Instance" then return false end
+        local probe = Instance.new("ScreenGui")
+        probe.Enabled = false
+        local ok = pcall(function()
+            assert(host ~= playerGui and not host:IsDescendantOf(playerGui))
+            probe.Parent = host
+        end)
+        probe:Destroy()
+        return ok
+    end
+    local hiddenGui = environment.gethui or _G.gethui
+    if type(hiddenGui) == "function" then
+        local ok, host = pcall(hiddenGui)
+        if ok and usable(host) then return host end
+    end
+    local ok, host = pcall(game.GetService, game, "CoreGui")
+    if ok and usable(host) then return host end
+    return playerGui
+end
+
 local Settings = {
     Enabled = true,
     Mode = "FOV",
@@ -2753,6 +3112,7 @@ local Settings = {
     PointMode = "Adaptive",
     ClosestPointMode = "Advanced",
     PointScale = 0.25,
+    AutoPrediction = true,
     AimPredictionMs = 0,
     HitChance = 100,
     Humanizer = false,
@@ -2842,6 +3202,9 @@ end
 if savedSettings.SpreadEnabled == nil then
     Settings.SpreadEnabled = Settings.SpreadPercent < 100
 end
+if savedSettings.AutoPrediction == nil and Settings.AimPredictionMs > 0 then
+    Settings.AutoPrediction = false
+end
 for _, group in ipairs({"Shotguns", "Pistols", "Other"}) do
     for _, suffix in ipairs({"FOV", "FOVX", "FOVY", "FOVZ"}) do
         if savedSettings[group .. suffix] == nil then Settings[group .. suffix] = Settings[suffix] end
@@ -2852,8 +3215,11 @@ local running = true
 local closed = false
 local closing = false
 local connections = {}
-local selector, ui, router, visual, movement
-local state = {Settings = Settings, Version = 13, Errors = {}}
+local selector, ui, router, visual, movement, uiRoot
+local state = {Settings = Settings, Version = 19, Errors = {}, UIIsolated = false}
+local function isCurrent()
+    return running and not closed and env.__DH_GunHandlerAimUI == state
+end
 local function reportOnce(area, problem)
     if state.Errors[area] == nil then state.Errors[area] = tostring(problem) end
 end
@@ -2882,12 +3248,15 @@ local function cleanup()
     connections = {}
     if selector then attempt(function() selector:Destroy() end) end
     if ui then attempt(function() ui:Destroy() end) end
+    if uiRoot then attempt(function() uiRoot:Destroy() end) end
 
-    for _, name in ipairs({"DH_AimPanel", "DH_AimOverlay"}) do
-        attempt(function()
-            local item = PlayerGui:FindFirstChild(name)
-            if item then item:Destroy() end
-        end)
+    if env.__DH_GunHandlerAimUI == state then
+        for _, name in ipairs({"DH_AimPanel", "DH_AimOverlay"}) do
+            attempt(function()
+                local item = PlayerGui:FindFirstChild(name)
+                if item then item:Destroy() end
+            end)
+        end
     end
     closing = false
     if #failures > 0 then
@@ -2945,24 +3314,66 @@ local function setSetting(key, value)
 end
 state.SetSetting = setSetting
 state.GetDiagnostics = function()
-    return selector and selector:GetDiagnostics() or {status = "Unloaded"}
+    return selector and selector:GetDiagnostics() or {status = running and "Starting" or "Unloaded"}
 end
 state.GetMovementDiagnostics = function()
-    return movement and movement:GetDiagnostics() or {enabled = false, mode = "Unloaded"}
+    return movement and movement:GetDiagnostics() or {enabled = false, mode = running and "Starting" or "Unloaded"}
 end
 state.ToggleTarget = function()
-    if not running or Settings.Mode ~= "CurrentTarget" then return false end
+    if not running or not selector or Settings.Mode ~= "CurrentTarget" then return false end
     return selector:ToggleTarget()
 end
 
 local initialMouseIcon = UserInputService.MouseIconEnabled
+env.__DH_GunHandlerAimUI = state
 local initialized, problem = pcall(function()
+    local uiHost = chooseGuiHost(PlayerGui, env)
+    if not isCurrent() then return end
+    uiRoot = Instance.new("Folder")
+    uiRoot.Name = "DH_AimRoot"
+    uiRoot.Parent = uiHost
+    state.UIIsolated = uiHost ~= PlayerGui
+    ui = buildUI({
+        PlayerGui = PlayerGui, UserInputService = UserInputService, RunService = RunService,
+        GuiParent = uiRoot, TweenService = TweenService,
+        Settings = Settings, Track = track, SetSetting = setSetting,
+        OnUnload = cleanup, ReferencePoint = referencePoint,
+        GetFOVVisuals = function() return selector and selector:GetFOVVisuals() or nil end,
+    })
+    track(UserInputService.InputBegan, function(input, gameProcessed)
+        if not running or UserInputService:GetFocusedTextBox() then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            ui:SetVisible(not ui:IsVisible())
+        elseif selector and not gameProcessed and Settings.Mode == "CurrentTarget"
+            and input.KeyCode == Enum.KeyCode[Settings.TargetKey] then
+            selector:ToggleTarget()
+        end
+    end)
+    track(RunService.RenderStepped, function()
+        if running then ui:Render(workspace.CurrentCamera) end
+    end)
+    if not isCurrent() then return end
+    local modules = ReplicatedStorage:WaitForChild("Modules", 10)
+    if not isCurrent() then return end
+    assert(modules, "ReplicatedStorage.Modules was not available.")
+    local gunModule = modules:WaitForChild("GunHandler", 10)
+    if not isCurrent() then return end
+    assert(gunModule, "Modules.GunHandler was not available.")
+    local GunHandler = require(gunModule)
+    if not isCurrent() then return end
+    assert(type(GunHandler) == "table" and type(GunHandler.getAim) == "function",
+        "GunHandler.getAim was not found.")
     selector = buildSelector({
         Players = Players, LocalPlayer = LocalPlayer, ReplicatedStorage = ReplicatedStorage,
         UserInputService = UserInputService, Settings = Settings,
         ReferencePoint = referencePoint, Track = track, Clock = os.clock,
         OriginalAim = GunHandler.getAim,
     })
+    if not isCurrent() then
+        pcall(selector.Destroy, selector)
+        selector = nil
+        return
+    end
     visual = buildVisualRedirect({
         Settings = Settings, LocalPlayer = LocalPlayer, GunHandler = GunHandler,
         Workspace = workspace, Track = track, Clock = os.clock, OnError = reportOnce,
@@ -2974,21 +3385,6 @@ local initialized, problem = pcall(function()
     movement = buildMovementController({
         Settings = Settings, LocalPlayer = LocalPlayer, Clock = os.clock, OnError = reportOnce,
     })
-    ui = buildUI({
-        PlayerGui = PlayerGui, UserInputService = UserInputService, RunService = RunService,
-        Settings = Settings, Track = track, SetSetting = setSetting,
-        OnUnload = cleanup, ReferencePoint = referencePoint,
-        GetFOVVisuals = function() return selector:GetFOVVisuals() end,
-    })
-    track(UserInputService.InputBegan, function(input, gameProcessed)
-        if not running or UserInputService:GetFocusedTextBox() then return end
-        if input.KeyCode == Enum.KeyCode.RightShift then
-            ui:SetVisible(not ui:IsVisible())
-        elseif not gameProcessed and Settings.Mode == "CurrentTarget"
-            and input.KeyCode == Enum.KeyCode[Settings.TargetKey] then
-            selector:ToggleTarget()
-        end
-    end)
     local resumeAt = 0
     track(RunService.Heartbeat, function(dt)
         if not running then return end
@@ -3003,9 +3399,6 @@ local initialized, problem = pcall(function()
         end
         local ok, failure = pcall(visual.Step, visual)
         if not ok then reportOnce("tracer update", failure) end
-    end)
-    track(RunService.RenderStepped, function()
-        if running then ui:Render(workspace.CurrentCamera) end
     end)
     track(RunService.PreSimulation or RunService.Heartbeat, function()
         if not running then return end
@@ -3031,10 +3424,12 @@ local initialized, problem = pcall(function()
     ui:Sync()
 
     router:Install()
-    env.__DH_GunHandlerAimUI = state
 end)
-if not initialized then
+if not initialized and isCurrent() then
     cleanup()
-    UserInputService.MouseIconEnabled = initialMouseIcon
+    if (env.__DH_GunHandlerAimUI == nil or env.__DH_GunHandlerAimUI == state)
+        and UserInputService.MouseIconEnabled == true then
+        UserInputService.MouseIconEnabled = initialMouseIcon
+    end
     error("[Dmc | Da Hood] Setup failed: " .. tostring(problem), 0)
 end
