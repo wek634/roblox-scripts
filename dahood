@@ -1,0 +1,3008 @@
+local AIM_PISTOL_NAMES = {
+    ["[Revolver]"] = true, ["[Glock]"] = true, ["[Silencer]"] = true,
+    ["[USP]"] = true, ["[Pistol]"] = true, ["[Flintlock]"] = true,
+}
+local function classifyWeapon(tool)
+    local name = tool and tool.Name or ""
+    local lower = string.lower(name)
+    if string.find(lower, "shotgun", 1, true) or string.find(lower, "double-barrel", 1, true)
+        or string.find(lower, "doublebarrel", 1, true) then return "Shotguns" end
+    return AIM_PISTOL_NAMES[name] and "Pistols" or "Other"
+end
+
+local function getFOVProfile(settings, tool)
+    local prefix = settings.PerWeaponFOV and classifyWeapon(tool) or ""
+    local function value(suffix, fallback, maximum)
+        local number = settings[prefix .. "FOV" .. suffix]
+        if type(number) ~= "number" or number ~= number then number = settings["FOV" .. suffix] end
+        if type(number) ~= "number" or number ~= number then number = fallback end
+        return math.clamp(number, 0, maximum)
+    end
+    return {
+        shape = settings.FOVShape == "Box" and "Box" or "Circle",
+        enabled = settings.FOVEnabled ~= false,
+        radius = value("", 100, 300),
+        x = value("X", 5, 20), y = value("Y", 5, 20), z = value("Z", 5, 20),
+    }
+end
+
+local function getCharacterFOVRoot(character)
+    if not character then return nil end
+    for _, name in ipairs({ "HumanoidRootPart", "Torso", "UpperTorso", "LowerTorso" }) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") then return part end
+    end
+    return nil
+end
+
+local function rayIntersectsBox(ray, frame, size)
+    if size.X <= 0 or size.Y <= 0 or size.Z <= 0 then return false end
+    local origin = frame:PointToObjectSpace(ray.Origin)
+    local direction = frame:VectorToObjectSpace(ray.Direction)
+    local half = size * 0.5
+    local o, d, h = { origin.X, origin.Y, origin.Z }, { direction.X, direction.Y, direction.Z }, { half.X, half.Y, half.Z }
+    local enter, leave = 0, math.huge
+    for index = 1, 3 do
+        if math.abs(d[index]) <= 0.000000001 then
+            if math.abs(o[index]) > h[index] then return false end
+        else
+            local first = (-h[index] - o[index]) / d[index]
+            local last = (h[index] - o[index]) / d[index]
+            if first > last then first, last = last, first end
+            enter, leave = math.max(enter, first), math.min(leave, last)
+            if leave < enter then return false end
+        end
+    end
+    return leave >= enter
+end
+
+local function closestRayBoxPoint(frame, size, ray)
+    local origin = frame:PointToObjectSpace(ray.Origin)
+    local direction = frame:VectorToObjectSpace(ray.Direction)
+    local half = size * 0.5
+    local o, d, h = { origin.X, origin.Y, origin.Z }, { direction.X, direction.Y, direction.Z }, { half.X, half.Y, half.Z }
+    local cuts = { 0 }
+    local directionSquared = direction:Dot(direction)
+    if directionSquared <= 0.000000000001 then
+        return Vector3.new(math.clamp(o[1], -h[1], h[1]), math.clamp(o[2], -h[2], h[2]), math.clamp(o[3], -h[3], h[3]))
+    end
+    local preferred = math.max(0, -origin:Dot(direction) / directionSquared)
+    for index = 1, 3 do
+        if math.abs(d[index]) > 0.000000001 then
+            local first = (-h[index] - o[index]) / d[index]
+            local last = (h[index] - o[index]) / d[index]
+            if first > 0 then cuts[#cuts + 1] = first end
+            if last > 0 then cuts[#cuts + 1] = last end
+        end
+    end
+    table.sort(cuts)
+    local bestDistance, bestT, bestPoint = math.huge, math.huge, nil
+    for index = 1, #cuts do
+        local lower, upper = cuts[index], cuts[index + 1] or math.huge
+        local sample = upper < math.huge and (lower + (upper - lower) * 0.5)
+            or (lower + math.max(1, math.abs(lower) * 0.01))
+        local a, b = 0, 0
+        for axis = 1, 3 do
+            local position = o[axis] + d[axis] * sample
+            local bound
+            if position < -h[axis] then bound = -h[axis]
+            elseif position > h[axis] then bound = h[axis] end
+            if bound then
+                a = a + d[axis] * d[axis]
+                b = b + d[axis] * (o[axis] - bound)
+            end
+        end
+        local t = a > 0.000000000001 and math.clamp(-b / a, lower, upper)
+            or math.clamp(preferred, lower, upper)
+        local x, y, z = o[1] + d[1] * t, o[2] + d[2] * t, o[3] + d[3] * t
+        local qx, qy, qz = math.clamp(x, -h[1], h[1]), math.clamp(y, -h[2], h[2]), math.clamp(z, -h[3], h[3])
+        local distance = (x - qx) ^ 2 + (y - qy) ^ 2 + (z - qz) ^ 2
+        if distance < bestDistance - 0.000000001
+            or (math.abs(distance - bestDistance) <= 0.000000001 and math.abs(t - preferred) < math.abs(bestT - preferred)) then
+            bestDistance, bestT = distance, t
+            bestPoint = Vector3.new(qx, qy, qz)
+        end
+    end
+    return bestPoint or Vector3.new(0, 0, 0)
+end
+
+local function buildSelector(ctx)
+    local Players = ctx.Players
+    local LocalPlayer = ctx.LocalPlayer
+    local ReplicatedStorage = ctx.ReplicatedStorage
+    local Settings = ctx.Settings
+    local Clock = ctx.Clock or os.clock
+    local World = ctx.Workspace or workspace
+    local SCAN_INTERVAL = 1 / 30
+    local PART_BUDGET = 192
+    local RAY_BUDGET = 12
+    local SHOT_RAY_BUDGET = 24
+    local RETAINED_RAY_BUDGET = 4
+    local MAX_PROBE_ATTEMPTS = 96
+    local EPSILON = 0.0001
+    local BODY_PARTS = {
+        "Head", "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart",
+        "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+        "LeftHand", "RightHand", "LeftUpperLeg", "RightUpperLeg",
+        "LeftLowerLeg", "RightLowerLeg", "LeftFoot", "RightFoot",
+        "Left Arm", "Right Arm", "Left Leg", "Right Leg",
+    }
+    local OFFSETS = {
+        ["[Revolver]"] = CFrame.new(-1, 0.4, 0),
+        ["[TacticalShotgun]"] = CFrame.new(0, 0.25, -2.5),
+        ["[SilencerAR]"] = CFrame.new(2.5, 0.35, 0),
+    }
+    local UNIT_OFFSETS = {
+        Vector3.new(0, 0, 0),
+        Vector3.new(0, 0, 0),
+        Vector3.new(0, 1, 0), Vector3.new(0, -1, 0),
+        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+        Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+        Vector3.new(1, 1, 1), Vector3.new(-1, 1, 1),
+        Vector3.new(1, 1, -1), Vector3.new(-1, 1, -1),
+        Vector3.new(1, -1, 1), Vector3.new(-1, -1, 1),
+        Vector3.new(1, -1, -1), Vector3.new(-1, -1, -1),
+    }
+
+    local alive = true
+    local epoch = 0
+    local roster = {}
+    local rosterAt = -math.huge
+    local playerCursor, partCursor = 1, 1
+    local records = {}
+    local selected
+    local currentTool
+    local nextScan = 0
+    local manualPlayer, manualCharacter, manualRequested, manualRequestUntil
+    local reactionPlayer, reactionCharacter, reactionSince
+    local normalParts = {}
+    local originalAimCache = {}
+    local lastGatherEpoch, lastGatherAt = -1, -math.huge
+    local recoveryStamp
+    local fovVisuals = { shape = "Circle", enabled = true, radius = 100, boxes = {} }
+    local diagnostics = { targetName = "None", status = "Waiting for a weapon", scanMs = 0, raycasts = 0 }
+
+    local ignoredObjects
+    local mainModule = ReplicatedStorage:FindFirstChild("MainModule")
+    if mainModule and mainModule:IsA("ModuleScript") then
+        local ok, module = pcall(require, mainModule)
+        if ok and type(module) == "table" and type(module.Ignored) == "table" then
+            ignoredObjects = module.Ignored
+        end
+    end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater = true
+    local wallParams = RaycastParams.new()
+    wallParams.FilterType = Enum.RaycastFilterType.Exclude
+    wallParams.RespectCanCollide = true
+
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+
+    local function positive(value)
+        return finite(value) and value > 0
+    end
+
+    local function finiteVector(value)
+        return typeof(value) == "Vector3" and finite(value.X) and finite(value.Y) and finite(value.Z)
+    end
+
+    local function isAllParts()
+        return Settings.Target == "Closest" or Settings.Target == "ClosestPart" or Settings.Target == "ClosestPoint"
+    end
+
+    local function isClosestPoint()
+        return Settings.Target == "ClosestPoint"
+    end
+
+    local function manualMode()
+        return Settings.Mode == "CurrentTarget"
+    end
+
+    local function resetReaction()
+        reactionPlayer, reactionCharacter, reactionSince = nil, nil, nil
+    end
+
+    local function updateReaction(record, now)
+        if not record then resetReaction(); return end
+        if reactionPlayer ~= record.player or reactionCharacter ~= record.character then
+            reactionPlayer, reactionCharacter, reactionSince = record.player, record.character, now
+        end
+    end
+
+    local function exempt(character)
+        if character:GetAttribute("AdminInvisible") == true then return true end
+        local flight = character:FindFirstChild("BatmanFlight")
+        return character:GetAttribute("BatmanFlight") == true
+            and flight ~= nil and flight:GetAttribute("HumanoidFlight") ~= true
+    end
+
+    local function eligible(player, expectedCharacter)
+        if player == LocalPlayer or player.Parent ~= Players then return nil end
+        local character = player.Character
+        if not character or (expectedCharacter and character ~= expectedCharacter) or not character.Parent then
+            return nil
+        end
+        if exempt(character) then return nil end
+        if Settings.TeamCheck and LocalPlayer.Team ~= nil and not LocalPlayer.Neutral
+            and not player.Neutral and player.Team == LocalPlayer.Team then
+            return nil
+        end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then return nil end
+        local effects = character:FindFirstChild("BodyEffects")
+        local dead = effects and effects:FindFirstChild("Dead")
+        if dead and dead.Value == true then return nil end
+        if Settings.SkipKnocked then
+            local knocked = effects and effects:FindFirstChild("K.O")
+            if knocked and knocked.Value == true then return nil end
+        end
+        return character
+    end
+
+    local function equipped()
+        local character = LocalPlayer.Character
+        if not character then return nil end
+        local tool = character:FindFirstChildWhichIsA("Tool")
+        local handle = tool and tool:FindFirstChild("Handle")
+        local rangeObject = tool and tool:FindFirstChild("Range")
+        if not handle or not handle:IsA("BasePart") or not rangeObject
+            or not (rangeObject:IsA("NumberValue") or rangeObject:IsA("IntValue"))
+            or not positive(rangeObject.Value) then
+            return nil
+        end
+        local default = tool:FindFirstChild("Default")
+        local mesh = default and default:FindFirstChild("Mesh")
+        local muzzle = mesh and mesh:FindFirstChild("Muzzle")
+        local origin
+        if muzzle and muzzle:IsA("Attachment") then
+            origin = muzzle.WorldPosition
+        elseif OFFSETS[tool.Name] then
+            origin = (handle.CFrame * OFFSETS[tool.Name]).Position
+        else
+            muzzle = handle:FindFirstChild("Muzzle")
+            origin = muzzle and muzzle:IsA("Attachment") and muzzle.WorldPosition or handle.Position
+        end
+        return tool, origin, rangeObject.Value
+    end
+
+    local function refreshFilters(now)
+        local oldPlayer = roster[playerCursor]
+        roster = Players:GetPlayers()
+        playerCursor = 1
+        if oldPlayer then
+            for index, player in ipairs(roster) do
+                if player == oldPlayer then playerCursor = index; break end
+            end
+        end
+        local excluded, wallExcluded = {}, {}
+        local function append(list, object)
+            if typeof(object) == "Instance" then list[#list + 1] = object end
+        end
+        append(excluded, LocalPlayer.Character)
+        local playerFolder = World:FindFirstChild("Players")
+        append(wallExcluded, playerFolder or LocalPlayer.Character)
+        if ignoredObjects then
+            for _, object in pairs(ignoredObjects) do
+                append(excluded, object)
+                append(wallExcluded, object)
+            end
+        else
+            local ignored = World:FindFirstChild("Ignored")
+            append(excluded, ignored)
+            append(wallExcluded, ignored)
+        end
+
+        for _, player in ipairs(roster) do
+            local character = player.Character
+            if character then
+                if exempt(character) then append(excluded, character) end
+                append(excluded, character:FindFirstChildWhichIsA("Tool"))
+            end
+        end
+        rayParams.FilterDescendantsInstances = excluded
+        wallParams.FilterDescendantsInstances = wallExcluded
+        rosterAt = now
+    end
+
+    local function raycast(origin, direction, params)
+        diagnostics.raycasts = diagnostics.raycasts + 1
+        return World:Raycast(origin, direction, params)
+    end
+
+    local function wallClear(origin)
+        if not Players:GetAttribute("RankedWallShotsBanned") then return true end
+        local character = LocalPlayer.Character
+        local head = character and character:FindFirstChild("Head")
+        if not head or not head:IsA("BasePart") then return false end
+        local delta = origin - head.Position
+        if delta:Dot(delta) <= EPSILON then return true end
+        return raycast(head.Position, delta, wallParams) == nil
+    end
+
+    local function pointScore(camera, pointer, point, origin, range, character, profile, aimRay, boxCache)
+        if not finiteVector(point) then return nil end
+        local delta = point - origin
+        local distanceSquared = delta:Dot(delta)
+        if distanceSquared <= EPSILON or distanceSquared > range * range then return nil end
+        local pixel, onScreen = camera:WorldToViewportPoint(point)
+        if not onScreen or pixel.Z <= 0 then return nil end
+        local dx, dy = pixel.X - pointer.X, pixel.Y - pointer.Y
+        local score = dx * dx + dy * dy
+        if profile.enabled then
+            if profile.shape == "Circle" then
+                if profile.radius <= 0 or score > profile.radius * profile.radius then return nil end
+            else
+                local allowed = boxCache and boxCache[character]
+                if allowed == nil then
+                    local root = getCharacterFOVRoot(character)
+                    allowed = root ~= nil and rayIntersectsBox(aimRay, root.CFrame, Vector3.new(profile.z, profile.y, profile.x))
+                    if boxCache then boxCache[character] = allowed end
+                end
+                if not allowed then return nil end
+            end
+        end
+        return score, delta, math.sqrt(distanceSquared)
+    end
+
+    local function nearestOffset(record, aimRay)
+        local part = record.part
+        local frame, size = part.CFrame, part.Size
+        local cached = record.closestGeometry
+        if cached and cached.frame == frame and cached.size == size
+            and cached.origin == aimRay.Origin and cached.direction == aimRay.Direction then
+            return cached.point
+        end
+        local point = closestRayBoxPoint(frame, size, aimRay)
+        record.closestGeometry = {
+            frame = frame, size = size, origin = aimRay.Origin, direction = aimRay.Direction, point = point,
+        }
+        return point
+    end
+
+    local function offsetAt(record, index, aimRay)
+        local part = record.part
+        if isClosestPoint() then
+            if index == 2 then return Vector3.new(0, 0, 0) end
+            if index == 1 then return nearestOffset(record, aimRay) end
+            local half = part.Size * 0.5
+            if index <= 8 then
+                local nearest = nearestOffset(record, aimRay)
+                local spacing = finite(Settings.PointScale) and math.clamp(Settings.PointScale, 0.05, 1) or 0.25
+                local point = nearest + UNIT_OFFSETS[index] * spacing
+                return Vector3.new(math.clamp(point.X, -half.X, half.X),
+                    math.clamp(point.Y, -half.Y, half.Y), math.clamp(point.Z, -half.Z, half.Z))
+            end
+            return half * 0.95 * UNIT_OFFSETS[index - 6]
+        end
+        if index == 1 or Settings.Target == "ClosestPart" or Settings.Target == "Closest"
+            or Settings.PointMode ~= "Adaptive" then
+            return Vector3.new(0, 0, 0)
+        end
+
+        local half = part.Size * 0.38
+        if index == 2 then
+            local localPoint = nearestOffset(record, aimRay)
+            return Vector3.new(
+                math.clamp(localPoint.X, -half.X, half.X),
+                math.clamp(localPoint.Y, -half.Y, half.Y),
+                math.clamp(localPoint.Z, -half.Z, half.Z)
+            )
+        end
+        return half * UNIT_OFFSETS[index]
+    end
+
+    local function sampleCount()
+        if isClosestPoint() then return 22 end
+        if Settings.Target == "ClosestPart" or Settings.Target == "Closest" then return 1 end
+        return Settings.PointMode == "Adaptive" and #UNIT_OFFSETS or 1
+    end
+
+    local function pointsAt(record, index, aimRay)
+        local offset = offsetAt(record, index, aimRay)
+        local point = record.part.CFrame:PointToWorldSpace(offset)
+        local prediction = finite(Settings.AimPredictionMs) and math.clamp(Settings.AimPredictionMs, 0, 250) or 0
+        local velocity = record.part.AssemblyLinearVelocity
+        if prediction > 0 and finiteVector(velocity) then
+            return point, point + velocity * (prediction / 1000), offset
+        end
+        return point, point, offset
+    end
+
+    local function recordValid(record)
+        return record ~= nil and record.part.Parent ~= nil
+            and eligible(record.player, record.character) ~= nil
+            and record.part:IsDescendantOf(record.character)
+    end
+
+    local function visible(record, point, aimPoint, origin, budget)
+        if not Settings.VisibleOnly then return true end
+        local required = point == aimPoint and 1 or 2
+        if budget and diagnostics.raycasts + required > budget then return nil end
+        local hit = raycast(origin, point - origin, rayParams)
+        if not hit or not hit.Instance:IsDescendantOf(record.character) then return false end
+        if point ~= aimPoint then
+            local predictedHit = raycast(origin, aimPoint - origin, rayParams)
+            if predictedHit and not predictedHit.Instance:IsDescendantOf(record.character) then return false end
+        end
+        return true
+    end
+
+    local function clearSelection(status)
+        selected = nil
+        diagnostics.targetName = "None"
+        if status then diagnostics.status = status end
+    end
+
+    local function commit(candidate, now)
+        if not candidate then return end
+        selected = {
+            record = candidate.record, offset = candidate.offset,
+            pointIndex = candidate.pointIndex, score = candidate.score, checkedAt = now,
+        }
+        diagnostics.targetName = candidate.record.player.Name
+    end
+
+    local function nearestPart(character, camera, pointer)
+        local best, bestScore
+        for _, name in ipairs(BODY_PARTS) do
+            local part = character:FindFirstChild(name)
+            if part and part:IsA("BasePart") then
+                local pixel, onScreen = camera:WorldToViewportPoint(part.Position)
+                if onScreen and pixel.Z > 0 then
+                    local score = (pixel.X - pointer.X) ^ 2 + (pixel.Y - pointer.Y) ^ 2
+                    if not bestScore or score < bestScore then best, bestScore = part, score end
+                end
+            end
+        end
+        return best
+    end
+
+    local function updateRecord(player, character, part, view, now)
+        if not part or not part:IsA("BasePart") then return nil end
+        local record = records[part]
+        if not record or record.character ~= character then
+            record = { player = player, character = character, part = part, pointIndex = 1, probeAt = -math.huge }
+        end
+        local _, primary = pointsAt(record, 1, view.aimRay)
+        local first = pointScore(view.camera, view.pointer, primary, view.origin, view.range,
+            character, view.profile, view.aimRay, view.boxCache)
+        local second
+        if sampleCount() > 1 then
+            local _, alternative = pointsAt(record, 2, view.aimRay)
+            second = pointScore(view.camera, view.pointer, alternative, view.origin, view.range,
+                character, view.profile, view.aimRay, view.boxCache)
+        end
+        if first or second then
+            record.score = math.min(first or math.huge, second or math.huge)
+            record.seenAt = now
+            records[part] = record
+            return record
+        end
+        records[part] = nil
+        return nil
+    end
+
+    local function playerBefore(a, b)
+        local first, second = a.UserId or 0, b.UserId or 0
+        if first ~= second then return first < second end
+        return a.Name < b.Name
+    end
+
+    local function gather(view, now)
+        local ranked = {}
+        local normal = isClosestPoint() and Settings.ClosestPointMode ~= "Advanced"
+        for _, player in ipairs(roster) do
+            local character = eligible(player)
+            if character then
+                local part = not isAllParts() and character:FindFirstChild(Settings.Target)
+                    or character:FindFirstChild("Head") or getCharacterFOVRoot(character)
+                local score, onScreen = math.huge, false
+                if part and part:IsA("BasePart") then
+                    local pixel, shown = view.camera:WorldToViewportPoint(part.Position)
+                    onScreen = shown and pixel.Z > 0
+                    if pixel.Z > 0 and finite(pixel.X) and finite(pixel.Y) then
+                        score = (pixel.X - view.pointer.X) ^ 2 + (pixel.Y - view.pointer.Y) ^ 2
+                    end
+                end
+                if isAllParts() and not onScreen then
+                    local root = getCharacterFOVRoot(character)
+                    if root and root ~= part then
+                        local pixel = view.camera:WorldToViewportPoint(root.Position)
+                        if pixel.Z > 0 and finite(pixel.X) and finite(pixel.Y) then
+                            score = math.min(score, (pixel.X - view.pointer.X) ^ 2 + (pixel.Y - view.pointer.Y) ^ 2)
+                        end
+                    end
+                end
+                if onScreen or isAllParts() then
+                    ranked[#ranked + 1] = {
+                        player = player, character = character, part = part, score = score,
+                    }
+                end
+            end
+        end
+        table.sort(ranked, function(a, b)
+            if a.score ~= b.score then return a.score < b.score end
+            return playerBefore(a.player, b.player)
+        end)
+        local spent = 0
+        for _, item in ipairs(ranked) do
+            local cost = normal and #BODY_PARTS or 1
+            if spent + cost > PART_BUDGET then break end
+            local part = item.part
+            if normal then
+                part = nearestPart(item.character, view.camera, view.pointer)
+                normalParts[item.character] = part
+            end
+            updateRecord(item.player, item.character, part, view, now)
+            spent = spent + cost
+        end
+        if isAllParts() and not normal and #ranked > 0 and spent < PART_BUDGET then
+            local firstPart = math.clamp(partCursor, 2, #BODY_PARTS)
+            local firstPlayer = math.clamp(playerCursor, 1, #ranked)
+            for offset = 0, #BODY_PARTS - 2 do
+                local index = (firstPart - 2 + offset) % (#BODY_PARTS - 1) + 2
+                for step = 0, #ranked - 1 do
+                    local rankIndex = (firstPlayer - 1 + step) % #ranked + 1
+                    local item = ranked[rankIndex]
+                    local part = item.character:FindFirstChild(BODY_PARTS[index])
+                    if part and part:IsA("BasePart") then
+                        if spent >= PART_BUDGET then
+                            partCursor, playerCursor = index, rankIndex
+                            lastGatherEpoch, lastGatherAt = epoch, now
+                            return
+                        end
+                        updateRecord(item.player, item.character, part, view, now)
+                        spent = spent + 1
+                    end
+                end
+            end
+            partCursor = firstPart % (#BODY_PARTS - 1) + 2
+            playerCursor = firstPlayer % #ranked + 1
+        end
+        lastGatherEpoch, lastGatherAt = epoch, now
+    end
+
+    local function seedPlayer(player, character, view, now)
+        if not player or not character or not eligible(player, character) then return end
+        if isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" then
+            local part = nearestPart(character, view.camera, view.pointer)
+            normalParts[character] = part
+            updateRecord(player, character, part, view, now)
+        elseif isAllParts() then
+            for _, name in ipairs(BODY_PARTS) do
+                updateRecord(player, character, character:FindFirstChild(name), view, now)
+            end
+        else
+            updateRecord(player, character, character:FindFirstChild(Settings.Target), view, now)
+        end
+    end
+
+    local function liveCandidate(record, index, view)
+        if not recordValid(record) then return nil end
+        if not isAllParts() and record.part.Name ~= Settings.Target then return nil end
+        if isClosestPoint() and Settings.ClosestPointMode ~= "Advanced"
+            and normalParts[record.character] ~= record.part then return nil end
+        index = math.clamp(index or 1, 1, sampleCount())
+        local point, aimPoint, offset = pointsAt(record, index, view.aimRay)
+        local score, delta, distance = pointScore(view.camera, view.pointer, aimPoint, view.origin,
+            view.range, record.character, view.profile, view.aimRay, view.boxCache)
+        if not score then return nil end
+        return {
+            record = record, pointIndex = index, point = point, aimPoint = aimPoint,
+            offset = offset, score = score, delta = delta, distance = distance,
+        }
+    end
+
+    local function better(candidate, winner)
+        if not winner then return true end
+        if candidate.score ~= winner.score then return candidate.score < winner.score end
+        if candidate.record.player ~= winner.record.player then
+            return playerBefore(candidate.record.player, winner.record.player)
+        end
+        if candidate.record.part.Name ~= winner.record.part.Name then
+            return candidate.record.part.Name < winner.record.part.Name
+        end
+        return candidate.pointIndex < winner.pointIndex
+    end
+
+    local function makeEntry(record, view, prior)
+        local queue, used, cache = {}, {}, {}
+        local function append(index)
+            index = math.clamp(index or 1, 1, sampleCount())
+            if not used[index] then used[index] = true; queue[#queue + 1] = index end
+        end
+        append(1)
+        if prior and prior.record.part == record.part then append(prior.pointIndex) end
+        append(record.pointIndex)
+        if sampleCount() > 1 then append(2) end
+        local bestScore
+        for _, index in ipairs(queue) do
+            local candidate = liveCandidate(record, index, view)
+            cache[index] = candidate or false
+            if candidate then bestScore = math.min(bestScore or math.huge, candidate.score) end
+        end
+        if not bestScore then return nil end
+        local first = math.clamp(record.pointIndex or 1, 1, sampleCount())
+        for step = 0, sampleCount() - 1 do append((first - 1 + step) % sampleCount() + 1) end
+        return { record = record, score = bestScore, queue = queue, cursor = 1, cache = cache }
+    end
+
+    local function collectGroups(view, now, prior, onlyPlayer)
+        local groups, byPlayer = {}, {}
+        local bodyCount = isAllParts() and #BODY_PARTS or 1
+        local maxAge = math.max(0.3, #roster * bodyCount / PART_BUDGET * SCAN_INTERVAL * 2 + 0.1)
+        for part, record in pairs(records) do
+            if now - record.seenAt > maxAge or not recordValid(record) then
+                records[part] = nil
+            elseif not onlyPlayer or record.player == onlyPlayer then
+                local entry = makeEntry(record, view, prior)
+                if entry then
+                    local group = byPlayer[record.player]
+                    if not group then
+                        group = { player = record.player, character = record.character, entries = {}, cursor = 1, score = entry.score }
+                        byPlayer[record.player] = group
+                        groups[#groups + 1] = group
+                    end
+                    group.entries[#group.entries + 1] = entry
+                    group.score = math.min(group.score, entry.score)
+                end
+            end
+        end
+        for _, group in ipairs(groups) do
+            table.sort(group.entries, function(a, b)
+                if a.score ~= b.score then return a.score < b.score end
+                return a.record.part.Name < b.record.part.Name
+            end)
+        end
+        table.sort(groups, function(a, b)
+            if a.score ~= b.score then return a.score < b.score end
+            return playerBefore(a.player, b.player)
+        end)
+        return groups, byPlayer
+    end
+
+    local function probeGroups(groups, view, now, budget, winner, checked)
+        local attempts = 0
+        while attempts < MAX_PROBE_ATTEMPTS and diagnostics.raycasts < budget do
+            local progressed = false
+            for _, group in ipairs(groups) do
+                if attempts >= MAX_PROBE_ATTEMPTS or diagnostics.raycasts >= budget then break end
+                local entry
+                for _ = 1, #group.entries do
+                    local candidateEntry = group.entries[group.cursor]
+                    group.cursor = group.cursor % #group.entries + 1
+                    if not candidateEntry.done and candidateEntry.cursor <= #candidateEntry.queue then
+                        entry = candidateEntry
+                        break
+                    end
+                end
+                if entry then
+                    progressed = true
+                    attempts = attempts + 1
+                    local index = entry.queue[entry.cursor]
+                    entry.cursor = entry.cursor + 1
+                    local candidate = entry.cache[index]
+                    if candidate == nil then candidate = liveCandidate(entry.record, index, view) end
+                    local result
+                    if candidate then
+                        local same = checked and checked.record.part == candidate.record.part
+                            and checked.pointIndex == candidate.pointIndex
+                        result = same and true or visible(candidate.record, candidate.point, candidate.aimPoint, view.origin, budget)
+                        if result == nil then return winner end
+                    end
+                    entry.record.probeAt = now
+                    if result then
+                        entry.done = true
+                        entry.record.pointIndex = 1
+                        if better(candidate, winner) then winner = candidate end
+                    else
+                        entry.record.pointIndex = index % sampleCount() + 1
+                    end
+                end
+            end
+            if not progressed then break end
+        end
+        return winner
+    end
+
+    local function acquire(view, now, budget, prior, checked, forceGather)
+        if forceGather or lastGatherEpoch ~= epoch or now - lastGatherAt >= SCAN_INTERVAL then gather(view, now) end
+        local retainedPlayer, retainedCharacter
+        if manualMode() and manualPlayer then
+            retainedPlayer, retainedCharacter = manualPlayer, manualCharacter
+        elseif Settings.KeepTarget and prior and eligible(prior.record.player, prior.record.character) then
+            retainedPlayer, retainedCharacter = prior.record.player, prior.record.character
+        end
+        seedPlayer(retainedPlayer, retainedCharacter, view, now)
+        if prior and recordValid(prior.record) then
+            prior.record.seenAt = now
+            records[prior.record.part] = prior.record
+        end
+        local groups, byPlayer = collectGroups(view, now, prior, manualMode() and manualPlayer or nil)
+        if retainedPlayer then
+            local retained = byPlayer[retainedPlayer]
+            if checked and checked.record.player == retainedPlayer and not isAllParts() and checked.pointIndex == 1 then
+                return checked
+            end
+            local winner = checked and checked.record.player == retainedPlayer and checked or nil
+            if retained then
+                local limit = manualMode() and budget or math.min(budget, diagnostics.raycasts + RETAINED_RAY_BUDGET)
+                winner = probeGroups({ retained }, view, now, limit, winner, checked)
+            end
+            if winner or manualMode() then return winner end
+            local alternatives = {}
+            for _, group in ipairs(groups) do
+                if group.player ~= retainedPlayer then alternatives[#alternatives + 1] = group end
+            end
+            winner = probeGroups(alternatives, view, now, budget, nil, checked)
+            if not winner and retained then winner = probeGroups({ retained }, view, now, budget, nil, checked) end
+            return winner
+        end
+        return probeGroups(groups, view, now, budget, checked, checked)
+    end
+
+    local function makeView(origin, range, camera, pointer, profile)
+        return {
+            origin = origin, range = range, camera = camera, pointer = pointer, profile = profile,
+            aimRay = camera:ViewportPointToRay(pointer.X, pointer.Y, 0), boxCache = {},
+        }
+    end
+
+    local function sameRecovery(view, tool, now)
+        local item = recoveryStamp
+        return item ~= nil and item.epoch == epoch and now - item.at <= SCAN_INTERVAL
+            and item.tool == tool and item.origin == view.origin and item.range == view.range
+            and item.camera == view.camera and item.frame == view.camera.CFrame
+            and item.fov == view.camera.FieldOfView and item.viewport == view.camera.ViewportSize
+            and item.x == view.pointer.X and item.y == view.pointer.Y
+            and item.mode == Settings.Mode and item.target == Settings.Target
+            and item.keepTarget == Settings.KeepTarget and item.manualPlayer == manualPlayer
+            and item.shape == view.profile.shape and item.enabled == view.profile.enabled
+            and item.radius == view.profile.radius and item.width == view.profile.x
+            and item.height == view.profile.y and item.depth == view.profile.z
+    end
+
+    local function stampRecovery(view, tool, now)
+        recoveryStamp = {
+            epoch = epoch, at = now, tool = tool, origin = view.origin, range = view.range,
+            camera = view.camera, frame = view.camera.CFrame, fov = view.camera.FieldOfView,
+            viewport = view.camera.ViewportSize, x = view.pointer.X, y = view.pointer.Y,
+            mode = Settings.Mode, target = Settings.Target, keepTarget = Settings.KeepTarget,
+            manualPlayer = manualPlayer, shape = view.profile.shape, enabled = view.profile.enabled,
+            radius = view.profile.radius, width = view.profile.x, height = view.profile.y, depth = view.profile.z,
+        }
+    end
+
+    local selector = {}
+
+    function selector:Invalidate(preserveManualLock)
+        clearSelection("Updating target")
+        records = {}
+        normalParts = {}
+        originalAimCache = {}
+        resetReaction()
+        if not preserveManualLock then manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil end
+        nextScan = 0
+        lastGatherEpoch, lastGatherAt, recoveryStamp = -1, -math.huge, nil
+        playerCursor, partCursor = 1, 1
+        rosterAt = -math.huge
+    end
+
+    function selector:Step(_dt)
+        if not alive then return end
+        epoch = epoch + 1
+        originalAimCache = {}
+        diagnostics.raycasts = 0
+        local now = Clock()
+        local tool, origin, range = equipped()
+        if tool ~= currentTool then
+            currentTool = tool
+            self:Invalidate(true)
+        end
+        local profile = getFOVProfile(Settings, tool)
+        if (Settings.Enabled or (Settings.ShowFOV and profile.shape == "Box")) and now - rosterAt >= 0.2 then
+            refreshFilters(now)
+        end
+        local boxes = {}
+        if profile.enabled and profile.shape == "Box" and profile.x > 0 and profile.y > 0 and profile.z > 0 then
+            local size = Vector3.new(profile.z, profile.y, profile.x)
+            for index = 1, math.min(#roster, 64) do
+                local character = eligible(roster[index])
+                local root = character and getCharacterFOVRoot(character)
+                if root then boxes[#boxes + 1] = { part = root, size = size } end
+            end
+        end
+        fovVisuals = { shape = profile.shape, enabled = profile.enabled, radius = profile.radius, boxes = boxes }
+        if not Settings.Enabled then clearSelection("Disabled"); resetReaction(); return end
+        if not tool then clearSelection("Waiting for a weapon"); resetReaction(); return end
+        if manualMode() then
+            if manualRequested and (not manualRequestUntil or now >= manualRequestUntil) then
+                manualRequested, manualRequestUntil = false, nil
+                clearSelection("No eligible target; press target key")
+                resetReaction()
+            end
+            if manualPlayer and not eligible(manualPlayer, manualCharacter) then
+                manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil
+                clearSelection("Target lost; press target key")
+                resetReaction()
+            end
+            if not manualPlayer and not manualRequested then
+                clearSelection("Press target key to select")
+                resetReaction()
+                return
+            end
+        end
+        if now < nextScan then return end
+        nextScan = now + SCAN_INTERVAL
+        local started = Clock()
+        local camera = World.CurrentCamera
+        if not camera then clearSelection("Waiting for camera"); resetReaction(); return end
+        local pointer = ctx.ReferencePoint(camera)
+        local view = makeView(origin, range, camera, pointer, profile)
+        if not wallClear(origin) then
+            clearSelection("Muzzle is behind cover")
+            resetReaction()
+            diagnostics.scanMs = (Clock() - started) * 1000
+            return
+        end
+        local prior = selected
+        if prior and isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" and recordValid(prior.record) then
+            normalParts[prior.record.character] = nearestPart(prior.record.character, camera, pointer)
+        end
+        gather(view, now)
+        local checked = prior and liveCandidate(prior.record, prior.pointIndex, view) or nil
+        if checked and not visible(checked.record, checked.point, checked.aimPoint, origin, RAY_BUDGET) then checked = nil end
+        local winner = acquire(view, now, RAY_BUDGET, prior, checked)
+        if winner then commit(winner, now) else clearSelection() end
+        if manualMode() and manualRequested and selected then
+            manualPlayer, manualCharacter, manualRequested = selected.record.player, selected.record.character, false
+            manualRequestUntil = nil
+        end
+        updateReaction(selected and selected.record or nil, now)
+        diagnostics.status = selected and "Tracking" or "Searching in FOV"
+        diagnostics.scanMs = (Clock() - started) * 1000
+    end
+
+    local function correctionAllowed(origin, requestedRange, camera, pointer, direction)
+        if type(ctx.OriginalAim) ~= "function" then return false end
+        local mouse = ctx.UserInputService and ctx.UserInputService:GetMouseLocation() or pointer
+        local originalDirection
+        local found = false
+        for index = 1, 4 do
+            local entry = originalAimCache[index]
+            if entry and entry.origin == origin and entry.range == requestedRange
+                and entry.camera == camera and entry.frame == camera.CFrame
+                and entry.fieldOfView == camera.FieldOfView and entry.viewport == camera.ViewportSize
+                and entry.mouse == mouse and entry.mobile == _G.MobileShiftLock and entry.mobileAim == _G.MobleAimingIn then
+                originalDirection, found = entry.direction, true
+                break
+            end
+        end
+        if not found then
+            local ok, value = pcall(ctx.OriginalAim, origin, requestedRange)
+            if ok and finiteVector(value) and value.Magnitude > 0.001 then originalDirection = value.Unit end
+            local entry = {
+                origin = origin, range = requestedRange, camera = camera, frame = camera.CFrame,
+                fieldOfView = camera.FieldOfView, viewport = camera.ViewportSize, mouse = mouse,
+                mobile = _G.MobileShiftLock, mobileAim = _G.MobleAimingIn, direction = originalDirection,
+            }
+            if #originalAimCache >= 4 then table.remove(originalAimCache, 1) end
+            originalAimCache[#originalAimCache + 1] = entry
+        end
+        if not originalDirection then return false end
+        local limit = finite(Settings.MaxCorrectionDegrees) and math.clamp(Settings.MaxCorrectionDegrees, 0, 45) or 8
+        return math.clamp(direction:Dot(originalDirection), -1, 1) >= math.cos(math.rad(limit)) - 0.000000001
+    end
+
+    function selector:Get(origin, requestedRange)
+        if not alive or not Settings.Enabled or not finiteVector(origin) then return nil end
+        local now = Clock()
+        local tool, _, range = equipped()
+        if tool ~= currentTool then
+            currentTool = tool
+            self:Invalidate(true)
+        end
+        if not tool or not positive(range) then return nil end
+        if requestedRange ~= nil then
+            if not positive(requestedRange) then return nil end
+            range = math.min(range, requestedRange)
+        end
+        if manualMode() then
+            if manualPlayer and not eligible(manualPlayer, manualCharacter) then
+                manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil
+                clearSelection("Target lost; press target key")
+                resetReaction()
+                return nil
+            end
+            if not manualPlayer then
+                if not manualRequested or not manualRequestUntil or now >= manualRequestUntil then return nil end
+            end
+        end
+        local camera = World.CurrentCamera
+        if not camera then return nil end
+        if now - rosterAt >= 0.2 then refreshFilters(now) end
+        local pointer = ctx.ReferencePoint(camera)
+        local profile = getFOVProfile(Settings, tool)
+        local view = makeView(origin, range, camera, pointer, profile)
+        local budget = diagnostics.raycasts + SHOT_RAY_BUDGET
+        if not wallClear(origin) then
+            resetReaction()
+            return nil
+        end
+        local prior = selected
+        if prior and isClosestPoint() and Settings.ClosestPointMode ~= "Advanced" and recordValid(prior.record) then
+            normalParts[prior.record.character] = nearestPart(prior.record.character, camera, pointer)
+        end
+        local candidate = prior and liveCandidate(prior.record, prior.pointIndex, view) or nil
+        if candidate and manualMode() and manualPlayer
+            and (candidate.record.player ~= manualPlayer or candidate.record.character ~= manualCharacter) then candidate = nil end
+        if candidate and not visible(candidate.record, candidate.point, candidate.aimPoint, origin, budget) then candidate = nil end
+        local needsRanking = not candidate or not (Settings.KeepTarget or manualMode())
+        local previousRecoverySucceeded = recoveryStamp and recoveryStamp.succeeded == true
+        if needsRanking and (not sameRecovery(view, tool, now) or (not candidate and previousRecoverySucceeded)) then
+            stampRecovery(view, tool, now)
+            candidate = acquire(view, now, budget, prior, candidate, true)
+            recoveryStamp.succeeded = candidate ~= nil
+        end
+        if not candidate then
+            clearSelection("Searching in FOV")
+            resetReaction()
+            return nil
+        end
+        commit(candidate, now)
+        if manualMode() and manualRequested and not manualPlayer then
+            manualPlayer, manualCharacter, manualRequested = candidate.record.player, candidate.record.character, false
+            manualRequestUntil = nil
+        end
+        local direction = candidate.delta / candidate.distance
+        if Settings.Humanizer then
+            updateReaction(candidate.record, now)
+            local delay = finite(Settings.ReactionMs) and math.clamp(Settings.ReactionMs, 0, 400) or 100
+            if (now - reactionSince) * 1000 + 0.000001 < delay then return nil end
+            if not correctionAllowed(origin, requestedRange, camera, pointer, direction) then return nil end
+        end
+        diagnostics.status = "Tracking"
+        return direction, candidate.distance, {
+            part = candidate.record.part, point = candidate.point, aimPoint = candidate.aimPoint,
+            character = candidate.record.character, player = candidate.record.player,
+        }
+    end
+
+    function selector:ToggleTarget()
+        if not alive then return false end
+        if manualPlayer or manualRequested then
+            manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil
+            clearSelection("Target released")
+            resetReaction()
+            return false
+        end
+        if not Settings.Enabled then return false end
+        manualRequested = true
+        manualRequestUntil = Clock() + 0.25
+        clearSelection("Selecting target")
+        resetReaction()
+        nextScan = 0
+        recoveryStamp = nil
+        return true
+    end
+
+    function selector:GetFOVVisuals()
+        local profile = getFOVProfile(Settings, currentTool)
+        return { shape = profile.shape, enabled = profile.enabled, radius = profile.radius, boxes = fovVisuals.boxes }
+    end
+
+    function selector:GetDiagnostics()
+        return {
+            targetName = diagnostics.targetName, status = diagnostics.status,
+            scanMs = diagnostics.scanMs, raycasts = diagnostics.raycasts,
+        }
+    end
+
+    function selector:Destroy()
+        alive = false
+        clearSelection("Unloaded")
+        resetReaction()
+        manualPlayer, manualCharacter, manualRequested, manualRequestUntil = nil, nil, false, nil
+        fovVisuals.boxes = {}
+        records, roster = {}, {}
+    end
+
+    return selector
+end
+
+local function buildShotRouter(ctx)
+    local GunHandler = ctx.GunHandler
+    local Selector = ctx.Selector
+    local Settings = ctx.Settings
+    local LocalPlayer = ctx.LocalPlayer
+    local Visual = ctx.Visual
+    local originalGetAim = GunHandler.getAim
+    local originalShoot = GunHandler.shoot
+    local originalSpread = GunHandler.shotgunSpread
+    assert(type(originalGetAim) == "function", "GunHandler.getAim was not found")
+    assert(type(originalShoot) == "function", "GunHandler.shoot was not found")
+    assert(type(originalSpread) == "function", "GunHandler.shotgunSpread was not found")
+
+    local rng = Random.new()
+    local alive, installed, destroyed = true, false, false
+    local generation = 0
+    local contexts = setmetatable({}, { __mode = "k" })
+    local mainThread = {}
+    local BYPASS = {}
+    local router = {}
+    local redirectedGetAim, routedShoot, routedSpread
+
+    local function report(area, problem)
+        if type(ctx.OnError) == "function" then
+            pcall(ctx.OnError, area, problem)
+        end
+    end
+
+    local function threadRecord()
+        local thread = coroutine.running() or mainThread
+        local record = contexts[thread]
+        if not record then
+            record = { pending = nil, active = nil, insideAim = false }
+            contexts[thread] = record
+        end
+        return record
+    end
+
+    local function identity()
+        local character = LocalPlayer.Character
+        if not character or not character.Parent then return nil end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.Health <= 0 then return nil end
+        local tool = character:FindFirstChildWhichIsA("Tool")
+        if not tool then return nil end
+        return character, tool
+    end
+
+    local function chanceValue()
+        local value = Settings.HitChance
+        if type(value) ~= "number" or value ~= value then return 100 end
+        return math.clamp(value, 0, 100)
+    end
+
+    local function newAction(character, tool, remaining)
+        return {
+            shooter = character, tool = tool, generation = generation,
+            chance = chanceValue(), decision = nil, remaining = remaining,
+            aimResolved = false, aimPoint = nil, selectionInfo = nil,
+        }
+    end
+
+    local function matches(action, character, tool)
+        return action ~= nil and action ~= BYPASS
+            and action.generation == generation
+            and action.shooter == character and action.tool == tool
+    end
+
+    local function allows(action)
+        if action.decision == nil then
+            if action.chance <= 0 then
+                action.decision = false
+            elseif action.chance >= 100 then
+                action.decision = true
+            else
+                action.decision = rng:NextNumber() < action.chance / 100
+            end
+        end
+        return action.decision
+    end
+
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+
+    local function finiteVector(value)
+        return typeof(value) == "Vector3" and finite(value.X) and finite(value.Y) and finite(value.Z)
+    end
+
+    local function snapshotValid(action)
+        local info = action.selectionInfo
+        if type(info) ~= "table" or not finiteVector(action.aimPoint) then return false end
+        local part, character, player = info.part, info.character, info.player
+        if not part or not part.Parent or not character or not character.Parent
+            or not part:IsDescendantOf(character) then return false end
+        if player and (not player.Parent or player.Character ~= character) then return false end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or not finite(humanoid.Health) or humanoid.Health <= 0 then return false end
+        local effects = character:FindFirstChild("BodyEffects")
+        local dead = effects and effects:FindFirstChild("Dead")
+        if dead and dead.Value == true then return false end
+        if Settings.SkipKnocked then
+            local knocked = effects and effects:FindFirstChild("K.O")
+            if knocked and knocked.Value == true then return false end
+        end
+        return true
+    end
+
+    local function snapshotAim(action, origin, requestedRange, distanceOnly)
+        if not finiteVector(origin) then return nil end
+        if not snapshotValid(action) then
+            action.aimPoint, action.selectionInfo = nil, nil
+            return nil
+        end
+        local rangeObject = action.tool:FindFirstChild("Range")
+        local limit = rangeObject and rangeObject.Value
+        if not finite(limit) or limit <= 0 then return nil end
+        if requestedRange ~= nil then
+            if not finite(requestedRange) or requestedRange <= 0 then return nil end
+            limit = math.min(limit, requestedRange)
+        end
+        local delta = action.aimPoint - origin
+        local distance = delta.Magnitude
+        if not finite(distance) or distance <= 0.0001
+            or (not distanceOnly and distance > limit + 0.0001) then
+            action.aimPoint, action.selectionInfo = nil, nil
+            return nil
+        end
+        return delta / distance, math.min(distance, limit)
+    end
+
+    local function resolveAim(record, origin, requestedRange)
+        local character, tool = identity()
+        if not character then
+            record.pending = nil
+            return nil
+        end
+        local action
+        local outerCall = record.active == nil
+        if not outerCall then
+            if not matches(record.active, character, tool) then return nil end
+            action = record.active
+        else
+            action = record.pending
+            if not matches(action, character, tool) or action.remaining == nil then
+                action = newAction(character, tool, nil)
+                record.pending = action
+            end
+        end
+        if not allows(action) then return nil end
+        if not outerCall then
+            if not action.aimResolved then return nil end
+            return snapshotAim(action, origin, requestedRange, true)
+        end
+        if not action.aimResolved then
+            action.aimResolved = true
+            local direction, distance, info = Selector:Get(origin, requestedRange)
+            if finiteVector(direction) and finite(distance) and distance > 0 and type(info) == "table" then
+                local point = finiteVector(info.aimPoint) and info.aimPoint or origin + direction * distance
+                if finiteVector(point) then
+                    local snapshot = {}
+                    for key, value in pairs(info) do snapshot[key] = value end
+                    action.aimPoint, action.selectionInfo = point, snapshot
+                end
+            end
+        end
+        return snapshotAim(action, origin, requestedRange, false)
+    end
+
+    redirectedGetAim = function(origin, ...)
+        if alive and Settings.Enabled then
+            local record = threadRecord()
+            if not record.insideAim then
+                record.insideAim = true
+                local ok, direction, distance = pcall(resolveAim, record, origin, select(1, ...))
+                record.insideAim = false
+                if ok and direction then return direction, distance end
+                if not ok then report("aim check", direction) end
+            end
+        end
+
+        return originalGetAim(origin, ...)
+    end
+
+    local function primaryShot(data, character, tool, previousActive)
+        return previousActive == nil and type(data) == "table"
+            and character ~= nil and data.Shooter == character
+            and data.Handle ~= nil and data.Handle.Parent == tool
+            and not (data.ReplicatedShot or data.IsLeftHand or data.isReflecting or data.TrailOnly)
+    end
+
+    routedShoot = function(data, ...)
+        if not alive then return originalShoot(data, ...) end
+        local record = threadRecord()
+        local previousActive = record.active
+        local character, tool = identity()
+        local primary = primaryShot(data, character, tool, previousActive)
+        local action = primary and record.pending or nil
+        if not matches(action, character, tool) then action = nil end
+
+        record.active = action or BYPASS
+
+        local visualToken
+        if primary and Visual and type(Visual.Begin) == "function" then
+            local ok, token = pcall(Visual.Begin, Visual, data, action and action.selectionInfo or nil)
+            if ok then visualToken = token else report("tracer begin", token) end
+        end
+
+        local result = table.pack(pcall(originalShoot, data, ...))
+        record.active = previousActive
+        if action and record.pending == action then
+            if not result[1] then
+                record.pending = nil
+            elseif action.remaining then
+                action.remaining = action.remaining - 1
+                if action.remaining <= 0 then record.pending = nil end
+            else
+                record.pending = nil
+            end
+        end
+
+        if visualToken ~= nil and Visual and type(Visual.Finish) == "function" then
+            local ok, problem = pcall(Visual.Finish, Visual, visualToken, result[1])
+            if not ok then report("tracer finish", problem) end
+        end
+        if not result[1] then error(result[2], 0) end
+        return table.unpack(result, 2, result.n)
+    end
+
+    routedSpread = function(weaponName, ...)
+        if not alive then return originalSpread(weaponName, ...) end
+        local record = threadRecord()
+        if record.active == nil then record.pending = nil end
+        local result = table.pack(originalSpread(weaponName, ...))
+        local character, tool = identity()
+        local offsets = result[1]
+        if character and tool.Name == weaponName and type(offsets) == "table" then
+            if record.active == nil then
+                local pelletCount = 0
+                for _ in pairs(offsets) do pelletCount = pelletCount + 1 end
+                if pelletCount > 0 then
+                    record.pending = newAction(character, tool, pelletCount)
+                end
+            end
+            local percent = Settings.SpreadPercent
+            if Settings.SpreadEnabled == true and type(percent) == "number"
+                and percent == percent and math.abs(percent) < math.huge then
+                local multiplier = math.clamp(percent, 0, 100) / 100
+                if multiplier < 1 then
+                    local adjusted = {}
+                    for key, offset in pairs(offsets) do
+                        adjusted[key] = typeof(offset) == "Vector3" and offset * multiplier or offset
+                    end
+                    result[1] = adjusted
+                end
+            end
+        end
+        return table.unpack(result, 1, result.n)
+    end
+
+    function router:Invalidate()
+        generation = generation + 1
+        contexts = setmetatable({}, { __mode = "k" })
+    end
+
+    function router:Install()
+        if destroyed then error("The shot router has been unloaded", 0) end
+        if installed then return true end
+        if GunHandler.getAim ~= originalGetAim or GunHandler.shoot ~= originalShoot
+            or GunHandler.shotgunSpread ~= originalSpread then
+            error("GunHandler changed during setup; no functions were replaced", 0)
+        end
+
+        GunHandler.getAim = redirectedGetAim
+        GunHandler.shoot = routedShoot
+        GunHandler.shotgunSpread = routedSpread
+        installed = true
+        return true
+    end
+
+    function router:Destroy()
+        alive, destroyed, installed = false, true, false
+        self:Invalidate()
+        local failures = {}
+        local function restore(name, owned, original)
+            local ok, problem = pcall(function()
+                if GunHandler[name] == owned then GunHandler[name] = original end
+            end)
+            if not ok then failures[#failures + 1] = tostring(problem) end
+        end
+
+        restore("getAim", redirectedGetAim, originalGetAim)
+        restore("shoot", routedShoot, originalShoot)
+        restore("shotgunSpread", routedSpread, originalSpread)
+        if #failures > 0 then error(table.concat(failures, " | "), 0) end
+        return true
+    end
+
+    return router
+end
+
+local function buildVisualRedirect(ctx)
+    local Settings, Player = ctx.Settings, ctx.LocalPlayer
+    local World, Clock = ctx.Workspace or workspace, ctx.Clock or os.clock
+    local alive = true
+    local pending = {}
+    local touched = setmetatable({}, {__mode = "k"})
+    local claimed = setmetatable({}, {__mode = "k"})
+    local generation = 0
+    local folder, folderConnection
+    local TTL, MAX_PENDING = 0.35, 128
+
+    local function finite(number)
+        return type(number) == "number" and number == number and math.abs(number) < math.huge
+    end
+
+    local function finiteVector(vector)
+        return typeof(vector) == "Vector3" and finite(vector.X) and finite(vector.Y) and finite(vector.Z)
+    end
+
+    local function report(problem)
+        if type(ctx.OnError) == "function" then pcall(ctx.OnError, "tracer appearance", problem) end
+    end
+
+    local function rotateDirection(from, to, direction)
+        local cosine = math.clamp(from:Dot(to), -1, 1)
+        local cross = from:Cross(to)
+        local sineSquared = cross:Dot(cross)
+        if sineSquared <= 0.000000000001 then
+            if cosine >= 0 then return direction end
+            local reference = math.abs(from.Y) < 0.9 and Vector3.new(0, 1, 0) or Vector3.new(1, 0, 0)
+            local axis = from:Cross(reference).Unit
+            return axis * (2 * axis:Dot(direction)) - direction
+        end
+        local sine = math.sqrt(sineSquared)
+        local axis = cross / sine
+        return direction * cosine + axis:Cross(direction) * sine
+            + axis * (axis:Dot(direction) * (1 - cosine))
+    end
+
+    local function weaponAllowed(tool)
+        return Settings["Redirect" .. classifyWeapon(tool)] == true
+    end
+
+    local function restore(part, record)
+        if not part.Parent then return true end
+        local complete = true
+        local function attempt(callback)
+            local ok, problem = pcall(callback)
+            if not ok then complete = false; report(problem) end
+        end
+
+        attempt(function()
+            if part.CFrame == record.appliedFrame then part.CFrame = record.originalFrame end
+        end)
+        attempt(function()
+            local endpoint = record.endpoint
+            if endpoint and endpoint.Parent == part and endpoint.Position == record.appliedPosition then
+                endpoint.Position = record.originalPosition
+            end
+        end)
+        attempt(function()
+            local beam = record.beam
+            if beam and beam.Parent == part and beam.CurveSize0 == 0 then beam.CurveSize0 = record.curve0 end
+        end)
+        attempt(function()
+            local beam = record.beam
+            if beam and beam.Parent == part and beam.CurveSize1 == 0 then beam.CurveSize1 = record.curve1 end
+        end)
+        return complete
+    end
+
+    local function invalidateRecords()
+        generation = generation + 1
+        for _, token in ipairs(pending) do token.cancelled = true end
+        pending = {}
+        local complete = true
+        for part, record in pairs(touched) do
+            if restore(part, record) then touched[part] = nil else complete = false end
+        end
+        return complete
+    end
+
+    local function apply(token)
+        if token.applied or token.cancelled or not token.finished then return false end
+        if token.generation ~= generation or token.folder ~= folder then token.cancelled = true; return false end
+        if token.expires < Clock() then token.cancelled = true; return false end
+        if not alive or not Settings.ClientBulletRedirection or not Settings.Enabled then return false end
+        if token.character ~= Player.Character then return false end
+        local part = token.part
+        if not part or part.Parent ~= token.folder then return false end
+        local beam = part:FindFirstChild("NewGunBeam")
+
+        if not beam or not beam:IsA("Beam") then return false end
+        local endpoint = beam.Attachment1
+        local start = beam.Attachment0
+        if not endpoint or not start or endpoint.ClassName ~= "Attachment" or start.ClassName ~= "Attachment"
+            or endpoint.Parent ~= part or start.Parent ~= part
+            or not finiteVector(start.Position) or start.Position.Magnitude > 0.0001 then return false end
+        local vector = token.point - token.origin
+        local length = vector.Magnitude
+        if not finite(length) or length <= 0.001 then return false end
+        local record = {
+            originalFrame = part.CFrame, originalPosition = endpoint.Position,
+            endpoint = endpoint, beam = beam, curve0 = beam.CurveSize0, curve1 = beam.CurveSize1,
+            appliedFrame = CFrame.new(token.origin, token.point),
+            appliedPosition = Vector3.new(0, 0, -length),
+        }
+        touched[part] = record
+        local ok, problem = pcall(function()
+            part.CFrame = record.appliedFrame
+            endpoint.Position = record.appliedPosition
+            beam.CurveSize0, beam.CurveSize1 = 0, 0
+        end)
+        if not ok or token.generation ~= generation or token.cancelled then
+            local restored = restore(part, record)
+            if restored and touched[part] == record then touched[part] = nil end
+            if not restored and not touched[part] then touched[part] = record end
+            token.cancelled = true
+            if not ok then report(problem) end
+            return false
+        end
+        token.applied = true
+        return true
+    end
+
+    local function onBullet(part)
+        if not alive or not Settings.ClientBulletRedirection or not Settings.Enabled then return end
+        if part.Parent ~= folder or claimed[part] or part.Name ~= "BULLET_RAYS" or not part:IsA("BasePart") then return end
+        local character = Player.Character
+        if not character or part:GetAttribute("OwnerCharacter") ~= character.Name then return end
+        local now = Clock()
+
+        for _, token in ipairs(pending) do
+            if not token.part and not token.cancelled and token.expires >= now
+                and token.character == character and token.generation == generation and token.folder == folder then
+                local difference = part.CFrame.Position - token.origin
+                if difference:Dot(difference) <= 0.0001 then
+                    claimed[part] = true
+                    token.part = part
+                    apply(token)
+                    return
+                end
+            end
+        end
+    end
+
+    local function bindFolder()
+        local ignored = World:FindFirstChild("Ignored")
+        local siren = ignored and ignored:FindFirstChild("Siren")
+        local current = siren and siren:FindFirstChild("Radius")
+        if current ~= folder then
+            invalidateRecords()
+            if folderConnection then folderConnection:Disconnect(); folderConnection = nil end
+            folder = current
+            if folder then
+                local boundFolder = folder
+                folderConnection = ctx.Track(folder.ChildAdded, function(part)
+                    if boundFolder ~= folder then return end
+                    local ok, problem = pcall(onBullet, part)
+                    if not ok then report(problem) end
+                end)
+            end
+        end
+        return folder ~= nil
+    end
+
+    local adapter = {}
+
+    function adapter:Begin(data, info)
+        if not alive or not Settings.Enabled or not Settings.ClientBulletRedirection then return nil end
+        if type(data) ~= "table" or type(info) ~= "table" or not info.part or not info.part.Parent then return nil end
+        local character = Player.Character
+        local handle = data.Handle
+        local tool = handle and handle.Parent
+        if not character or data.Shooter ~= character or not tool or tool.Parent ~= character
+            or data.ReplicatedShot or data.IsLeftHand or data.isReflecting or data.TrailOnly then return nil end
+        if not weaponAllowed(tool) or not bindFolder() then return nil end
+
+        if type(ctx.GunHandler.isLegacy) == "function" then
+            local ok, legacy = pcall(ctx.GunHandler.isLegacy)
+            if ok and legacy then return nil end
+        end
+        local origin = data.ForcedOrigin
+        if typeof(origin) ~= "Vector3" then
+            local muzzle = handle:FindFirstChild("Muzzle")
+            origin = muzzle and muzzle:IsA("Attachment") and muzzle.WorldPosition or handle.Position
+        end
+        if not finiteVector(origin) or not finiteVector(info.point)
+            or not finiteVector(data.AimPosition) then return nil end
+
+        local aimPoint = finiteVector(info.aimPoint) and info.aimPoint or info.point
+        local base = aimPoint - origin
+        local shot = data.AimPosition - origin
+        if not finite(base.Magnitude) or not finite(shot.Magnitude)
+            or base.Magnitude <= 0.001 or shot.Magnitude <= 0.001 then return nil end
+        local lead = finite(Settings.VisualPredictionMs) and math.clamp(Settings.VisualPredictionMs, 0, 250) / 1000 or 0
+        local velocity = info.part.AssemblyLinearVelocity
+        if not finiteVector(velocity) then velocity = Vector3.new(0, 0, 0) end
+        local predicted = info.point + velocity * lead - origin
+        if not finite(predicted.Magnitude) or predicted.Magnitude <= 0.001 then return nil end
+
+        local visualDirection = rotateDirection(base.Unit, predicted.Unit, shot.Unit)
+        local length = predicted.Magnitude
+        if finite(data.Range) and data.Range > 0 then length = math.min(length, data.Range) end
+        if not finite(length) or not finiteVector(visualDirection) or not finite(visualDirection.Magnitude)
+            or visualDirection.Magnitude <= 0.001 then return nil end
+        local visualPoint = origin + visualDirection.Unit * length
+        if not finiteVector(visualPoint) then return nil end
+        local now = Clock()
+        for index = #pending, 1, -1 do
+            local item = pending[index]
+            if item.applied or item.cancelled or item.expires < now then table.remove(pending, index) end
+        end
+        if #pending >= MAX_PENDING then return nil end
+        local token = {
+            character = character, origin = origin,
+            point = visualPoint, generation = generation, folder = folder,
+            expires = now + TTL, finished = false,
+        }
+        pending[#pending + 1] = token
+        return token
+    end
+
+    function adapter:Finish(token, success)
+        if not token then return end
+        if not success then token.cancelled = true; return end
+        token.finished = true
+        apply(token)
+    end
+
+    function adapter:Step()
+        if not alive then return end
+        if not Settings.ClientBulletRedirection or not Settings.Enabled then
+            if #pending > 0 or next(touched) then self:Invalidate() end
+            return
+        end
+        bindFolder()
+        local now = Clock()
+        for index = #pending, 1, -1 do
+            local token = pending[index]
+            if not token.cancelled and token.expires >= now then apply(token) end
+            if token.applied or token.cancelled or token.expires < now then table.remove(pending, index) end
+        end
+        for part in pairs(touched) do
+            if not part.Parent then touched[part] = nil end
+        end
+    end
+
+    function adapter:Invalidate()
+        return invalidateRecords()
+    end
+
+    function adapter:Destroy()
+        if not alive and not next(touched) then return true end
+        alive = false
+        local restored = self:Invalidate()
+        if folderConnection then folderConnection:Disconnect(); folderConnection = nil end
+        folder = nil
+        if not restored then error("Some local tracer properties could not be restored", 0) end
+        return true
+    end
+
+    return adapter
+end
+
+local function buildMovementController(ctx)
+    local Settings, Player = ctx.Settings, ctx.LocalPlayer
+    local Clock = ctx.Clock or os.clock
+    local alive = true
+    local owned
+    local updating, releasing, refreshRequested = false, false, false
+    local runUpdate, queueCorrection
+    local controller = {}
+    local MAX_CORRECTIONS = 2
+    local diagnostic = {enabled = false, mode = "Disabled", multiplier = 1}
+
+    local function finite(value)
+        return type(value) == "number" and value == value and math.abs(value) < math.huge
+    end
+
+    local function sameStoredSpeed(a, b)
+
+        return finite(a) and finite(b)
+            and math.abs(a - b) <= math.max(1, math.abs(a), math.abs(b)) * 0.0000001
+    end
+
+    local function release()
+        if not owned or releasing then return end
+        local record = owned
+        releasing = true
+        local ok, failure = pcall(function()
+
+            record.active = false
+            record.generation = record.generation + 1
+            record.queued, record.forceQueued = false, false
+            if record.connection then
+                record.connection:Disconnect()
+                record.connection = nil
+            end
+
+            if record.humanoid.Parent then
+                local current = record.humanoid.WalkSpeed
+                local inFlight = record.inFlight ~= nil and sameStoredSpeed(current, record.inFlight)
+                if (record.applied ~= nil and current == record.applied) or inFlight then
+                    record.humanoid.WalkSpeed = record.native
+                end
+            end
+        end)
+        releasing = false
+        if not ok then error(failure, 0) end
+        if owned == record then owned = nil end
+    end
+
+    local function report(problem)
+        if type(ctx.OnError) == "function" then pcall(ctx.OnError, "movement", problem) end
+    end
+
+    local function liveRecord(record)
+        return alive and Settings.MovementEnabled and owned == record and record.active
+            and Player.Character == record.character and record.humanoid.Parent == record.character
+    end
+
+    queueCorrection = function(record, force)
+        if not liveRecord(record) then return end
+        if record.queued then
+            record.forceQueued = record.forceQueued or force == true
+            return
+        end
+        if record.remaining <= 0 then record.conflicted = true; return end
+        record.queued, record.forceQueued = true, force == true
+        local generation = record.generation
+        task.defer(function()
+            if generation ~= record.generation or not liveRecord(record) then return end
+            local forced = record.forceQueued
+            record.queued, record.forceQueued = false, false
+            if not forced and (record.factor == 1 or (record.applied ~= nil
+                and record.humanoid.WalkSpeed == record.applied)) then return end
+            if record.remaining <= 0 then record.conflicted = true; return end
+            record.remaining = record.remaining - 1
+            local ok, failure = pcall(runUpdate)
+            if not ok then
+                local released, cleanupFailure = pcall(controller.Invalidate, controller)
+                report(tostring(failure) .. (released and "" or " | " .. tostring(cleanupFailure)))
+            end
+        end)
+    end
+
+    local function bindObserver(record)
+        record.connection = record.humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+
+            if updating or not liveRecord(record) or record.factor == 1 then return end
+            if record.applied ~= nil and record.humanoid.WalkSpeed == record.applied then return end
+            queueCorrection(record, false)
+        end)
+    end
+
+    local function flag(container, name)
+        local value = container and container:FindFirstChild(name)
+        return value ~= nil and value:IsA("BoolValue") and value.Value == true
+    end
+
+    local function eligible(character, humanoid, effects)
+        if not character or not character.Parent or not humanoid or not humanoid.Parent then
+            return false, "Waiting"
+        end
+        if not finite(humanoid.Health) or humanoid.Health <= 0
+            or flag(effects, "Dead") or flag(effects, "K.O")
+            or flag(effects, "Cuff") or flag(effects, "Grabbed") then
+            return false, "Paused"
+        end
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if not root or not root:IsA("BasePart") then return false, "Waiting" end
+        local state = humanoid:GetState()
+        if root.Anchored or humanoid.Sit or humanoid.PlatformStand
+            or state == Enum.HumanoidStateType.Dead
+            or state == Enum.HumanoidStateType.Seated
+            or state == Enum.HumanoidStateType.PlatformStanding
+            or state == Enum.HumanoidStateType.Physics
+            or state == Enum.HumanoidStateType.Ragdoll
+            or state == Enum.HumanoidStateType.FallingDown then
+            return false, "Paused"
+        end
+        return true
+    end
+
+    local function isShooting(character, now)
+        local tool = character:FindFirstChildWhichIsA("Tool")
+        if not tool or not tool:FindFirstChild("Handle") then return false end
+        local cooldownValue = tool:FindFirstChild("ShootingCooldown")
+        local cooldown = cooldownValue and cooldownValue:IsA("ValueBase") and cooldownValue.Value
+        if not finite(cooldown) then return false end
+
+        local duration = math.clamp(cooldown, 0.1, 1)
+        local last = tool:GetAttribute("LocalLastShotAt")
+        if character:GetAttribute("LocalLastFiredGun") == tool.Name then
+            local stamp = character:GetAttribute("LocalLastGunShotAt")
+            if finite(stamp) and (not finite(last) or stamp > last) then last = stamp end
+        end
+        return finite(last) and now >= last and now - last < duration
+    end
+
+    local function chooseMode(character, humanoid, effects, now)
+        if flag(effects, "Reload") then return "Reloading", "ReloadMultiplier" end
+        if isShooting(character, now) then return "Shooting", "ShootMultiplier" end
+        local maximum = humanoid.MaxHealth
+        local threshold = Settings.LowHealthThreshold
+        if not finite(threshold) then threshold = 50 end
+        if finite(maximum) and maximum > 0
+            and humanoid.Health / maximum <= math.clamp(threshold, 1, 100) / 100 then
+            return "Low health", "LowHealthMultiplier"
+        end
+        return "Walking", "WalkMultiplier"
+    end
+
+    local function update()
+        if not alive then return end
+        if not Settings.MovementEnabled then
+            release()
+            diagnostic = {enabled = false, mode = "Disabled", multiplier = 1}
+            return
+        end
+        local character = Player.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local effects = character and character:FindFirstChild("BodyEffects")
+        if owned and (owned.humanoid ~= humanoid or not owned.active) then release() end
+        local usable, reason = eligible(character, humanoid, effects)
+        if not usable then
+            release()
+            diagnostic = {enabled = true, mode = reason, multiplier = 1}
+            return
+        end
+        local current = humanoid.WalkSpeed
+        if not finite(current) or current < 0 then
+            release()
+            diagnostic = {enabled = true, mode = "Invalid speed", multiplier = 1}
+            return
+        end
+        if not owned then
+            owned = {
+                humanoid = humanoid, character = character, native = current,
+                active = true, generation = 1, remaining = MAX_CORRECTIONS,
+                factor = 1, queued = false, forceQueued = false, conflicted = false,
+            }
+            bindObserver(owned)
+        end
+        local record = owned
+        if owned.applied == nil or current ~= owned.applied then
+
+            owned.native, owned.applied = current, nil
+        end
+        local mode, setting = chooseMode(character, humanoid, effects, Clock())
+        local multiplier = Settings[setting]
+        if not finite(multiplier) then multiplier = 1 end
+        multiplier = math.clamp(multiplier, 0.25, 3)
+        record.factor = multiplier
+        local target = owned.native * multiplier
+        if not finite(target) then
+            release()
+            diagnostic = {enabled = true, mode = "Invalid speed", multiplier = 1}
+            return
+        end
+
+        if not sameStoredSpeed(current, target) then
+            local previousApplied = owned.applied
+            record.inFlight = target
+            local ok, failure = pcall(function() humanoid.WalkSpeed = target end)
+            current = humanoid.WalkSpeed
+
+            if not liveRecord(record) then
+                if owned == record then release() end
+                record.inFlight = nil
+                return
+            end
+            record.inFlight = nil
+            if not ok then
+                owned.applied = sameStoredSpeed(current, target) and current or previousApplied
+                error(failure, 0)
+            end
+        end
+        if sameStoredSpeed(current, target) then
+
+            owned.applied = target ~= owned.native and current or nil
+        else
+
+            owned.applied = nil
+            if finite(current) and current >= 0 then owned.native = current end
+            record.conflicted = true
+            queueCorrection(record, false)
+        end
+        diagnostic = {
+            enabled = true, mode = mode, multiplier = multiplier,
+            nativeSpeed = owned.native, appliedSpeed = humanoid.WalkSpeed,
+        }
+    end
+
+    runUpdate = function()
+        if not alive then return end
+        if updating or releasing then refreshRequested = true; return end
+        updating, refreshRequested = true, false
+        local ok, failure = pcall(update)
+        updating = false
+        if not ok then refreshRequested = false; error(failure, 0) end
+        if refreshRequested then
+            refreshRequested = false
+            if owned then queueCorrection(owned, true) end
+        end
+    end
+
+    function controller:Step()
+        if not alive then return end
+        if updating or releasing then refreshRequested = true; return end
+
+        if owned then owned.remaining, owned.conflicted = MAX_CORRECTIONS, false end
+        runUpdate()
+    end
+
+    function controller:Refresh()
+        runUpdate()
+    end
+
+    function controller:Invalidate()
+        release()
+        diagnostic = {enabled = Settings.MovementEnabled == true, mode = "Waiting", multiplier = 1}
+    end
+
+    function controller:GetDiagnostics()
+        local copy = {}
+        for key, value in pairs(diagnostic) do copy[key] = value end
+        copy.observerConnected = owned ~= nil and owned.connection ~= nil
+            and owned.connection.Connected == true
+        copy.pendingCorrection = owned ~= nil and owned.queued == true
+        copy.correctionsThisStep = owned and (MAX_CORRECTIONS - owned.remaining) or 0
+        copy.conflicted = owned ~= nil and owned.conflicted == true
+        return copy
+    end
+
+    function controller:Destroy()
+        alive = false
+        release()
+        diagnostic = {enabled = false, mode = "Unloaded", multiplier = 1}
+    end
+
+    return controller
+end
+
+local function buildUI(ctx)
+    local Settings, Input, Track = ctx.Settings, ctx.UserInputService, ctx.Track
+    local ui = {}
+    local destroyed, insideGuiDestroy, visible = false, false, false
+    local savedMouseIcon, lastCamera, activeDropdown
+    local activeTab = "Assistance"
+    local rowTab = "Assistance"
+    local dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty
+    local resizeEdges, resizeStart
+    local layoutRows
+    local geometryDepth, layoutDepth = 0, 0
+    local rows, toggles, dropdowns, sliders, tabs, boxAdornments = {}, {}, {}, {}, {}, {}
+    local PANEL_WIDTH, PANEL_HEIGHT = 360, 520
+    local MIN_WIDTH, MIN_HEIGHT = 244, 300
+    local colors = {
+        Background = Color3.fromRGB(15, 15, 15), Input = Color3.fromRGB(25, 25, 25),
+        Border = Color3.fromRGB(8, 8, 8), Text = Color3.fromRGB(224, 224, 224),
+        Muted = Color3.fromRGB(148, 148, 148), Selected = Color3.fromRGB(43, 43, 43),
+        Accent = Color3.fromRGB(100, 100, 100),
+    }
+
+    local function make(className, parent, properties)
+        local object = Instance.new(className)
+        for key, value in pairs(properties) do object[key] = value end
+        object.Parent = parent
+        return object
+    end
+
+    local overlay = make("ScreenGui", ctx.PlayerGui, {
+        Name = "DH_AimOverlay", DisplayOrder = 998, ResetOnSpawn = false,
+        IgnoreGuiInset = true, ScreenInsets = Enum.ScreenInsets.None,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    local circle = make("Frame", overlay, {
+        Name = "FOVCircle", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1, BorderSizePixel = 0, Active = false, Visible = false,
+    })
+    make("UICorner", circle, { CornerRadius = UDim.new(1, 0) })
+    make("UIStroke", circle, {
+        Color = Color3.fromRGB(240, 240, 240), Thickness = 1.4, Transparency = 0.12,
+    })
+    local boxRoot = make("Folder", overlay, { Name = "FOVBoxes" })
+    local gui = make("ScreenGui", ctx.PlayerGui, {
+        Name = "DH_AimPanel", DisplayOrder = 999, ResetOnSpawn = false,
+        Enabled = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    local canvas = make("Frame", gui, {
+        Name = "Canvas", Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, BorderSizePixel = 0, Active = false,
+    })
+    local panel = make("Frame", canvas, {
+        Name = "Panel", Position = UDim2.fromOffset(16, 16),
+        Size = UDim2.fromOffset(PANEL_WIDTH, PANEL_HEIGHT),
+        BackgroundColor3 = colors.Background, BorderColor3 = colors.Border, BorderSizePixel = 1,
+        Active = true, ZIndex = 2,
+    })
+    make("UIStroke", panel, { Color = Color3.fromRGB(48, 48, 48), Thickness = 1 })
+    local header = make("TextButton", panel, {
+        Name = "DragHandle", Position = UDim2.fromOffset(10, 6),
+        Size = UDim2.new(1, -35, 0, 19), BackgroundTransparency = 1,
+        AutoButtonColor = false, Active = true, Selectable = false,
+        Font = Enum.Font.Code, Text = "Dmc | Da Hood", TextSize = 11,
+        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left,
+        Modal = false, ZIndex = 3,
+    })
+    local closeButton = make("TextButton", panel, {
+        Name = "Unload", Position = UDim2.new(1, -25, 0, 6),
+        Size = UDim2.fromOffset(17, 19), BackgroundTransparency = 1,
+        BorderSizePixel = 0, AutoButtonColor = false, Active = true,
+        Font = Enum.Font.Code, Text = "x", TextSize = 14, TextColor3 = colors.Muted, ZIndex = 3,
+    })
+    for _, y in ipairs({ 29, 391 }) do
+        make("Frame", panel, {
+            Position = y == 391 and UDim2.new(0, 10, 1, -29) or UDim2.fromOffset(10, y),
+            Size = UDim2.new(1, -20, 0, 1),
+            BackgroundColor3 = Color3.fromRGB(38, 38, 38), BorderSizePixel = 0, ZIndex = 3,
+        })
+    end
+    local main = make("ScrollingFrame", panel, {
+        Name = "AssistanceContent", Position = UDim2.fromOffset(10, 63),
+        Size = UDim2.new(1, -20, 1, -97), BackgroundTransparency = 1, BorderSizePixel = 0,
+        Active = true, ClipsDescendants = true, CanvasSize = UDim2.fromOffset(0, 0),
+        CanvasPosition = Vector2.new(0, 0), ScrollBarThickness = 2,
+        ScrollBarImageColor3 = colors.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
+        TopImage = "", BottomImage = "", ZIndex = 3,
+    })
+    local misc = make("ScrollingFrame", panel, {
+        Name = "MovementContent", Position = main.Position, Size = main.Size,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+        Active = true, ClipsDescendants = true, CanvasSize = UDim2.fromOffset(0, 0),
+        CanvasPosition = Vector2.new(0, 0), ScrollBarThickness = 2,
+        ScrollBarImageColor3 = colors.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
+        TopImage = "", BottomImage = "", ZIndex = 3,
+    })
+    local exploits = make("ScrollingFrame", panel, {
+        Name = "ExploitsContent", Position = main.Position, Size = main.Size,
+        BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false,
+        Active = true, ClipsDescendants = true, CanvasSize = UDim2.fromOffset(0, 0),
+        CanvasPosition = Vector2.new(0, 0), ScrollBarThickness = 2,
+        ScrollBarImageColor3 = colors.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
+        TopImage = "", BottomImage = "", ZIndex = 3,
+    })
+    local tabContents = { Assistance = main, Movement = misc, Exploits = exploits }
+    make("TextLabel", panel, {
+        Name = "Footer", Position = UDim2.new(0, 11, 1, -22), Size = UDim2.new(1, -22, 0, 14),
+        BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "Right Shift: menu",
+        TextSize = 10, TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 3,
+    })
+    local resizeHandles = {}
+    local handleDefinitions = {
+        { "N", UDim2.new(0, 6, 0, -4), UDim2.new(1, -12, 0, 8), { North = true } },
+        { "NE", UDim2.new(1, -6, 0, -4), UDim2.fromOffset(10, 10), { North = true, East = true } },
+        { "E", UDim2.new(1, -4, 0, 6), UDim2.new(0, 8, 1, -12), { East = true } },
+        { "SE", UDim2.new(1, -6, 1, -6), UDim2.fromOffset(10, 10), { South = true, East = true } },
+        { "S", UDim2.new(0, 6, 1, -4), UDim2.new(1, -12, 0, 8), { South = true } },
+        { "SW", UDim2.new(0, -4, 1, -6), UDim2.fromOffset(10, 10), { South = true, West = true } },
+        { "W", UDim2.new(0, -4, 0, 6), UDim2.new(0, 8, 1, -12), { West = true } },
+        { "NW", UDim2.fromOffset(-4, -4), UDim2.fromOffset(10, 10), { North = true, West = true } },
+    }
+    for _, definition in ipairs(handleDefinitions) do
+        local handle = make("TextButton", panel, {
+            Name = "Resize" .. definition[1], Position = definition[2], Size = definition[3],
+            BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false,
+            Active = true, Selectable = false, Modal = false, Text = "", ZIndex = 50,
+        })
+        resizeHandles[#resizeHandles + 1] = { Button = handle, Edges = definition[4] }
+    end
+
+    local function endDrag()
+        dragInput, dragKind, dragStart, panelStart, dragSlider, dragProperty = nil, nil, nil, nil, nil, nil
+        resizeEdges, resizeStart = nil, nil
+    end
+    local function closeDropdown()
+        if activeDropdown then
+            activeDropdown.Menu.Visible = false
+            activeDropdown = nil
+        end
+    end
+    local function releaseNumberFocus()
+        local focused = Input:GetFocusedTextBox()
+        for _, slider in ipairs(sliders) do
+            if focused == slider.NumberBox then slider.NumberBox:ReleaseFocus() end
+        end
+    end
+    local function changeSetting(property, value)
+        if not destroyed then ctx.SetSetting(property, value) end
+    end
+    local function canInteractWindow()
+        return not destroyed and visible and gui.Enabled and panel.Visible ~= false
+    end
+    local function canInteractRow(row)
+        return canInteractWindow() and activeTab == row.Tab and row.Container.Visible
+            and row.Frame.Visible and (not row.ShowWhen or row.ShowWhen())
+    end
+    local function contains(object, position)
+        local origin, size = object.AbsolutePosition, object.AbsoluteSize
+        return position.X >= origin.X and position.Y >= origin.Y
+            and position.X <= origin.X + size.X and position.Y <= origin.Y + size.Y
+    end
+    local function positionDropdown(dropdown)
+        local area = canvas.AbsoluteSize
+        local anchor = dropdown.Button.AbsolutePosition - canvas.AbsolutePosition
+        local anchorSize = dropdown.Button.AbsoluteSize
+        local width = math.min(math.max(156, anchorSize.X), math.max(1, area.X - 16))
+        local height = math.min(dropdown.ContentHeight, 220, math.max(1, area.Y - 16))
+        local x = math.clamp(anchor.X, 8, math.max(8, area.X - width - 8))
+        local y = anchor.Y + anchorSize.Y + 4
+        if y + height > area.Y - 8 then y = anchor.Y - height - 4 end
+        y = math.clamp(y, 8, math.max(8, area.Y - height - 8))
+        dropdown.Menu.Position = UDim2.fromOffset(x, y)
+        dropdown.Menu.Size = UDim2.fromOffset(width, height)
+    end
+    local function applyRectangle(x, y, width, height)
+        geometryDepth = geometryDepth + 1
+        panel.Position = UDim2.fromOffset(x, y)
+        panel.Size = UDim2.fromOffset(width, height)
+        for _, content in pairs(tabContents) do
+            content.Size = UDim2.new(1, -math.min(20, width), 0, math.max(0, height - 97))
+        end
+        if layoutRows then layoutRows() end
+        geometryDepth = geometryDepth - 1
+    end
+    local function clampPanel()
+        if geometryDepth > 0 then return end
+        local area = canvas.AbsoluteSize
+        if area.X <= 0 or area.Y <= 0 then return end
+        local width = math.clamp(panel.Size.X.Offset, math.min(MIN_WIDTH, area.X), area.X)
+        local height = math.clamp(panel.Size.Y.Offset, math.min(MIN_HEIGHT, area.Y), area.Y)
+        local x = math.clamp(panel.Position.X.Offset, 0, math.max(0, area.X - width))
+        local y = math.clamp(panel.Position.Y.Offset, 0, math.max(0, area.Y - height))
+        if x ~= panel.Position.X.Offset or y ~= panel.Position.Y.Offset
+            or width ~= panel.Size.X.Offset or height ~= panel.Size.Y.Offset then
+            applyRectangle(x, y, width, height)
+        end
+        if activeDropdown then positionDropdown(activeDropdown) end
+    end
+    local function setTab(name)
+        if destroyed or not tabContents[name] then return end
+        endDrag()
+        closeDropdown()
+        releaseNumberFocus()
+        activeTab = name
+        for tabName, content in pairs(tabContents) do
+            content.Visible = tabName == name
+        end
+        for tabName, tab in pairs(tabs) do
+            local selected = tabName == name
+            tab.Button.BackgroundTransparency = selected and 0 or 1
+            tab.Button.TextColor3 = selected and colors.Text or colors.Muted
+            tab.Line.Visible = selected
+        end
+    end
+    for index, name in ipairs({ "Assistance", "Movement", "Exploits" }) do
+        local tabName = name
+        local button = make("TextButton", panel, {
+            Name = tabName .. "Tab", Position = UDim2.fromOffset(11 + (index - 1) * 77, 35),
+            Size = UDim2.fromOffset(70, 22), BackgroundColor3 = colors.Input, BorderSizePixel = 0,
+            AutoButtonColor = false, Active = true, Font = Enum.Font.Code, Text = tabName,
+            TextSize = 11, TextColor3 = colors.Muted, ZIndex = 3,
+        })
+        local line = make("Frame", button, {
+            Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1),
+            BackgroundColor3 = colors.Text, BorderSizePixel = 0, ZIndex = 4,
+        })
+        tabs[tabName] = { Button = button, Line = line }
+        Track(button.Activated, function()
+            if canInteractWindow() then setTab(tabName) end
+        end)
+    end
+
+    local function newRow(name, height, showWhen, gap)
+        local container = tabContents[rowTab]
+        local frame = make("Frame", container, {
+            Name = name .. "Row", Position = UDim2.fromOffset(1, 0),
+            Size = UDim2.new(1, -7, 0, height), BackgroundTransparency = 1,
+            BorderSizePixel = 0, ZIndex = 4,
+        })
+        local row = {
+            Frame = frame, Height = height, Gap = gap or 3, ShowWhen = showWhen,
+            Tab = rowTab, Container = container,
+        }
+        rows[#rows + 1] = row
+        return row
+    end
+    local function section(showWhen)
+        local row = newRow("Separator", 7, showWhen, 2)
+        make("Frame", row.Frame, {
+            Position = UDim2.fromOffset(0, 3), Size = UDim2.new(1, 0, 0, 1),
+            BackgroundColor3 = Color3.fromRGB(38, 38, 38), BorderSizePixel = 0, ZIndex = 5,
+        })
+    end
+    local function toggleRow(label, property, showWhen)
+        local row = newRow(property, 19, showWhen, 2)
+        local button = make("TextButton", row.Frame, {
+            Name = property, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+            AutoButtonColor = false, Active = true, Text = "", ZIndex = 5,
+        })
+        local box = make("Frame", button, {
+            Position = UDim2.new(0, 0, 0.5, -6), Size = UDim2.fromOffset(12, 12),
+            BackgroundColor3 = colors.Input, BorderColor3 = colors.Border, BorderSizePixel = 1, ZIndex = 6,
+        })
+        local mark = make("Frame", box, {
+            Position = UDim2.fromOffset(2, 2), Size = UDim2.fromOffset(8, 8),
+            BackgroundColor3 = colors.Text, BorderSizePixel = 0, ZIndex = 7,
+        })
+        make("TextLabel", button, {
+            Position = UDim2.fromOffset(19, 0), Size = UDim2.new(1, -19, 1, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.Code, Text = label, TextSize = 11,
+            TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 6,
+        })
+        toggles[property] = mark
+        Track(button.Activated, function()
+            if canInteractRow(row) then changeSetting(property, not Settings[property]) end
+        end)
+    end
+    local function dropdownRow(label, property, choices, showWhen, multiSelection)
+        local row = newRow(property, 22, showWhen)
+        make("TextLabel", row.Frame, {
+            Size = UDim2.fromOffset(89, 22), BackgroundTransparency = 1,
+            Font = Enum.Font.Code, Text = label, TextSize = 11,
+            TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+        })
+        local button = make("TextButton", row.Frame, {
+            Name = property .. "Dropdown", Position = UDim2.fromOffset(90, 0),
+            Size = UDim2.new(1, -90, 1, 0), BackgroundColor3 = colors.Input,
+            BorderColor3 = colors.Border, BorderSizePixel = 1, AutoButtonColor = false,
+            Active = true, Text = "", ZIndex = 5,
+        })
+        local valueLabel = make("TextLabel", button, {
+            Position = UDim2.fromOffset(6, 0), Size = UDim2.new(1, -12, 1, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.Code, Text = "", TextSize = 10,
+            TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+        })
+        local menu = make("ScrollingFrame", canvas, {
+            Name = property .. "Options", Size = UDim2.fromOffset(156, 28),
+            BackgroundColor3 = Color3.fromRGB(20, 20, 20), BorderColor3 = Color3.fromRGB(75, 75, 75),
+            BorderSizePixel = 1, Active = true, Visible = false, ClipsDescendants = true,
+            CanvasSize = UDim2.fromOffset(0, #choices * 22 + 6), CanvasPosition = Vector2.new(0, 0),
+            ScrollBarThickness = 2, ScrollBarImageColor3 = colors.Muted,
+            ScrollingDirection = Enum.ScrollingDirection.Y, TopImage = "", BottomImage = "", ZIndex = 100,
+        })
+        local dropdown = {
+            Property = property, Row = row, Button = button, Label = valueLabel,
+            Menu = menu, Options = {}, ContentHeight = #choices * 22 + 6,
+            MultiSelection = multiSelection == true,
+        }
+        for index, choice in ipairs(choices) do
+            local choiceValue, choiceLabel = choice.Value, choice.Label
+            local option = make("TextButton", menu, {
+                Name = choiceValue, Position = UDim2.fromOffset(3, 3 + (index - 1) * 22),
+                Size = UDim2.new(1, -6, 0, 21), BorderSizePixel = 0,
+                BackgroundColor3 = colors.Selected, BackgroundTransparency = 1,
+                Active = true, AutoButtonColor = true, Text = "", ZIndex = 101,
+            })
+            local textLabel = make("TextLabel", option, {
+                Position = UDim2.fromOffset(multiSelection and 23 or 6, 0),
+                Size = UDim2.new(1, multiSelection and -29 or -12, 1, 0),
+                BackgroundTransparency = 1, Font = Enum.Font.Code, Text = choiceLabel,
+                TextSize = 10, TextColor3 = colors.Text,
+                TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 102,
+            })
+            local selectedMark
+            if multiSelection then
+                local square = make("Frame", option, {
+                    Position = UDim2.fromOffset(6, 5), Size = UDim2.fromOffset(11, 11),
+                    BackgroundColor3 = colors.Input, BorderColor3 = colors.Border,
+                    BorderSizePixel = 1, ZIndex = 102,
+                })
+                selectedMark = make("Frame", square, {
+                    Position = UDim2.fromOffset(2, 2), Size = UDim2.fromOffset(7, 7),
+                    BackgroundColor3 = colors.Text, BorderSizePixel = 0, ZIndex = 103,
+                })
+            end
+            dropdown.Options[index] = {
+                Value = choiceValue, Button = option, Label = textLabel, Mark = selectedMark,
+            }
+            Track(option.Activated, function()
+                if not canInteractRow(row) or activeDropdown ~= dropdown or not menu.Visible then return end
+                if multiSelection then changeSetting(choiceValue, not Settings[choiceValue])
+                else changeSetting(property, choiceValue); closeDropdown() end
+            end)
+        end
+        dropdowns[#dropdowns + 1] = dropdown
+        Track(button.Activated, function()
+            if not canInteractRow(row) then return end
+            local wasOpen = activeDropdown == dropdown
+            closeDropdown()
+            if not wasOpen then
+                endDrag()
+                positionDropdown(dropdown)
+                dropdown.Menu.Visible = true
+                activeDropdown = dropdown
+            end
+        end)
+    end
+
+    local function resolveProperty(slider)
+        return type(slider.Property) == "function" and slider.Property() or slider.Property
+    end
+    local function numericValue(slider, property)
+        local value = tonumber(Settings[property or resolveProperty(slider)])
+        if not value or value ~= value or math.abs(value) == math.huge then value = slider.Default end
+        return math.clamp(value, slider.Minimum, slider.Maximum)
+    end
+    local function quantize(slider, value)
+        local steps = math.floor((value - slider.Minimum) / slider.Step + 0.5)
+        return math.clamp(slider.Minimum + steps * slider.Step, slider.Minimum, slider.Maximum)
+    end
+    local function formatNumber(slider, value)
+        return string.format("%." .. tostring(slider.Decimals) .. "f", value)
+    end
+    local function sliderRow(label, name, property, minimum, maximum, step, defaultValue, showWhen, decimals)
+        local row = newRow(name, 21, showWhen)
+        make("TextLabel", row.Frame, {
+            Name = name .. "Readout", Size = UDim2.fromOffset(88, 21),
+            BackgroundTransparency = 1, Font = Enum.Font.Code, Text = label,
+            TextSize = #label > 14 and 9 or 10,
+            TextColor3 = colors.Text, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+        })
+        local button = make("TextButton", row.Frame, {
+            Name = name .. "Slider", Position = UDim2.fromOffset(89, 0),
+            Size = UDim2.new(1, -140, 1, 0), BackgroundTransparency = 1,
+            BorderSizePixel = 0, AutoButtonColor = false, Active = true, Text = "", ZIndex = 5,
+        })
+        local rail = make("Frame", button, {
+            Position = UDim2.new(0, 0, 0.5, -2), Size = UDim2.new(1, 0, 0, 4),
+            BackgroundColor3 = colors.Input, BorderSizePixel = 0, ZIndex = 6,
+        })
+        local fill = make("Frame", rail, {
+            Name = name .. "Fill", Size = UDim2.fromScale(0, 1),
+            BackgroundColor3 = colors.Accent, BorderSizePixel = 0, ZIndex = 7,
+        })
+        local numberBox = make("TextBox", row.Frame, {
+            Name = name .. "Value", Position = UDim2.new(1, -44, 0, 0),
+            Size = UDim2.fromOffset(44, 21), BackgroundColor3 = colors.Input,
+            BorderColor3 = colors.Border, BorderSizePixel = 1, Font = Enum.Font.Code,
+            Text = tostring(defaultValue), TextSize = 10, TextColor3 = colors.Text,
+            ClearTextOnFocus = false, ZIndex = 5,
+        })
+        local slider = {
+            Property = property, Minimum = minimum, Maximum = maximum, Step = step,
+            Default = defaultValue, Decimals = decimals or 0, Row = row,
+            Button = button, Fill = fill, NumberBox = numberBox,
+        }
+        sliders[#sliders + 1] = slider
+        Track(numberBox.Focused, function()
+            if not canInteractRow(row) then
+                slider.EditingProperty = nil
+                numberBox.Text = formatNumber(slider, numericValue(slider))
+                if Input:GetFocusedTextBox() == numberBox then numberBox:ReleaseFocus() end
+                return
+            end
+            slider.EditingProperty = resolveProperty(slider)
+        end)
+        Track(numberBox.FocusLost, function()
+            if destroyed then return end
+
+            local mayCommit = slider.EditingProperty ~= nil or canInteractRow(row)
+            local propertyName = slider.EditingProperty or resolveProperty(slider)
+            slider.EditingProperty = nil
+            local value = tonumber(numberBox.Text)
+            if mayCommit and value and value == value and math.abs(value) < math.huge then
+                changeSetting(propertyName, quantize(slider, value))
+            end
+            numberBox.Text = formatNumber(slider, numericValue(slider))
+        end)
+    end
+
+    local function isClosestPoint() return Settings.Target == "ClosestPoint" end
+    local function isNamedPart() return Settings.Target ~= "ClosestPoint" and Settings.Target ~= "ClosestPart" end
+    local function isCurrentTarget() return Settings.Mode == "CurrentTarget" end
+    local function fovOn() return Settings.FOVEnabled == true end
+    local function boxFOV() return fovOn() and Settings.FOVShape == "Box" end
+    local function circleFOV() return fovOn() and Settings.FOVShape ~= "Box" end
+    local function humanizerOn() return Settings.Humanizer == true end
+    local function visualOn() return Settings.ClientBulletRedirection == true end
+    local function profileKey(suffix)
+        if not Settings.PerWeaponFOV then return suffix end
+        local group = Settings.FOVWeaponGroup
+        if group ~= "Pistols" and group ~= "Other" then group = "Shotguns" end
+        return group .. suffix
+    end
+
+    toggleRow("Enabled", "Enabled")
+    dropdownRow("Mode", "Mode", {
+        { Value = "FOV", Label = "FOV" }, { Value = "CurrentTarget", Label = "Current target" },
+    })
+    dropdownRow("Target key", "TargetKey", {
+        { Value = "Q", Label = "Q" }, { Value = "T", Label = "T" }, { Value = "Y", Label = "Y" },
+    }, isCurrentTarget)
+    toggleRow("Visible only", "VisibleOnly")
+    toggleRow("Skip KO", "SkipKnocked")
+    toggleRow("Team check", "TeamCheck")
+    toggleRow("Keep target", "KeepTarget", function() return not isCurrentTarget() end)
+    section()
+    dropdownRow("Hit position", "Target", {
+        { Value = "ClosestPoint", Label = "Closest point" },
+        { Value = "ClosestPart", Label = "Closest part" },
+        { Value = "Head", Label = "Head" }, { Value = "UpperTorso", Label = "Upper torso" },
+        { Value = "LowerTorso", Label = "Lower torso" }, { Value = "Torso", Label = "Torso (R6)" },
+        { Value = "HumanoidRootPart", Label = "Root part" },
+        { Value = "LeftUpperArm", Label = "L upper arm" }, { Value = "LeftLowerArm", Label = "L lower arm" },
+        { Value = "LeftHand", Label = "L hand" }, { Value = "RightUpperArm", Label = "R upper arm" },
+        { Value = "RightLowerArm", Label = "R lower arm" }, { Value = "RightHand", Label = "R hand" },
+        { Value = "LeftUpperLeg", Label = "L upper leg" }, { Value = "LeftLowerLeg", Label = "L lower leg" },
+        { Value = "LeftFoot", Label = "L foot" }, { Value = "RightUpperLeg", Label = "R upper leg" },
+        { Value = "RightLowerLeg", Label = "R lower leg" }, { Value = "RightFoot", Label = "R foot" },
+        { Value = "Left Arm", Label = "L arm (R6)" }, { Value = "Right Arm", Label = "R arm (R6)" },
+        { Value = "Left Leg", Label = "L leg (R6)" }, { Value = "Right Leg", Label = "R leg (R6)" },
+    })
+    dropdownRow("Point mode", "ClosestPointMode", {
+        { Value = "Normal", Label = "Normal" }, { Value = "Advanced", Label = "Advanced" },
+    }, isClosestPoint)
+    sliderRow("Point scale", "PointScale", "PointScale", 0.05, 1, 0.05, 0.25, isClosestPoint, 2)
+    dropdownRow("Part aim", "PointMode", {
+        { Value = "Center", Label = "Center" }, { Value = "Adaptive", Label = "Adaptive" },
+    }, isNamedPart)
+    sliderRow("Aim lead (ms)", "AimPredictionMs", "AimPredictionMs", 0, 250, 1, 0)
+    sliderRow("Hit chance", "HitChance", "HitChance", 0, 100, 1, 100)
+    toggleRow("Humanizer", "Humanizer")
+    sliderRow("Reaction (ms)", "ReactionMs", "ReactionMs", 0, 400, 1, 100, humanizerOn)
+    sliderRow("Max angle", "MaxCorrectionDegrees", "MaxCorrectionDegrees", 0, 45, 1, 8, humanizerOn)
+    section()
+    toggleRow("Limit FOV", "FOVEnabled")
+    toggleRow("Show FOV", "ShowFOV", fovOn)
+    dropdownRow("Center", "AimPoint", {
+        { Value = "Auto", Label = "Auto" }, { Value = "Cursor", Label = "Cursor" },
+        { Value = "Center", Label = "Screen" },
+    }, fovOn)
+    dropdownRow("FOV shape", "FOVShape", {
+        { Value = "Circle", Label = "Circle" }, { Value = "Box", Label = "Box" },
+    }, fovOn)
+    toggleRow("Per weapon", "PerWeaponFOV", fovOn)
+    dropdownRow("Edit group", "FOVWeaponGroup", {
+        { Value = "Shotguns", Label = "Shotguns" }, { Value = "Pistols", Label = "Pistols" },
+        { Value = "Other", Label = "Other" },
+    }, function() return fovOn() and Settings.PerWeaponFOV == true end)
+    sliderRow("Radius (px)", "FOV", function() return profileKey("FOV") end, 0, 300, 1, 100, circleFOV)
+    sliderRow("X (front)", "FOVX", function() return profileKey("FOVX") end, 0, 20, 0.1, 5, boxFOV, 1)
+    sliderRow("Y (height)", "FOVY", function() return profileKey("FOVY") end, 0, 20, 0.1, 5, boxFOV, 1)
+    sliderRow("Z (side)", "FOVZ", function() return profileKey("FOVZ") end, 0, 20, 0.1, 5, boxFOV, 1)
+    section()
+    toggleRow("Bullet redirect", "ClientBulletRedirection")
+    dropdownRow("Weapons", "RedirectWeapons", {
+        { Value = "RedirectShotguns", Label = "Shotguns" },
+        { Value = "RedirectPistols", Label = "Pistols" }, { Value = "RedirectOther", Label = "Other" },
+    }, visualOn, true)
+    sliderRow("Visual lead (ms)", "VisualPredictionMs", "VisualPredictionMs", 0, 250, 1, 0, visualOn)
+
+    rowTab = "Movement"
+    local function movementOn() return Settings.MovementEnabled == true end
+    toggleRow("Movement", "MovementEnabled")
+    sliderRow("Walk (x)", "WalkMultiplier", "WalkMultiplier", 0.25, 3, 0.01, 1, movementOn, 2)
+    sliderRow("Reload (x)", "ReloadMultiplier", "ReloadMultiplier", 0.25, 3, 0.01, 1, movementOn, 2)
+    sliderRow("Shoot (x)", "ShootMultiplier", "ShootMultiplier", 0.25, 3, 0.01, 1, movementOn, 2)
+    sliderRow("Low health (x)", "LowHealthMultiplier", "LowHealthMultiplier", 0.25, 3, 0.01, 1, movementOn, 2)
+    sliderRow("Health (%)", "LowHealthThreshold", "LowHealthThreshold", 1, 100, 1, 50, movementOn)
+
+    rowTab = "Exploits"
+    local function spreadOn() return Settings.SpreadEnabled == true end
+    toggleRow("Spread modifier", "SpreadEnabled")
+    sliderRow("Spread (%)", "SpreadPercent", "SpreadPercent", 0, 100, 1, 100, spreadOn)
+    local spreadHelp = newRow("SpreadHelp", 17, spreadOn)
+    make("TextLabel", spreadHelp.Frame, {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, Text = "100% normal / 0% none", TextSize = 10,
+        TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5,
+    })
+
+    layoutRows = function()
+        if layoutDepth > 0 then return end
+        layoutDepth = layoutDepth + 1
+        local positions = { Assistance = 1, Movement = 1, Exploits = 1 }
+        for _, row in ipairs(rows) do
+            local show = not row.ShowWhen or row.ShowWhen()
+            row.Frame.Visible = show
+            if show then
+                row.Frame.Position = UDim2.fromOffset(1, positions[row.Tab])
+                positions[row.Tab] = positions[row.Tab] + row.Height + row.Gap
+            end
+        end
+        for name, content in pairs(tabContents) do
+            local height = positions[name] + 1
+            content.CanvasSize = UDim2.fromOffset(0, height)
+            local scrollY = math.clamp(content.CanvasPosition.Y, 0, math.max(0, height - content.AbsoluteSize.Y))
+            if scrollY ~= content.CanvasPosition.Y then content.CanvasPosition = Vector2.new(0, scrollY) end
+        end
+        if activeDropdown and not canInteractRow(activeDropdown.Row) then closeDropdown() end
+        if dragSlider and not canInteractRow(dragSlider.Row) then endDrag() end
+        local focused = Input:GetFocusedTextBox()
+        for _, slider in ipairs(sliders) do
+            if focused == slider.NumberBox and (not canInteractRow(slider.Row)
+                or (slider.EditingProperty and slider.EditingProperty ~= resolveProperty(slider))) then
+                slider.NumberBox:ReleaseFocus()
+            end
+        end
+        layoutDepth = layoutDepth - 1
+    end
+    local function moveSlider(slider, property, position)
+        if not canInteractRow(slider.Row) then return end
+        local fraction = math.clamp((position.X - slider.Button.AbsolutePosition.X)
+            / math.max(1, slider.Button.AbsoluteSize.X), 0, 1)
+        changeSetting(property, quantize(slider, slider.Minimum + fraction * (slider.Maximum - slider.Minimum)))
+    end
+    local function beginDrag(input, kind, slider)
+        if not canInteractWindow() or dragInput then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if kind == "slider" and not canInteractRow(slider.Row) then return end
+        closeDropdown()
+        dragInput, dragKind, dragSlider = input, kind, slider
+        dragStart, panelStart = input.Position, panel.Position
+        if slider then
+            dragProperty = resolveProperty(slider)
+            moveSlider(slider, dragProperty, input.Position)
+        end
+    end
+    local function beginResize(input, edges)
+        if not canInteractWindow() or dragInput then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        closeDropdown()
+        releaseNumberFocus()
+        clampPanel()
+        local area = canvas.AbsoluteSize
+        if area.X <= 0 or area.Y <= 0 then return end
+        local x, y = panel.Position.X.Offset, panel.Position.Y.Offset
+        resizeStart = {
+            Left = x, Top = y, Right = x + panel.Size.X.Offset,
+            Bottom = y + panel.Size.Y.Offset, ViewWidth = area.X, ViewHeight = area.Y,
+        }
+        resizeEdges, dragInput, dragKind, dragStart = edges, input, "resize", input.Position
+    end
+    local function moveResize(position)
+        local area = canvas.AbsoluteSize
+        if not resizeStart or area.X <= 0 or area.Y <= 0 then endDrag(); return end
+        if area.X ~= resizeStart.ViewWidth or area.Y ~= resizeStart.ViewHeight then
+            endDrag()
+            clampPanel()
+            return
+        end
+        local delta = position - dragStart
+        local minWidth, minHeight = math.min(MIN_WIDTH, area.X), math.min(MIN_HEIGHT, area.Y)
+        local left, right = resizeStart.Left, resizeStart.Right
+        local top, bottom = resizeStart.Top, resizeStart.Bottom
+        if resizeEdges.West then left = math.clamp(left + delta.X, 0, right - minWidth) end
+        if resizeEdges.East then right = math.clamp(right + delta.X, left + minWidth, area.X) end
+        if resizeEdges.North then top = math.clamp(top + delta.Y, 0, bottom - minHeight) end
+        if resizeEdges.South then bottom = math.clamp(bottom + delta.Y, top + minHeight, area.Y) end
+        applyRectangle(left, top, right - left, bottom - top)
+    end
+    Track(header.InputBegan, function(input) beginDrag(input, "panel") end)
+    for _, region in ipairs(resizeHandles) do
+        local edges = region.Edges
+        Track(region.Button.InputBegan, function(input) beginResize(input, edges) end)
+    end
+    for _, slider in ipairs(sliders) do
+        local selectedSlider = slider
+        Track(selectedSlider.Button.InputBegan, function(input) beginDrag(input, "slider", selectedSlider) end)
+    end
+    Track(Input.InputChanged, function(input)
+        if destroyed or not dragInput then return end
+        if not canInteractWindow() then endDrag(); return end
+        if dragInput.UserInputState == Enum.UserInputState.Cancel
+            or dragInput.UserInputState == Enum.UserInputState.End then endDrag(); return end
+        local mouseMove = dragInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        if input ~= dragInput and not mouseMove then return end
+        if dragKind == "slider" then moveSlider(dragSlider, dragProperty, input.Position)
+        elseif dragKind == "resize" then moveResize(input.Position)
+        else
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.fromOffset(panelStart.X.Offset + delta.X, panelStart.Y.Offset + delta.Y)
+            clampPanel()
+        end
+    end)
+    Track(Input.InputEnded, function(input)
+        if not dragInput then return end
+        if input == dragInput or (input.UserInputType == Enum.UserInputType.MouseButton1
+            and dragInput.UserInputType == Enum.UserInputType.MouseButton1) then endDrag() end
+    end)
+    Track(Input.WindowFocusReleased, function() endDrag(); closeDropdown() end)
+    Track(Input.InputBegan, function(input)
+        if not canInteractWindow() or not activeDropdown then return end
+        if input.KeyCode == Enum.KeyCode.Escape then closeDropdown()
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if not contains(activeDropdown.Menu, input.Position) and not contains(activeDropdown.Button, input.Position) then
+                closeDropdown()
+            end
+        end
+    end)
+    for name, content in pairs(tabContents) do
+        local tabName, tabContent = name, content
+        Track(tabContent:GetPropertyChangedSignal("CanvasPosition"), function()
+            if activeDropdown and activeDropdown.Row.Container == tabContent then closeDropdown() end
+
+            if activeTab == tabName and dragKind ~= "resize"
+                and geometryDepth == 0 and layoutDepth == 0 then endDrag() end
+        end)
+        Track(tabContent:GetPropertyChangedSignal("AbsoluteSize"), layoutRows)
+    end
+    Track(canvas:GetPropertyChangedSignal("AbsoluteSize"), function()
+        if geometryDepth == 0 then endDrag(); clampPanel() end
+    end)
+    Track(closeButton.Activated, function() if canInteractWindow() then ctx.OnUnload() end end)
+    Track(gui.Destroying, function()
+        if destroyed then return end
+        insideGuiDestroy = true
+        ctx.OnUnload()
+        insideGuiDestroy = false
+    end)
+
+    local function clearBoxes()
+        for part, adornment in pairs(boxAdornments) do
+            adornment.Visible = false
+            adornment.Adornee = nil
+            adornment:Destroy()
+            boxAdornments[part] = nil
+        end
+    end
+    function ui:Sync()
+        if destroyed then return end
+        for property, mark in pairs(toggles) do mark.Visible = Settings[property] == true end
+        for _, dropdown in ipairs(dropdowns) do
+            local current, selectedCount, selectedLabel = Settings[dropdown.Property], 0, "None"
+            for _, option in ipairs(dropdown.Options) do
+                local selected
+                if dropdown.MultiSelection then selected = Settings[option.Value] == true
+                else selected = option.Value == current end
+                if selected then selectedCount, selectedLabel = selectedCount + 1, option.Label.Text end
+                if option.Mark then option.Mark.Visible = selected end
+                option.Button.BackgroundTransparency = selected and 0 or 1
+            end
+            if dropdown.MultiSelection and selectedCount == #dropdown.Options then dropdown.Label.Text = "All weapons"
+            elseif dropdown.MultiSelection and selectedCount > 1 then dropdown.Label.Text = tostring(selectedCount) .. " groups"
+            else dropdown.Label.Text = selectedLabel end
+        end
+        for _, slider in ipairs(sliders) do
+            local value = numericValue(slider)
+            slider.Fill.Size = UDim2.fromScale((value - slider.Minimum) / (slider.Maximum - slider.Minimum), 1)
+            if Input:GetFocusedTextBox() ~= slider.NumberBox then slider.NumberBox.Text = formatNumber(slider, value) end
+        end
+        layoutRows()
+        local camera = lastCamera
+        if workspace then camera = workspace.CurrentCamera end
+        self:Render(camera)
+    end
+    function ui:SetVisible(value)
+        if destroyed then return end
+        value = value == true
+        if visible == value then return end
+        endDrag()
+        closeDropdown()
+
+        if value then savedMouseIcon = Input.MouseIconEnabled end
+        visible, header.Modal, gui.Enabled = value, value, value
+        if value then
+            Input.MouseIconEnabled = true
+            clampPanel()
+        else
+            releaseNumberFocus()
+
+            if savedMouseIcon ~= nil and Input.MouseIconEnabled == true then
+                Input.MouseIconEnabled = savedMouseIcon
+            end
+            savedMouseIcon = nil
+        end
+    end
+    function ui:IsVisible() return not destroyed and visible end
+    function ui:Render(camera)
+        if destroyed then return end
+        lastCamera = camera
+        local display = camera ~= nil and Settings.ShowFOV == true and Settings.FOVEnabled == true
+        if not display then circle.Visible = false; clearBoxes(); return end
+        local visuals
+        if type(ctx.GetFOVVisuals) == "function" then visuals = ctx.GetFOVVisuals() end
+        visuals = visuals or { shape = Settings.FOVShape or "Circle", enabled = true, radius = Settings.FOV, boxes = {} }
+        if not visuals.enabled then circle.Visible = false; clearBoxes(); return end
+        if visuals.shape ~= "Box" then
+            clearBoxes()
+            local radius = math.clamp(tonumber(visuals.radius) or 0, 0, 300)
+            circle.Size = UDim2.fromOffset(radius * 2, radius * 2)
+            circle.Visible = radius > 0
+            if circle.Visible then
+                local point = ctx.ReferencePoint(camera)
+                circle.Position = UDim2.fromOffset(point.X, point.Y)
+            end
+            return
+        end
+        circle.Visible = false
+        local seen = {}
+        for _, entry in ipairs(visuals.boxes or {}) do
+            local part, size = entry.part, entry.size
+            if part and part.Parent and size and size.X > 0 and size.Y > 0 and size.Z > 0 then
+                local adornment = boxAdornments[part]
+                if not adornment then
+                    adornment = make("BoxHandleAdornment", boxRoot, {
+                        Name = "FOVBox", Adornee = part, Size = size, CFrame = CFrame.new(),
+                        Color3 = Color3.fromRGB(235, 235, 235), Transparency = 0.91,
+                        AlwaysOnTop = false, ZIndex = 0, Visible = true,
+                    })
+                    boxAdornments[part] = adornment
+                end
+                adornment.Size, adornment.Visible = size, true
+                seen[part] = true
+            end
+        end
+        for part, adornment in pairs(boxAdornments) do
+            if not seen[part] then
+                adornment.Visible, adornment.Adornee = false, nil
+                adornment:Destroy()
+                boxAdornments[part] = nil
+            end
+        end
+    end
+    function ui:SetStatus(_text)
+
+    end
+    function ui:Destroy()
+        if destroyed then return end
+        self:SetVisible(false)
+        destroyed = true
+        endDrag()
+        closeDropdown()
+        clearBoxes()
+        circle.Visible, header.Modal = false, false
+        if not insideGuiDestroy and gui.Parent then gui:Destroy() end
+        if overlay.Parent then overlay:Destroy() end
+    end
+
+    ui:Sync()
+    setTab("Assistance")
+    ui:SetVisible(true)
+    return ui
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+assert(LocalPlayer, "This script must run on the local client.")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+assert(PlayerGui, "PlayerGui was not available.")
+local env = (type(getgenv) == "function" and getgenv()) or _G
+local previous = env.__DH_GunHandlerAimUI
+local savedSettings = {}
+if type(previous) == "table" and type(previous.Settings) == "table" then
+    for key, value in pairs(previous.Settings) do savedSettings[key] = value end
+end
+
+local function removePrevious(callback, label)
+    local ok, result, detail = pcall(callback)
+    if not ok or result == false then
+        error("Could not unload " .. label .. ": " .. tostring(ok and detail or result)
+            .. ". Reload the client before trying again.", 0)
+    end
+end
+if type(previous) == "table" and type(previous.Cleanup) == "function" then
+    removePrevious(previous.Cleanup, "the previous aim controller")
+end
+if type(env.VelocityAimTestRestore) == "function" then
+    removePrevious(env.VelocityAimTestRestore, "the earlier aim test")
+    env.VelocityAimTestRestore = nil
+end
+for _, name in ipairs({"DH_AimPanel", "DH_AimOverlay"}) do
+    local obsolete = PlayerGui:FindFirstChild(name)
+    if obsolete then obsolete:Destroy() end
+end
+
+local modules = ReplicatedStorage:WaitForChild("Modules", 10)
+assert(modules, "ReplicatedStorage.Modules was not available.")
+local gunModule = modules:WaitForChild("GunHandler", 10)
+assert(gunModule, "Modules.GunHandler was not available.")
+local GunHandler = require(gunModule)
+assert(type(GunHandler) == "table" and type(GunHandler.getAim) == "function",
+    "GunHandler.getAim was not found.")
+local Settings = {
+    Enabled = true,
+    Mode = "FOV",
+    TargetKey = "Q",
+    ShowFOV = false,
+    FOVEnabled = true,
+    FOVShape = "Circle",
+    FOV = 100,
+    FOVX = 5,
+    FOVY = 5,
+    FOVZ = 5,
+    PerWeaponFOV = false,
+    FOVWeaponGroup = "Shotguns",
+    Target = "Head",
+    AimPoint = "Auto",
+    VisibleOnly = true,
+    SkipKnocked = true,
+    TeamCheck = false,
+    KeepTarget = true,
+    PointMode = "Adaptive",
+    ClosestPointMode = "Advanced",
+    PointScale = 0.25,
+    AimPredictionMs = 0,
+    HitChance = 100,
+    Humanizer = false,
+    ReactionMs = 100,
+    MaxCorrectionDegrees = 8,
+    ClientBulletRedirection = false,
+    RedirectShotguns = true,
+    RedirectPistols = true,
+    RedirectOther = true,
+    VisualPredictionMs = 0,
+    SpreadEnabled = false,
+    SpreadPercent = 100,
+    MovementEnabled = false,
+    WalkMultiplier = 1,
+    ReloadMultiplier = 1,
+    ShootMultiplier = 1,
+    LowHealthMultiplier = 1,
+    LowHealthThreshold = 50,
+}
+for _, group in ipairs({"Shotguns", "Pistols", "Other"}) do
+    Settings[group .. "FOV"] = 100
+    Settings[group .. "FOVX"] = 5
+    Settings[group .. "FOVY"] = 5
+    Settings[group .. "FOVZ"] = 5
+end
+local choices = {
+    Target = {Head = true, UpperTorso = true, LowerTorso = true, Torso = true,
+        HumanoidRootPart = true, ClosestPoint = true, ClosestPart = true,
+        LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+        RightUpperArm = true, RightLowerArm = true, RightHand = true,
+        LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+        RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+        ["Left Arm"] = true, ["Right Arm"] = true,
+        ["Left Leg"] = true, ["Right Leg"] = true},
+    AimPoint = {Auto = true, Cursor = true, Center = true},
+    PointMode = {Center = true, Adaptive = true},
+    ClosestPointMode = {Normal = true, Advanced = true},
+    Mode = {FOV = true, CurrentTarget = true},
+    TargetKey = {Q = true, T = true, Y = true},
+    FOVShape = {Circle = true, Box = true},
+    FOVWeaponGroup = {Shotguns = true, Pistols = true, Other = true},
+}
+
+local numericLimits = {
+    FOV = {0, 300, 1}, HitChance = {0, 100, 1}, SpreadPercent = {0, 100, 1},
+    FOVX = {0, 20, 0.1}, FOVY = {0, 20, 0.1}, FOVZ = {0, 20, 0.1},
+    PointScale = {0.05, 1, 0.05}, AimPredictionMs = {0, 250, 1},
+    VisualPredictionMs = {0, 250, 1}, ReactionMs = {0, 400, 1},
+    MaxCorrectionDegrees = {0, 45, 1},
+    WalkMultiplier = {0.25, 3, 0.01}, ReloadMultiplier = {0.25, 3, 0.01},
+    ShootMultiplier = {0.25, 3, 0.01}, LowHealthMultiplier = {0.25, 3, 0.01},
+    LowHealthThreshold = {1, 100, 1},
+}
+for _, group in ipairs({"Shotguns", "Pistols", "Other"}) do
+    numericLimits[group .. "FOV"] = numericLimits.FOV
+    for _, axis in ipairs({"X", "Y", "Z"}) do
+        numericLimits[group .. "FOV" .. axis] = numericLimits["FOV" .. axis]
+    end
+end
+local function normalizeSetting(key, value)
+    if Settings[key] == nil then return nil, "Unknown setting: " .. tostring(key) end
+    if key == "Target" and value == "Closest" then value = "ClosestPart" end
+    if numericLimits[key] then
+        if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+            return nil, key .. " must be a finite number."
+        end
+        local limits = numericLimits[key]
+        value = math.clamp(value, limits[1], limits[2])
+        value = limits[1] + math.floor((value - limits[1]) / limits[3] + 0.5) * limits[3]
+        return math.clamp(math.floor(value * 10000 + 0.5) / 10000, limits[1], limits[2])
+    end
+    if choices[key] then
+        if not choices[key][value] then return nil, "Invalid option for " .. key end
+        return value
+    end
+    if type(value) ~= "boolean" then return nil, key .. " must be true or false." end
+    return value
+end
+if savedSettings.Target == "Closest" and savedSettings.PointMode == "Adaptive" then
+    savedSettings.Target = "ClosestPoint"
+    savedSettings.ClosestPointMode = "Advanced"
+end
+for key, value in pairs(savedSettings) do
+    local normalized, problem = normalizeSetting(key, value)
+    if not problem then Settings[key] = normalized end
+end
+if savedSettings.SpreadEnabled == nil then
+    Settings.SpreadEnabled = Settings.SpreadPercent < 100
+end
+for _, group in ipairs({"Shotguns", "Pistols", "Other"}) do
+    for _, suffix in ipairs({"FOV", "FOVX", "FOVY", "FOVZ"}) do
+        if savedSettings[group .. suffix] == nil then Settings[group .. suffix] = Settings[suffix] end
+    end
+end
+
+local running = true
+local closed = false
+local closing = false
+local connections = {}
+local selector, ui, router, visual, movement
+local state = {Settings = Settings, Version = 12, Errors = {}}
+local function reportOnce(area, problem)
+    if state.Errors[area] == nil then state.Errors[area] = tostring(problem) end
+end
+local function track(signal, callback)
+    local connection = signal:Connect(callback)
+    connections[#connections + 1] = connection
+    return connection
+end
+
+local function cleanup()
+    if closed then return true end
+    if closing then return false, "Cleanup is already running." end
+    closing, running = true, false
+    local failures = {}
+    local function attempt(callback)
+        local ok, problem = pcall(callback)
+        if not ok then failures[#failures + 1] = tostring(problem) end
+    end
+
+    if router then attempt(function() router:Destroy() end) end
+    if visual then attempt(function() visual:Destroy() end) end
+    if movement then attempt(function() movement:Destroy() end) end
+    for _, connection in ipairs(connections) do
+        attempt(function() connection:Disconnect() end)
+    end
+    connections = {}
+    if selector then attempt(function() selector:Destroy() end) end
+    if ui then attempt(function() ui:Destroy() end) end
+
+    for _, name in ipairs({"DH_AimPanel", "DH_AimOverlay"}) do
+        attempt(function()
+            local item = PlayerGui:FindFirstChild(name)
+            if item then item:Destroy() end
+        end)
+    end
+    closing = false
+    if #failures > 0 then
+        local problem = table.concat(failures, " | ")
+        reportOnce("unload", problem)
+        return false, problem
+    end
+    closed = true
+    if env.__DH_GunHandlerAimUI == state then env.__DH_GunHandlerAimUI = nil end
+    return true
+end
+state.Cleanup = cleanup
+
+local function referencePoint(camera)
+    if Settings.AimPoint == "Center" then return camera.ViewportSize * 0.5 end
+    if Settings.AimPoint == "Auto" then
+        if UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
+            or _G.MobileShiftLock or _G.MobleAimingIn
+            or (UserInputService.TouchEnabled and not UserInputService.MouseEnabled) then
+            return camera.ViewportSize * 0.5
+        end
+    end
+    return UserInputService:GetMouseLocation()
+end
+
+local function setSetting(key, value)
+    if not running then return false, "The script is unloaded." end
+    local normalized, problem = normalizeSetting(key, value)
+    if problem then return false, problem end
+    if Settings[key] ~= normalized then
+        Settings[key] = normalized
+        local visualOnly = key == "ClientBulletRedirection" or key == "VisualPredictionMs"
+            or key == "RedirectShotguns" or key == "RedirectPistols" or key == "RedirectOther"
+        local presentationOnly = key == "ShowFOV" or key == "FOVWeaponGroup" or key == "TargetKey"
+        local movementOnly = key == "MovementEnabled" or key == "WalkMultiplier"
+            or key == "ReloadMultiplier" or key == "ShootMultiplier"
+            or key == "LowHealthMultiplier" or key == "LowHealthThreshold"
+        if selector and not presentationOnly and key ~= "HitChance"
+            and key ~= "SpreadPercent" and key ~= "SpreadEnabled"
+            and not visualOnly and not movementOnly then
+            selector:Invalidate(key ~= "Mode")
+        end
+        if visual and (visualOnly or key == "Enabled") then visual:Invalidate() end
+        if movement and movementOnly then
+            local ok, failure = pcall(movement.Refresh, movement)
+            if not ok then
+                pcall(movement.Invalidate, movement)
+                reportOnce("movement", failure)
+            end
+        end
+
+    end
+    if ui then ui:Sync() end
+    return true
+end
+state.SetSetting = setSetting
+state.GetDiagnostics = function()
+    return selector and selector:GetDiagnostics() or {status = "Unloaded"}
+end
+state.GetMovementDiagnostics = function()
+    return movement and movement:GetDiagnostics() or {enabled = false, mode = "Unloaded"}
+end
+state.ToggleTarget = function()
+    if not running or Settings.Mode ~= "CurrentTarget" then return false end
+    return selector:ToggleTarget()
+end
+
+local initialMouseIcon = UserInputService.MouseIconEnabled
+local initialized, problem = pcall(function()
+    selector = buildSelector({
+        Players = Players, LocalPlayer = LocalPlayer, ReplicatedStorage = ReplicatedStorage,
+        UserInputService = UserInputService, Settings = Settings,
+        ReferencePoint = referencePoint, Track = track, Clock = os.clock,
+        OriginalAim = GunHandler.getAim,
+    })
+    visual = buildVisualRedirect({
+        Settings = Settings, LocalPlayer = LocalPlayer, GunHandler = GunHandler,
+        Workspace = workspace, Track = track, Clock = os.clock, OnError = reportOnce,
+    })
+    router = buildShotRouter({
+        GunHandler = GunHandler, Selector = selector, Settings = Settings,
+        LocalPlayer = LocalPlayer, Clock = os.clock, Visual = visual, OnError = reportOnce,
+    })
+    movement = buildMovementController({
+        Settings = Settings, LocalPlayer = LocalPlayer, Clock = os.clock, OnError = reportOnce,
+    })
+    ui = buildUI({
+        PlayerGui = PlayerGui, UserInputService = UserInputService, RunService = RunService,
+        Settings = Settings, Track = track, SetSetting = setSetting,
+        OnUnload = cleanup, ReferencePoint = referencePoint,
+        GetFOVVisuals = function() return selector:GetFOVVisuals() end,
+    })
+    track(UserInputService.InputBegan, function(input, gameProcessed)
+        if not running or UserInputService:GetFocusedTextBox() then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            ui:SetVisible(not ui:IsVisible())
+        elseif not gameProcessed and Settings.Mode == "CurrentTarget"
+            and input.KeyCode == Enum.KeyCode[Settings.TargetKey] then
+            selector:ToggleTarget()
+        end
+    end)
+    local resumeAt = 0
+    track(RunService.Heartbeat, function(dt)
+        if not running then return end
+        local now = os.clock()
+        if now >= resumeAt then
+            local ok, failure = pcall(selector.Step, selector, dt)
+            if not ok then
+                selector:Invalidate()
+                resumeAt = now + 0.5
+                reportOnce("target selection", failure)
+            end
+        end
+        local ok, failure = pcall(visual.Step, visual)
+        if not ok then reportOnce("tracer update", failure) end
+    end)
+    track(RunService.RenderStepped, function()
+        if running then ui:Render(workspace.CurrentCamera) end
+    end)
+    track(RunService.PreSimulation or RunService.Heartbeat, function()
+        if not running then return end
+        local ok, failure = pcall(movement.Step, movement)
+        if not ok then
+            pcall(movement.Invalidate, movement)
+            reportOnce("movement", failure)
+        end
+    end)
+    local function invalidateCharacter()
+        selector:Invalidate()
+        router:Invalidate()
+        visual:Invalidate()
+        movement:Invalidate()
+    end
+    track(LocalPlayer.CharacterAdded, invalidateCharacter)
+    if LocalPlayer.CharacterRemoving then
+        track(LocalPlayer.CharacterRemoving, invalidateCharacter)
+    end
+    track(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+        selector:Invalidate(true)
+    end)
+    ui:Sync()
+
+    router:Install()
+    env.__DH_GunHandlerAimUI = state
+end)
+if not initialized then
+    cleanup()
+    UserInputService.MouseIconEnabled = initialMouseIcon
+    error("[Dmc | Da Hood] Setup failed: " .. tostring(problem), 0)
+end
