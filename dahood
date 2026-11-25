@@ -2,6 +2,24 @@ local AIM_PISTOL_NAMES = {
     ["[Revolver]"] = true, ["[Glock]"] = true, ["[Silencer]"] = true,
     ["[USP]"] = true, ["[Pistol]"] = true, ["[Flintlock]"] = true,
 }
+local function isSameTeam(localPlayer, otherPlayer, playersService)
+    if not localPlayer or not otherPlayer or localPlayer == otherPlayer then return false end
+    if playersService:GetAttribute("ServerMode") == "Ranked" then
+        local ownMatch = localPlayer:GetAttribute("RankedMatchId")
+        local otherMatch = otherPlayer:GetAttribute("RankedMatchId")
+        local ownRound = localPlayer:GetAttribute("RankedRoundId")
+        local otherRound = otherPlayer:GetAttribute("RankedRoundId")
+        local ownTeam = localPlayer:GetAttribute("RankedTeam")
+        local otherTeam = otherPlayer:GetAttribute("RankedTeam")
+        return type(ownMatch) == "string" and ownMatch ~= "" and ownMatch == otherMatch
+            and type(ownRound) == "string" and ownRound ~= "" and ownRound == otherRound
+            and type(ownTeam) == "number" and ownTeam > 0 and ownTeam == ownTeam
+            and type(otherTeam) == "number" and ownTeam == otherTeam
+    end
+    return localPlayer.Team ~= nil and not localPlayer.Neutral
+        and not otherPlayer.Neutral and otherPlayer.Team == localPlayer.Team
+end
+
 local function classifyWeapon(tool)
     local name = tool and tool.Name or ""
     local lower = string.lower(name)
@@ -441,8 +459,7 @@ local function buildSelector(ctx)
             return nil
         end
         if exempt(character) then return nil end
-        if Settings.TeamCheck and LocalPlayer.Team ~= nil and not LocalPlayer.Neutral
-            and not player.Neutral and player.Team == LocalPlayer.Team then
+        if Settings.TeamCheck and isSameTeam(LocalPlayer, player, Players) then
             return nil
         end
         local humanoid = character:FindFirstChildOfClass("Humanoid")
@@ -1333,8 +1350,7 @@ local function buildTriggerbot(ctx)
         if not player or player == LocalPlayer or player.Parent ~= Players
             or character ~= player.Character or not character or not character.Parent then return false end
         if character:GetAttribute("AdminInvisible") == true then return false end
-        if Settings.TriggerTeamCheck and LocalPlayer.Team ~= nil and not LocalPlayer.Neutral
-            and player.Team == LocalPlayer.Team and not player.Neutral then return false end
+        if Settings.TriggerTeamCheck and isSameTeam(LocalPlayer, player, Players) then return false end
         local humanoid = character:FindFirstChildOfClass("Humanoid")
         if not humanoid or humanoid.Health <= 0 then return false end
         local effects = character:FindFirstChild("BodyEffects")
@@ -2060,11 +2076,15 @@ local function buildVisualRedirect(ctx)
         end)
         attempt(function()
             local beam = record.beam
-            if beam and beam.Parent == part and beam.CurveSize0 == 0 then beam.CurveSize0 = record.curve0 end
+            if beam and beam.Parent == part and beam.CurveSize0 == record.appliedCurve0 then
+                beam.CurveSize0 = record.curve0
+            end
         end)
         attempt(function()
             local beam = record.beam
-            if beam and beam.Parent == part and beam.CurveSize1 == 0 then beam.CurveSize1 = record.curve1 end
+            if beam and beam.Parent == part and beam.CurveSize1 == record.appliedCurve1 then
+                beam.CurveSize1 = record.curve1
+            end
         end)
         return complete
     end
@@ -2104,12 +2124,15 @@ local function buildVisualRedirect(ctx)
             endpoint = endpoint, beam = beam, curve0 = beam.CurveSize0, curve1 = beam.CurveSize1,
             appliedFrame = CFrame.new(token.origin, token.point),
             appliedPosition = Vector3.new(0, 0, -length),
+            appliedCurve0 = 0, appliedCurve1 = 0,
         }
         touched[part] = record
         local ok, problem = pcall(function()
             part.CFrame = record.appliedFrame
             endpoint.Position = record.appliedPosition
             beam.CurveSize0, beam.CurveSize1 = 0, 0
+            record.appliedFrame, record.appliedPosition = part.CFrame, endpoint.Position
+            record.appliedCurve0, record.appliedCurve1 = beam.CurveSize0, beam.CurveSize1
         end)
         if not ok or token.generation ~= generation or token.cancelled then
             local restored = restore(part, record)
@@ -2206,6 +2229,52 @@ local function buildVisualRedirect(ctx)
             or visualDirection.Magnitude <= 0.001 then return nil end
         local visualPoint = origin + visualDirection.Unit * length
         if not finiteVector(visualPoint) then return nil end
+
+        local redirect = finite(Settings.VisualCurvePercent)
+            and math.clamp(Settings.VisualCurvePercent, 0, 100) / 100 or 0.55
+        if redirect > 0 then
+            local range = finite(data.Range) and data.Range > 0 and data.Range or 200
+            local naturalDirection, naturalDistance
+            if type(ctx.OriginalAim) == "function" then
+                local ok, direction, distance = pcall(ctx.OriginalAim, origin, range)
+                if ok and finiteVector(direction) and direction.Magnitude > 0.001 then
+                    naturalDirection = direction.Unit
+                    if finite(distance) and distance > 0 then
+                        naturalDistance = math.min(distance, range)
+                    end
+                end
+            end
+            if not naturalDirection then
+                local camera = World.CurrentCamera
+                if camera and type(ctx.ReferencePoint) == "function" then
+                    local ok, reference = pcall(ctx.ReferencePoint, camera)
+                    if ok and typeof(reference) == "Vector2" then
+                        local ray = camera:ViewportPointToRay(reference.X, reference.Y)
+                        if ray and finiteVector(ray.Origin) and finiteVector(ray.Direction)
+                            and ray.Direction.Magnitude > 0.001 then
+                            local unit = ray.Direction.Unit
+                            local depth = math.clamp((aimPoint - ray.Origin):Dot(unit), 0.5, range)
+                            local vector = ray.Origin + unit * depth - origin
+                            if finiteVector(vector) and vector.Magnitude > 0.001 then
+                                naturalDirection = vector.Unit
+                                naturalDistance = math.min(vector.Magnitude, range)
+                            end
+                        end
+                    end
+                end
+            end
+            if naturalDirection then
+                local straightDirection = rotateDirection(base.Unit, naturalDirection, shot.Unit)
+                if finiteVector(straightDirection) and straightDirection.Magnitude > 0.001 then
+                    local straightDistance = naturalDistance or length
+                    local straightPoint = origin + straightDirection.Unit * straightDistance
+                    if finiteVector(straightPoint) then
+                        visualPoint = visualPoint:Lerp(straightPoint, redirect)
+                    end
+                end
+            end
+        end
+        if not finiteVector(visualPoint) or (visualPoint - origin).Magnitude <= 0.001 then return nil end
         local now = Clock()
         for index = #pending, 1, -1 do
             local item = pending[index]
@@ -2214,7 +2283,8 @@ local function buildVisualRedirect(ctx)
         if #pending >= MAX_PENDING then return nil end
         local token = {
             character = character, origin = origin,
-            point = visualPoint, generation = generation, folder = folder,
+            point = visualPoint,
+            generation = generation, folder = folder,
             expires = now + TTL, finished = false,
         }
         pending[#pending + 1] = token
@@ -2438,19 +2508,51 @@ local function buildHitboxController(ctx)
         local part = character and character:FindFirstChild("HumanoidRootPart")
         return part and part:IsA("BasePart") and part or nil
     end
+    local visibilityParams = RaycastParams.new()
+    visibilityParams.FilterType = Enum.RaycastFilterType.Exclude
+    visibilityParams.IgnoreWater = true
+    local visibilityCharacter, visibilityIgnored
+    local function hasLineOfSight(character)
+        if Settings.HitboxVisibleOnly ~= true then return true end
+        local ownCharacter = Player.Character
+        local ignored = World:FindFirstChild("Ignored")
+        if visibilityCharacter ~= ownCharacter or visibilityIgnored ~= ignored then
+            local excluded = {}
+            if ownCharacter then excluded[#excluded + 1] = ownCharacter end
+            if ignored then excluded[#excluded + 1] = ignored end
+            visibilityParams.FilterDescendantsInstances = excluded
+            visibilityCharacter, visibilityIgnored = ownCharacter, ignored
+        end
+        local camera = World.CurrentCamera
+        local eye = camera and camera.CFrame.Position
+        if not eye then
+            local ownRoot = root(ownCharacter)
+            eye = ownRoot and (ownRoot.Position + Vector3.new(0, 1.5, 0))
+        end
+        if not eye then return false end
+        local function clearTo(part)
+            if not part or not part:IsA("BasePart") then return false end
+            local delta = part.Position - eye
+            if delta.Magnitude <= 0.001 then return true end
+            local hit = World:Raycast(eye, delta, visibilityParams)
+            return hit == nil or hit.Instance:IsDescendantOf(character)
+        end
+        return clearTo(character:FindFirstChild("Head"))
+            or clearTo(character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso"))
+            or clearTo(root(character))
+    end
     local function eligible(player, origin)
         if player == Player or player.Parent ~= Players then return nil end
         local character = player.Character
         if not character or not character:IsDescendantOf(World) then return nil end
-        if Settings.TeamCheck and Player.Team ~= nil and not Player.Neutral
-            and not player.Neutral and player.Team == Player.Team then return nil end
+        if Settings.HitboxTeamCheck and isSameTeam(Player, player, Players) then return nil end
         local humanoid = character:FindFirstChildOfClass("Humanoid")
         if not humanoid or not finite(humanoid.Health) or humanoid.Health <= 0 then return nil end
         local effects = character:FindFirstChild("BodyEffects")
         local dead = effects and effects:FindFirstChild("Dead")
         if dead and dead.Value == true then return nil end
         local knocked = effects and effects:FindFirstChild("K.O")
-        if Settings.SkipKnocked and knocked and knocked.Value == true then return nil end
+        if Settings.HitboxSkipKnocked and knocked and knocked.Value == true then return nil end
         local part = root(character)
         if not part then return nil end
         local delta = part.Position - origin
@@ -2475,18 +2577,24 @@ local function buildHitboxController(ctx)
         end)
         local desired, order = {}, {}
         local x, y, z = dimensions()
-        local maxProxies = 128
+        local maxProxies, visibilityProbes = 128, 0
         for _, candidate in ipairs(candidates) do
             if #order >= maxProxies then break end
+            if Settings.HitboxVisibleOnly == true then
+                if visibilityProbes >= 40 then break end
+                visibilityProbes = visibilityProbes + 1
+            end
             local character = candidate.character
-            local volumes, layout = hitboxVolumes(character, Settings, x, y, z)
-            for _, volume in ipairs(volumes) do
-                local part = volume.part
-                if #order >= maxProxies then break end
-                if validSize(volume.size) and not desired[part] then
-                    desired[part] = {player = candidate.player, character = character,
-                        native = part, size = volume.size, layout = layout}
-                    order[#order + 1] = part
+            if hasLineOfSight(character) then
+                local volumes, layout = hitboxVolumes(character, Settings, x, y, z)
+                for _, volume in ipairs(volumes) do
+                    local part = volume.part
+                    if #order >= maxProxies then break end
+                    if validSize(volume.size) and not desired[part] then
+                        desired[part] = {player = candidate.player, character = character,
+                            native = part, size = volume.size, layout = layout}
+                        order[#order + 1] = part
+                    end
                 end
             end
         end
@@ -3631,6 +3739,12 @@ local function buildConfigController(ctx)
                 end
             end
         end
+        if values.HitboxTeamCheck == nil and type(values.TeamCheck) == "boolean" then
+            result.HitboxTeamCheck = values.TeamCheck
+        end
+        if values.HitboxSkipKnocked == nil and type(values.SkipKnocked) == "boolean" then
+            result.HitboxSkipKnocked = values.SkipKnocked
+        end
         if result.MenuKey == result.SilentKey or result.MenuKey == result.TriggerKey
             or result.MenuKey == result.TargetKey then
             result.MenuKey = defaults.MenuKey
@@ -3878,6 +3992,42 @@ local function buildConfigController(ctx)
         return run(function()
             if not ready() then return false, "File access unavailable" end
             return loadProfile(name, true)
+        end)
+    end
+    function controller:Delete(name)
+        return run(function()
+            if not ready() then return false, "File access unavailable" end
+            if type(files.delfile) ~= "function" then return false, "Delete unavailable" end
+            local _, key = normalizeName(name)
+            if not key or not entries[key] then return false, "Choose a config" end
+            local path = configPath(key)
+            local contents, readProblem = readFile(path)
+            if not contents then return false, readProblem end
+            local _, loadedKey = normalizeName(loaded)
+            local removingLoaded = loadedKey == key
+            local previousLoaded, previousAuto = loaded, autoLoad
+            if removingLoaded then
+                local cleared, clearProblem = writeMetadata("", false)
+                if not cleared then return false, clearProblem end
+            end
+            if not current() then return false, "Script reloaded" end
+            local deleted, deleteResult = pcall(files.delfile, path)
+            if not current() then return false, "Script reloaded" end
+            local verified, stillExists = pcall(files.isfile, path)
+            if not deleted or deleteResult == false or not verified or stillExists then
+                if removingLoaded then
+                    local restored = writeMetadata(previousLoaded, previousAuto)
+                    if not restored then return false, "Delete failed; auto load restore failed" end
+                end
+                return false, "Couldn't delete config"
+            end
+            local title = entries[key].Name
+            entries[key] = nil
+            local _, selectedKey = normalizeName(selected)
+            if selectedKey == key then selected = "" end
+            if removingLoaded then loaded, autoLoad = "", false end
+            sortedNames()
+            return true, "Deleted " .. title
         end)
     end
     function controller:SetAutoLoad(value)
@@ -4499,7 +4649,6 @@ local function buildUI(ctx)
             if not active then boxFill.Transparency = 1 end
             for index = edgeIndex, #edges do edges[index].Transparency = 1 end
             for index = fillIndex, #selectedFills do selectedFills[index].Transparency = 1 end
-            -- The avatar always keeps its real colors. Only the separate test boxes are tinted.
             for _, entry in ipairs(avatarParts) do
                 if entry.Part.Parent and entry.Part.Color ~= entry.Color then
                     entry.Part.Color = entry.Color
@@ -5352,6 +5501,7 @@ local function buildUI(ctx)
         { Value = "RedirectPistols", Label = "Pistols" }, { Value = "RedirectOther", Label = "Other" },
     }, visualOn, true)
     sliderRow("Visual lead (ms)", "VisualPredictionMs", "VisualPredictionMs", 0, 250, 1, 0, visualOn)
+    sliderRow("Redirect (%)", "VisualCurvePercent", "VisualCurvePercent", 0, 100, 1, 55, visualOn)
 
     rowParent = function() return activeAssistPage == "Triggerbot" end
     toggleRow("Enabled", "TriggerEnabled")
@@ -5426,6 +5576,9 @@ local function buildUI(ctx)
     }, hitboxOn)
     dropdownRow("Body parts", "HitboxSelectedParts", scopedPartChoices("Hitbox"),
         function() return Settings.HitboxTarget == "SelectedParts" end, true)
+    toggleRow("Visible only", "HitboxVisibleOnly", hitboxOn)
+    toggleRow("Team check", "HitboxTeamCheck", hitboxOn)
+    toggleRow("Skip KO", "HitboxSkipKnocked", hitboxOn)
     sliderRow("X (width)", "HitboxX", "HitboxX", 0, 20, 0.1, 5, hitboxOn, 1)
     sliderRow("Y (height)", "HitboxY", "HitboxY", 0, 20, 0.1, 5, hitboxOn, 1)
     sliderRow("Z (depth)", "HitboxZ", "HitboxZ", 0, 20, 0.1, 5, hitboxOn, 1)
@@ -5603,8 +5756,9 @@ local function buildUI(ctx)
     end)
 
     local actionsRow = newRow("ConfigActions", 22)
-    local saveButton = configButton(actionsRow, "ConfigSave", "Save", UDim2.fromOffset(90, 0), UDim2.new(0.5, -48, 1, 0))
-    local loadButton = configButton(actionsRow, "ConfigLoad", "Load", UDim2.new(0.5, 48, 0, 0), UDim2.new(0.5, -48, 1, 0))
+    local saveButton = configButton(actionsRow, "ConfigSave", "Save", UDim2.fromOffset(90, 0), UDim2.new(1/3, -34, 1, 0))
+    local loadButton = configButton(actionsRow, "ConfigLoad", "Load", UDim2.new(1/3, 62, 0, 0), UDim2.new(1/3, -34, 1, 0))
+    local deleteButton = configButton(actionsRow, "ConfigDelete", "Delete", UDim2.new(2/3, 34, 0, 0), UDim2.new(1/3, -34, 1, 0))
     Track(saveButton.Activated, function()
         if not configInteractive(actionsRow) then return end
         local name = configNameBox.Text
@@ -5614,6 +5768,11 @@ local function buildUI(ctx)
     Track(loadButton.Activated, function()
         if not configInteractive(actionsRow) then return end
         if configOperation("Load", configUI.State.Selected) then configNameBox.Text = "" end
+    end)
+    Track(deleteButton.Activated, function()
+        if not configInteractive(actionsRow) then return end
+        closeDropdown()
+        if configOperation("Delete", configUI.State.Selected) then configNameBox.Text = "" end
     end)
 
     local autoRow = newRow("ConfigAutoLoad", 19, nil, 2)
@@ -6454,9 +6613,13 @@ local Settings = {
     RedirectPistols = true,
     RedirectOther = true,
     VisualPredictionMs = 0,
+    VisualCurvePercent = 55,
     SpreadEnabled = false,
     SpreadPercent = 100,
     HitboxEnabled = false,
+    HitboxVisibleOnly = false,
+    HitboxTeamCheck = false,
+    HitboxSkipKnocked = true,
     HitboxTarget = "SelectedParts",
     HitboxX = 5,
     HitboxY = 5,
@@ -6515,7 +6678,7 @@ local numericLimits = {
     PreviewThickness = {0.5, 2, 0.05},
     FOVX = {0, 20, 0.1}, FOVY = {0, 20, 0.1}, FOVZ = {0, 20, 0.1},
     PointScale = {0.05, 1, 0.05}, AimPredictionMs = {0, 250, 1},
-    VisualPredictionMs = {0, 250, 1}, ReactionMs = {0, 400, 1},
+    VisualPredictionMs = {0, 250, 1}, VisualCurvePercent = {0, 100, 1}, ReactionMs = {0, 400, 1},
     MaxCorrectionDegrees = {0, 45, 1},
     WalkMultiplier = {0.25, 3, 0.01}, ReloadMultiplier = {0.25, 3, 0.01},
     ShootMultiplier = {0.25, 3, 0.01}, LowHealthMultiplier = {0.25, 3, 0.01},
@@ -6591,6 +6754,12 @@ end
 for key, value in pairs(savedSettings) do
     local normalized, problem = normalizeSetting(key, value)
     if not problem then Settings[key] = normalized end
+end
+if savedSettings.HitboxTeamCheck == nil then
+    Settings.HitboxTeamCheck = Settings.TeamCheck
+end
+if savedSettings.HitboxSkipKnocked == nil then
+    Settings.HitboxSkipKnocked = Settings.SkipKnocked
 end
 if savedSettings.SpreadEnabled == nil then
     Settings.SpreadEnabled = Settings.SpreadPercent < 100
@@ -6736,10 +6905,12 @@ local function setSetting(key, value)
             silentHeld, silentToggled = false, false
         end
         local visualOnly = key == "ClientBulletRedirection" or key == "VisualPredictionMs"
+            or key == "VisualCurvePercent"
             or key == "RedirectShotguns" or key == "RedirectPistols" or key == "RedirectOther"
         local presentationOnly = key == "ShowFOV" or key == "FOVWeaponGroup" or key == "TargetKey"
             or key == "HitboxShow" or key == "SilentKey"
         local hitboxSetting = key == "HitboxEnabled" or key == "HitboxTarget"
+            or key == "HitboxVisibleOnly" or key == "HitboxTeamCheck" or key == "HitboxSkipKnocked"
             or (type(key) == "string" and string.sub(key, 1, 12) == "HitboxSelect")
             or key == "HitboxX" or key == "HitboxY" or key == "HitboxZ" or key == "HitboxShow"
             or key == "StreamMode"
@@ -6786,14 +6957,14 @@ local function setSetting(key, value)
                 reportOnce("jump", failure)
             end
         end
-        if hitbox and (hitboxSetting or key == "TeamCheck" or key == "SkipKnocked") then
+        if hitbox and hitboxSetting then
             local ok, failure = pcall(hitbox.Refresh, hitbox)
             if not ok then
                 pcall(hitbox.Invalidate, hitbox)
                 reportOnce("hitbox", failure)
             end
         end
-        if particles and (hitboxSetting or key == "TeamCheck" or key == "SkipKnocked") then
+        if particles and hitboxSetting then
             local ok, failure = pcall(particles.Refresh, particles)
             if not ok then
                 pcall(particles.Invalidate, particles)
@@ -6937,7 +7108,7 @@ local initialized, problem = pcall(function()
             isfile = fileFunction("isfile", isfile),
             isfolder = fileFunction("isfolder", isfolder),
             makefolder = fileFunction("makefolder", makefolder),
-            delfile = fileFunction("delfile", delfile),
+            delfile = fileFunction("delfile", delfile) or fileFunction("deletefile", deletefile),
         },
     })
     state.Configs = configs
@@ -7060,6 +7231,7 @@ local initialized, problem = pcall(function()
     visual = buildVisualRedirect({
         Settings = Settings, LocalPlayer = LocalPlayer, GunHandler = GunHandler,
         Workspace = workspace, Track = track, Clock = os.clock,
+        ReferencePoint = referencePoint, OriginalAim = GunHandler.getAim,
         SilentActive = silentActive, OnError = reportOnce,
     })
     router = buildShotRouter({
