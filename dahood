@@ -75,33 +75,7 @@ local KNOWN_BODY_PARTS = {}
 for _, option in ipairs(AIM_PART_OPTIONS) do KNOWN_BODY_PARTS[option.Name] = true end
 
 local function fittedHitboxSize(character, root, requested)
-    local halfX = math.max(root.Size.X, requested.X) * 0.5
-    local halfY = math.max(root.Size.Y, requested.Y) * 0.5
-    local halfZ = math.max(root.Size.Z, requested.Z) * 0.5
-    local reference = root.CFrame
-    local margin = 0.08
-    for _, option in ipairs(AIM_PART_OPTIONS) do
-        if option.Name ~= "HumanoidRootPart" then
-            local part = character:FindFirstChild(option.Name)
-            if part and part.Parent == character and part:IsA("BasePart") then
-                local size = part.Size
-                if size.X > 0 and size.Y > 0 and size.Z > 0 then
-                    local relative = reference:ToObjectSpace(part.CFrame)
-                    local center = relative.Position
-                    local right, up, forward = relative.RightVector,
-                        relative.UpVector, relative.LookVector
-                    local sx, sy, sz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
-                    local extentX = math.abs(right.X) * sx + math.abs(up.X) * sy + math.abs(forward.X) * sz
-                    local extentY = math.abs(right.Y) * sx + math.abs(up.Y) * sy + math.abs(forward.Y) * sz
-                    local extentZ = math.abs(right.Z) * sx + math.abs(up.Z) * sy + math.abs(forward.Z) * sz
-                    halfX = math.max(halfX, math.abs(center.X) + extentX + margin)
-                    halfY = math.max(halfY, math.abs(center.Y) + extentY + margin)
-                    halfZ = math.max(halfZ, math.abs(center.Z) + extentZ + margin)
-                end
-            end
-        end
-    end
-    return Vector3.new(halfX * 2, halfY * 2, halfZ * 2)
+    return requested
 end
 
 local function hitboxVolumes(character, settings, x, y, z)
@@ -189,6 +163,32 @@ local function rayIntersectsBox(ray, frame, size)
         end
     end
     return leave >= enter
+end
+
+local function rayBoxEntryDistance(ray, frame, size, range)
+    if not size or size.X <= 0 or size.Y <= 0 or size.Z <= 0
+        or type(range) ~= "number" or range <= 0 then return nil end
+    local origin = frame:PointToObjectSpace(ray.Origin)
+    local direction = frame:VectorToObjectSpace(ray.Direction)
+    local ox, oy, oz = origin.X, origin.Y, origin.Z
+    local dx, dy, dz = direction.X, direction.Y, direction.Z
+    local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+    local entry, exit = 0, range
+    for axis = 1, 3 do
+        local o = axis == 1 and ox or axis == 2 and oy or oz
+        local d = axis == 1 and dx or axis == 2 and dy or dz
+        local half = axis == 1 and hx or axis == 2 and hy or hz
+        if math.abs(d) < 0.00000001 then
+            if math.abs(o) > half then return nil end
+        else
+            local near = (-half - o) / d
+            local far = (half - o) / d
+            if near > far then near, far = far, near end
+            entry, exit = math.max(entry, near), math.min(exit, far)
+            if entry > exit then return nil end
+        end
+    end
+    return entry <= range and entry or nil
 end
 
 local function closestRayBoxPoint(frame, size, ray)
@@ -1316,6 +1316,30 @@ local function buildSelector(ctx)
     return selector
 end
 
+local TRIGGER_GUN_TOOL_NAMES = {
+    ["[AK47]"] = true,
+    ["[AR]"] = true,
+    ["[AUG]"] = true,
+    ["[Deagle]"] = true,
+    ["[Double-Barrel SG]"] = true,
+    ["[Drum-Shotgun]"] = true,
+    ["[DrumGun]"] = true,
+    ["[Flamethrower]"] = true,
+    ["[Flintlock]"] = true,
+    ["[Glock]"] = true,
+    ["[GrenadeLauncher]"] = true,
+    ["[LMG]"] = true,
+    ["[P90]"] = true,
+    ["[Revolver]"] = true,
+    ["[Rifle]"] = true,
+    ["[RPG]"] = true,
+    ["[Shotgun]"] = true,
+    ["[Silencer]"] = true,
+    ["[SilencerAR]"] = true,
+    ["[SMG]"] = true,
+    ["[TacticalShotgun]"] = true,
+}
+
 local function buildTriggerbot(ctx)
     local Settings, Players, LocalPlayer = ctx.Settings, ctx.Players, ctx.LocalPlayer
     local World, Input = ctx.Workspace or workspace, ctx.UserInputService
@@ -1383,6 +1407,9 @@ local function buildTriggerbot(ctx)
     local function toolInfo(character)
         local tool = character and character:FindFirstChildWhichIsA("Tool")
         if not tool or not tool.Parent or tool.Parent ~= character or tool.Enabled == false then return nil end
+        if Settings.TriggerGunsOnly and not TRIGGER_GUN_TOOL_NAMES[tool.Name] then
+            return nil, "Not a gun"
+        end
         local handle = tool:FindFirstChild("Handle")
         if not handle or not handle:IsA("BasePart") then return nil end
         local range = math.clamp(tonumber(Settings.TriggerRange) or 200, 10, 500)
@@ -1408,6 +1435,27 @@ local function buildTriggerbot(ctx)
         if ignored then excluded[#excluded + 1] = ignored end
         params.FilterDescendantsInstances = excluded
         filterFor, filterIgnored = character, ignored
+    end
+
+    local function findCrosshairBody(cameraRay, range)
+        local closestDistance, bestPlayer, bestCharacter, bestPart, bestPoint
+        for _, player in ipairs(Players:GetPlayers()) do
+            local character = player.Character
+            if validTarget(player, character) then
+                for _, option in ipairs(AIM_PART_OPTIONS) do
+                    local part = character:FindFirstChild(option.Name)
+                    if part and part:IsA("BasePart") and selectedPart(part) then
+                        local distance = rayBoxEntryDistance(cameraRay, part.CFrame, part.Size, range)
+                        if distance and (not closestDistance or distance < closestDistance) then
+                            closestDistance = distance
+                            bestPlayer, bestCharacter, bestPart = player, character, part
+                            bestPoint = cameraRay.Origin + cameraRay.Direction * distance
+                        end
+                    end
+                end
+            end
+        end
+        return bestPlayer, bestCharacter, bestPart, bestPoint, closestDistance
     end
 
     local function nativeShotStamp(character, tool)
@@ -1444,24 +1492,44 @@ local function buildTriggerbot(ctx)
             end
             if Settings.HitboxEnabled and ctx.Hitbox and type(ctx.Hitbox.PickRayTarget) == "function" then
                 local player, model, part, point, entry = ctx.Hitbox:PickRayTarget(cameraRay, range, selectedPart)
-                local nativeDistance = hit and (hit.Position - cameraRay.Origin).Magnitude or math.huge
+                local nativeDistance = Settings.TriggerVisibleOnly
+                    and hit and (hit.Position - cameraRay.Origin).Magnitude or math.huge
                 if part and entry and entry <= nativeDistance + 0.01 and validTarget(player, model) then
                     targetPart, targetPlayer, targetCharacter, targetPoint = part, player, model, point
                 end
             end
+            if Settings.TriggerVisibleOnly == false and not targetPart then
+                local player, model, part, point = findCrosshairBody(cameraRay, range)
+                if part then
+                    targetPart, targetPlayer, targetCharacter, targetPoint = part, player, model, point
+                end
+            end
         end
-        if not targetPart or not targetPlayer or not targetCharacter or not targetPoint then return nil end
-        if Settings.TriggerVisibleOnly and Settings.TriggerMode == "SilentAim" then
-            local eyeRay = targetPoint - camera.CFrame.Position
-            if eyeRay.Magnitude <= 0.001 then return nil end
-            local eyeHit = World:Raycast(camera.CFrame.Position, eyeRay, params)
-            if not eyeHit or not eyeHit.Instance:IsDescendantOf(targetCharacter) then return nil end
+        if not targetPart or not targetPlayer or not targetCharacter or not targetPoint then
+            return nil, "Searching"
+        end
+        if Settings.TriggerVisibleOnly then
+            local eyePoint = targetPoint
+            local eyeRay = eyePoint - camera.CFrame.Position
+            local eyeHit = eyeRay.Magnitude > 0.001
+                and World:Raycast(camera.CFrame.Position, eyeRay, params) or nil
+            if not eyeHit or not eyeHit.Instance:IsDescendantOf(targetCharacter) then
+                eyePoint = targetPart.Position
+                eyeRay = eyePoint - camera.CFrame.Position
+                eyeHit = eyeRay.Magnitude > 0.001
+                    and World:Raycast(camera.CFrame.Position, eyeRay, params) or nil
+                if not eyeHit or not eyeHit.Instance:IsDescendantOf(targetCharacter) then
+                    return nil, "Camera blocked"
+                end
+            end
         end
         local delta = targetPoint - origin
-        if delta.Magnitude <= 0.001 or delta.Magnitude > range then return nil end
+        if delta.Magnitude <= 0.001 or delta.Magnitude > range then return nil, "Out of range" end
         if Settings.TriggerMuzzleCheck then
             local obstruction = World:Raycast(origin, delta, params)
-            if obstruction and not obstruction.Instance:IsDescendantOf(targetCharacter) then return nil end
+            if obstruction and not obstruction.Instance:IsDescendantOf(targetCharacter) then
+                return nil, "Muzzle blocked"
+            end
         end
         return targetCharacter
     end
@@ -1545,14 +1613,18 @@ local function buildTriggerbot(ctx)
             diagnostics.status = "No character"; trackedCharacter = nil; return
         end
         local tool, origin, range = toolInfo(character)
-        if not tool then diagnostics.status = "No weapon"; trackedCharacter = nil; return end
+        if not tool then
+            diagnostics.status = origin or "No weapon"
+            trackedCharacter, pendingShot, lastTool = nil, nil, nil
+            return
+        end
         if lastTool ~= tool then lastTool, trackedCharacter, nextShot = tool, nil, now end
         local camera = World.CurrentCamera
         if not camera then diagnostics.status = "No camera"; return end
         makeFilter(character)
-        local target = detect(camera, character, origin, range)
+        local target, reason = detect(camera, character, origin, range)
         if not target then
-            diagnostics.status = "Searching"
+            diagnostics.status = reason or "Searching"
             trackedCharacter, pendingShot = nil, nil
             return
         end
@@ -4239,6 +4311,10 @@ local function buildUI(ctx)
         local originalRootFrame, appliedThickness = nil, nil
         local neutralBodyScaleX, neutralBodyScaleZ = 1, 1
         local sourceCharacter
+        local fallbackAvatar, lastAvatarAttempt = false, -math.huge
+        local profileAvatarSource, profileAvatarLoading = nil, false
+        local nextProfileAvatarRequest = 0
+        local rebuildAvatar
         local holder = make("Frame", canvas, {
             Name = "HitboxPreview", Size = UDim2.fromOffset(previewWidth, previewHeight),
             BackgroundColor3 = colors.Background, BorderColor3 = colors.Border,
@@ -4263,6 +4339,13 @@ local function buildUI(ctx)
         local scene = make("WorldModel", viewport, { Name = "PreviewWorld" })
         local previewCamera = make("Camera", viewport, {FieldOfView = 52})
         viewport.CurrentCamera = previewCamera
+        local avatarStatus = make("TextLabel", viewport, {
+            Name = "AvatarStatus", Position = UDim2.new(0, 5, 1, -23),
+            Size = UDim2.new(1, -10, 0, 16), BackgroundTransparency = 1,
+            Font = Enum.Font.Code, Text = "", TextSize = 11,
+            TextColor3 = colors.Muted, TextXAlignment = Enum.TextXAlignment.Center,
+            ZIndex = 14,
+        })
         local sizeInfo = make("TextLabel", holder, {
             Name = "PreviewSize", Position = UDim2.new(0, 9, 1, -62),
             Size = UDim2.new(1, -18, 0, 15), BackgroundTransparency = 1,
@@ -4296,37 +4379,6 @@ local function buildUI(ctx)
                 Color = Color3.fromRGB(235, 235, 235), Material = Enum.Material.SmoothPlastic,
                 Transparency = 1, Size = Vector3.new(0.04, 0.04, 1),
             })
-        end
-        local function makeDummy()
-            local rig = make("Model", scene, {Name = "PreviewDummy"})
-            local function piece(name, size, position, color, shape)
-                local part = make("Part", rig, {
-                    Name = name, Anchored = true, CanCollide = false,
-                    CanQuery = false, CanTouch = false, CastShadow = false,
-                    Size = size, CFrame = CFrame.new(position),
-                    Color = color, Material = Enum.Material.SmoothPlastic,
-                    Shape = shape or Enum.PartType.Block,
-                })
-                return part
-            end
-            rootPart = piece("HumanoidRootPart", Vector3.new(1, 2, 0.5), Vector3.zero,
-                Color3.fromRGB(255, 255, 255))
-            rootPart.Transparency = 1
-            piece("Head", Vector3.new(1.2, 1.2, 1.2), Vector3.new(0, 2, 0),
-                Color3.fromRGB(239, 220, 189), Enum.PartType.Ball)
-            piece("UpperTorso", Vector3.new(1.8, 1.35, 0.85), Vector3.new(0, 0.95, 0),
-                Color3.fromRGB(62, 109, 153))
-            piece("LowerTorso", Vector3.new(1.6, 0.7, 0.8), Vector3.new(0, -0.06, 0),
-                Color3.fromRGB(56, 64, 71))
-            piece("LeftUpperArm", Vector3.new(0.5, 1.5, 0.55), Vector3.new(-1.15, 0.88, 0),
-                Color3.fromRGB(239, 220, 189))
-            piece("RightUpperArm", Vector3.new(0.5, 1.5, 0.55), Vector3.new(1.15, 0.88, 0),
-                Color3.fromRGB(239, 220, 189))
-            piece("LeftUpperLeg", Vector3.new(0.66, 1.9, 0.65), Vector3.new(-0.43, -1.28, 0),
-                Color3.fromRGB(47, 54, 68))
-            piece("RightUpperLeg", Vector3.new(0.66, 1.9, 0.65), Vector3.new(0.43, -1.28, 0),
-                Color3.fromRGB(47, 54, 68))
-            return rig
         end
         local function makeStandingPose(previewModel)
             local joints, welds, accessories = {}, {}, {}
@@ -4406,49 +4458,169 @@ local function buildUI(ctx)
                 end
             end
         end
-        local function rebuildAvatar()
-            if model then model:Destroy(); model = nil end
-            avatarParts, rootPart = {}, nil
-            sourceCharacter = ctx.LocalPlayer and ctx.LocalPlayer.Character
-            if sourceCharacter and sourceCharacter:IsA("Model") then
-                local oldArchivable = sourceCharacter.Archivable
-                local ok, clone = pcall(function()
-                    sourceCharacter.Archivable = true
-                    return sourceCharacter:Clone()
-                end)
-                pcall(function() sourceCharacter.Archivable = oldArchivable end)
-                if ok and clone then
-                    clone.Name = "PreviewCharacter"
-                    for _, descendant in ipairs(clone:GetDescendants()) do
-                        if descendant.Parent then
-                            if descendant:IsA("LuaSourceContainer") or descendant:IsA("Tool")
-                                or descendant:IsA("Sound") or descendant:IsA("ParticleEmitter")
-                                or descendant:IsA("Beam") or descendant:IsA("Trail")
-                                or descendant:IsA("BillboardGui") or descendant:IsA("SurfaceGui")
-                                or descendant.Name == "DH_HitboxProxy" or descendant.Name == "BodyEffects" then
-                                descendant:Destroy()
-                            elseif descendant:IsA("BasePart") then
-                                descendant.Anchored = true
-                                descendant.CanCollide = false
-                                descendant.CanTouch = false
-                                descendant.CanQuery = false
-                                descendant.CastShadow = false
-                            end
-                        end
-                    end
-                    if clone:FindFirstChildWhichIsA("BasePart", true) then
-                        clone.Parent = scene
-                        local pivotOK = pcall(function()
-                            clone:PivotTo(CFrame.new())
-                            makeStandingPose(clone)
-                        end)
-                        if pivotOK then model = clone else clone:Destroy() end
-                    else
-                        clone:Destroy()
+        local function prepareAvatar(candidate)
+            if not candidate or not candidate:IsA("Model") then return false end
+            local previewRoot = candidate:FindFirstChild("HumanoidRootPart", true)
+            local previewTorso = candidate:FindFirstChild("UpperTorso", true)
+                or candidate:FindFirstChild("Torso", true)
+            local previewHead = candidate:FindFirstChild("Head", true)
+            local previewArm = candidate:FindFirstChild("LeftUpperArm", true)
+                or candidate:FindFirstChild("Left Arm", true)
+            local previewLeg = candidate:FindFirstChild("RightUpperLeg", true)
+                or candidate:FindFirstChild("Right Leg", true)
+            if not (previewRoot and previewRoot:IsA("BasePart")
+                and previewTorso and previewTorso:IsA("BasePart")
+                and previewHead and previewHead:IsA("BasePart")
+                and previewArm and previewLeg) then
+                candidate:Destroy()
+                return false
+            end
+            candidate.Name = "PreviewCharacter"
+            for _, descendant in ipairs(candidate:GetDescendants()) do
+                if descendant.Parent then
+                    if descendant:IsA("LuaSourceContainer") or descendant:IsA("Tool")
+                        or descendant:IsA("Sound") or descendant:IsA("ParticleEmitter")
+                        or descendant:IsA("Beam") or descendant:IsA("Trail")
+                        or descendant:IsA("BillboardGui") or descendant:IsA("SurfaceGui")
+                        or descendant.Name == "DH_HitboxProxy"
+                        or descendant.Name == "BodyEffects" then
+                        descendant:Destroy()
+                    elseif descendant:IsA("BasePart") then
+                        descendant.Anchored = true
+                        descendant.CanCollide = false
+                        descendant.CanTouch = false
+                        descendant.CanQuery = false
+                        descendant.CastShadow = false
+                    elseif descendant:IsA("Humanoid") then
+                        descendant.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
                     end
                 end
             end
-            if not model then model = makeDummy() end
+            candidate.Parent = scene
+            local ok = pcall(function()
+                candidate:PivotTo(previewRoot.CFrame:Inverse() * candidate:GetPivot())
+                makeStandingPose(candidate)
+            end)
+            if not ok then
+                candidate:Destroy()
+                return false
+            end
+            model = candidate
+            return true
+        end
+        local function cloneLiveAvatar(character)
+            if not character or not character:IsA("Model") then return nil end
+            local changed = {}
+            local function allowClone(instance)
+                local ok, old = pcall(function() return instance.Archivable end)
+                if ok and not old then
+                    local changedOK = pcall(function() instance.Archivable = true end)
+                    if changedOK then changed[#changed + 1] = instance end
+                end
+            end
+            allowClone(character)
+            for _, item in ipairs(character:GetDescendants()) do
+                if not item:IsA("LuaSourceContainer") then allowClone(item) end
+            end
+            local ok, clone = pcall(function() return character:Clone() end)
+            for index = #changed, 1, -1 do
+                pcall(function() changed[index].Archivable = false end)
+            end
+            if ok then return clone end
+            return nil
+        end
+        local function requestProfileAvatar()
+            if destroyed or profileAvatarSource or profileAvatarLoading or not ctx.LocalPlayer then return end
+            local now = os.clock()
+            if now < nextProfileAvatarRequest then return end
+            nextProfileAvatarRequest = now + 12
+            profileAvatarLoading = true
+            task.spawn(function()
+                local ok, newProfile = false, nil
+                local liveCharacter = ctx.LocalPlayer.Character
+                local humanoid = liveCharacter and liveCharacter:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    local descOK, description = pcall(function()
+                        return humanoid:GetAppliedDescription()
+                    end)
+                    if descOK and description then
+                        ok, newProfile = pcall(function()
+                            return ctx.Players:CreateHumanoidModelFromDescriptionAsync(
+                                description, humanoid.RigType)
+                        end)
+                        pcall(function() description:Destroy() end)
+                    end
+                end
+                if not ok or not newProfile or not newProfile:IsA("Model") then
+                    ok, newProfile = pcall(function()
+                        return ctx.Players:CreateHumanoidModelFromUserIdAsync(ctx.LocalPlayer.UserId)
+                    end)
+                end
+                profileAvatarLoading = false
+                if destroyed then
+                    if ok and typeof(newProfile) == "Instance" then newProfile:Destroy() end
+                    return
+                end
+                if ok and typeof(newProfile) == "Instance" and newProfile:IsA("Model") then
+                    newProfile.Archivable = true
+                    for _, part in ipairs(newProfile:GetDescendants()) do
+                        if not part:IsA("LuaSourceContainer") then
+                            pcall(function() part.Archivable = true end)
+                        end
+                    end
+                    newProfile.Parent = nil
+                    profileAvatarSource = newProfile
+                    if holder.Visible and rebuildAvatar then rebuildAvatar() end
+                elseif holder.Visible then
+                    avatarStatus.Text = "Avatar unavailable; retrying"
+                end
+            end)
+        end
+        rebuildAvatar = function()
+            if destroyed then return end
+            lastAvatarAttempt = os.clock()
+            local previousModel = model
+            model = nil
+            sourceCharacter = ctx.LocalPlayer and ctx.LocalPlayer.Character
+            local liveReady = sourceCharacter and sourceCharacter:IsDescendantOf(ctx.Workspace)
+            local humanoid = liveReady and sourceCharacter:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 then liveReady = false end
+            if liveReady then
+                local appearanceOK, hasAppearance = pcall(function()
+                    return ctx.LocalPlayer:HasAppearanceLoaded()
+                end)
+                if appearanceOK and hasAppearance == false then
+                    local hasClothes = sourceCharacter:FindFirstChildOfClass("Shirt")
+                        or sourceCharacter:FindFirstChildOfClass("Pants")
+                        or sourceCharacter:FindFirstChildOfClass("Accessory")
+                    if not hasClothes then liveReady = false end
+                end
+            end
+            if liveReady then
+                local liveClone = cloneLiveAvatar(sourceCharacter)
+                if liveClone then prepareAvatar(liveClone) end
+            end
+            if not model and profileAvatarSource then
+                local ok, clone = pcall(function() return profileAvatarSource:Clone() end)
+                if ok and clone then prepareAvatar(clone) end
+            end
+            local hasNewAvatar = model ~= nil
+            if not hasNewAvatar and previousModel and previousModel.Parent then
+                model = previousModel
+            end
+            fallbackAvatar = not hasNewAvatar
+            if previousModel and previousModel ~= model then previousModel:Destroy() end
+            if fallbackAvatar then
+                avatarStatus.Text = model and "Refreshing avatar..." or "Loading avatar..."
+                requestProfileAvatar()
+                if model then return end
+                avatarParts, rootPart = {}, nil
+                baseBodyParts, attachedAccessories = {}, {}
+                originalRootFrame, appliedThickness = nil, nil
+                return
+            end
+            avatarStatus.Text = ""
+            avatarParts, rootPart = {}, nil
             rootPart = model:FindFirstChild("HumanoidRootPart", true)
             originalRootFrame = rootPart and rootPart.CFrame or nil
             baseBodyParts, attachedAccessories, appliedThickness = {}, {}, nil
@@ -4589,7 +4761,12 @@ local function buildUI(ctx)
         end
         function controller:Update()
             if destroyed or not holder.Visible then return end
-            if not model then rebuildAvatar() end
+            local liveCharacter = ctx.LocalPlayer and ctx.LocalPlayer.Character
+            if liveCharacter ~= sourceCharacter
+                or ((not model or fallbackAvatar) and os.clock() - lastAvatarAttempt >= 3.5) then
+                rebuildAvatar()
+            end
+            if fallbackAvatar then requestProfileAvatar() end
             updatePreviewThickness()
             local requestedX = tonumber(Settings.HitboxX) or 5
             local requestedY = tonumber(Settings.HitboxY) or 5
@@ -4646,7 +4823,7 @@ local function buildUI(ctx)
                 end
             end
             if selectedMode and layout == "Parts" then boxFill.Transparency = 1 end
-            if not active then boxFill.Transparency = 1 end
+            if not active or not model then boxFill.Transparency = 1 end
             for index = edgeIndex, #edges do edges[index].Transparency = 1 end
             for index = fillIndex, #selectedFills do selectedFills[index].Transparency = 1 end
             for _, entry in ipairs(avatarParts) do
@@ -4696,6 +4873,9 @@ local function buildUI(ctx)
                 baseBodyParts, attachedAccessories = {}, {}
                 originalRootFrame, appliedThickness = nil, nil
                 neutralBodyScaleX, neutralBodyScaleZ = 1, 1
+                sourceCharacter, fallbackAvatar = nil, false
+                lastAvatarAttempt = -math.huge
+                avatarStatus.Text = ""
             end
             holder.Visible = show
             if show then self:Position(); self:Update() end
@@ -4703,6 +4883,7 @@ local function buildUI(ctx)
         function controller:RefreshAvatar()
             if not holder.Visible then
                 if model then model:Destroy(); model = nil end
+                lastAvatarAttempt = -math.huge
                 return
             end
             rebuildAvatar()
@@ -4712,6 +4893,7 @@ local function buildUI(ctx)
             dragging = nil
             holder.Visible = false
             if model then model:Destroy(); model = nil end
+            if profileAvatarSource then profileAvatarSource:Destroy(); profileAvatarSource = nil end
             baseBodyParts, attachedAccessories = {}, {}
             originalRootFrame, appliedThickness = nil, nil
             neutralBodyScaleX, neutralBodyScaleZ = 1, 1
@@ -5524,6 +5706,7 @@ local function buildUI(ctx)
         {Value = "Auto", Label = "Auto"}, {Value = "Tool", Label = "Tool activation"},
         {Value = "Mouse", Label = "Mouse input"},
     })
+    toggleRow("Guns only", "TriggerGunsOnly")
     rowParent = triggerOn
     catalog("Targets")
     dropdownRow("Hit position", "TriggerPartMode", {
@@ -6586,6 +6769,7 @@ local Settings = {
     TriggerKey = "V",
     MenuKey = "RightShift",
     TriggerFireMethod = "Auto",
+    TriggerGunsOnly = true,
     TriggerPartMode = "SelectedParts",
     TriggerDelayMs = 0,
     TriggerIntervalMs = 0,
